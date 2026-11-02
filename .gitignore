@@ -9,6 +9,12 @@
 # ===== 本机维护说明，不入库 =====
 /CLAUDE.md
 
+# ===== 离线资源，不入库 =====
+# 模型权重与预编译 ORT 库体积大、按平台/模型分发；
+# onnxruntime/README.md 保留入库，说明安装与接入方式。
+/weight/
+/onnxruntime/install/
+
 # ===== Python 缓存（python_ref 自带 .gitignore，这里兜底） =====
 __pycache__/
 *.py[cod]

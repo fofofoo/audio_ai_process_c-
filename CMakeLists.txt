@@ -51,6 +51,54 @@ else()
 endif()
 
 # ---------------------------------------------------------------------
+# ONNX Runtime：按架构选择项目内托管的版本
+#
+#   x86_64  (WSL / PC)       -> onnxruntime-1.23.2（官方预编译，CUDA 12.x + cuDNN 9.x）
+#   aarch64 (Jetson Orin NX) -> onnxruntime-1.18.0（按 onnxruntime/README.md 第 3 节源码编译）
+#
+# 两个目录结构统一为 <root>/include 与 <root>/lib，CMake 只认这套路径。
+# 需要推理能力的目标调用 ort_link_target(<target>)，一次性设置 include、链接和 RPATH。
+# ---------------------------------------------------------------------
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(ORT_VERSION_DIR "onnxruntime-1.18.0")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(ORT_VERSION_DIR "onnxruntime-1.23.2")
+else()
+    message(FATAL_ERROR "ONNX Runtime: unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+set(ORT_ROOT        "${CMAKE_SOURCE_DIR}/onnxruntime/install/${ORT_VERSION_DIR}")
+set(ORT_INCLUDE_DIR "${ORT_ROOT}/include")
+set(ORT_LIB_DIR     "${ORT_ROOT}/lib")
+set(ORT_LIBRARY     "${ORT_LIB_DIR}/libonnxruntime.so")
+
+if(EXISTS "${ORT_LIBRARY}")
+    set(ORT_FOUND TRUE)
+    message(STATUS "ONNX Runtime root : ${ORT_ROOT}")
+else()
+    # 不中断现有构建：当前工程还没有推理目标时，ORT 缺失不影响音频链路。
+    set(ORT_FOUND FALSE)
+    message(WARNING
+        "ONNX Runtime 未安装：${ORT_LIBRARY}\n"
+        "  x86_64  : 确认预编译包已复制到 onnxruntime/install/onnxruntime-1.23.2/\n"
+        "  aarch64 : 按 onnxruntime/README.md 第 3 节在 Jetson 上编译并安装")
+endif()
+
+# 把 ORT 接入指定 target：头文件、共享库、运行期 RPATH。
+# providers_cuda.so 由 ORT 运行时 dlopen，必须与 libonnxruntime.so 同目录。
+function(ort_link_target target)
+    if(NOT ORT_FOUND)
+        message(FATAL_ERROR "ort_link_target(${target}) 失败：ONNX Runtime 未安装")
+    endif()
+    target_include_directories(${target} PRIVATE ${ORT_INCLUDE_DIR})
+    target_link_libraries(${target} PRIVATE ${ORT_LIBRARY})
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH   "${ORT_LIB_DIR}"
+        INSTALL_RPATH "${ORT_LIB_DIR}"
+    )
+endfunction()
+
+# ---------------------------------------------------------------------
 # SDK 与客户端路径
 # ---------------------------------------------------------------------
 set(HK_MIC_DIR "${CMAKE_SOURCE_DIR}/hk_mic_client")
@@ -170,3 +218,19 @@ target_link_libraries(fbank_dump.out PRIVATE
     ${OpenCV_LIBS}
     Threads::Threads
 )
+
+# ---------------------------------------------------------------------
+# 可执行文件：load_onnx_model.out
+#   模型加载自检：打开 encoder / decoder / joiner，打印输入输出与 metadata。
+#   不依赖 OpenCV 和海康 SDK，只依赖 ONNX Runtime。
+# ---------------------------------------------------------------------
+add_executable(load_onnx_model.out
+    load_onnx_model.cpp
+)
+
+# 默认模型目录按工程根拼接，入口从任意工作目录启动都能找到 weight/
+target_compile_definitions(load_onnx_model.out PRIVATE
+    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+ort_link_target(load_onnx_model.out)
