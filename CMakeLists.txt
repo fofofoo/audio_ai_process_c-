@@ -187,6 +187,7 @@ add_executable(test_spectrogram_cv_wav.out
     test_spectrogram_cv_wav.cpp
     audio_ai_process/audio_preprocess.cpp
     audio_ai_process/spectrogram_image.cpp
+    audio_ai_process/text_utils.cpp
 )
 
 target_include_directories(test_spectrogram_cv_wav.out PRIVATE
@@ -220,17 +221,63 @@ target_link_libraries(fbank_dump.out PRIVATE
 )
 
 # ---------------------------------------------------------------------
+# 可执行文件：test_wav_asr.out
+#   wav 文件 -> AudioPreprocess -> AsrDecoder（ORT 三模型）-> 文本
+#   可选 SpectrogramImage 窗口 + 底部识别文字；依赖 OpenCV 与 ONNX Runtime。
+# ---------------------------------------------------------------------
+add_executable(test_wav_asr.out
+    test_wav_asr.cpp
+    audio_ai_process/audio_preprocess.cpp
+    audio_ai_process/asr_decode.cpp
+    audio_ai_process/text_utils.cpp
+    audio_ai_process/text_renderer.cpp
+    audio_ai_process/spectrogram_image.cpp
+)
+
+target_compile_definitions(test_wav_asr.out PRIVATE
+    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+target_include_directories(test_wav_asr.out PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_wav_asr.out PRIVATE
+    ${OpenCV_LIBS}
+    Threads::Threads
+)
+
+# FreeType：text_renderer.cpp 按 UTF-8 渲染中文识别结果（cv::putText 只支持 ASCII）。
+# 直接用系统 FreeType，不依赖 opencv_contrib；找不到时 text_renderer 编译成空实现，
+# 入口靠 ready() 回退 ASCII，不影响构建与识别。注意 OpenCV 可能来自 /usr/local
+# （自带 build 无 freetype 模块），因此不混链发行版 libopencv_freetype。
+find_package(Freetype QUIET)
+if(FREETYPE_FOUND)
+    target_compile_definitions(test_wav_asr.out PRIVATE HK_HAVE_FREETYPE=1)
+    target_include_directories(test_wav_asr.out PRIVATE ${FREETYPE_INCLUDE_DIRS})
+    target_link_libraries(test_wav_asr.out PRIVATE ${FREETYPE_LIBRARIES})
+else()
+    message(STATUS "FreeType 未找到：test_wav_asr 窗口文字回退 ASCII")
+endif()
+
+ort_link_target(test_wav_asr.out)
+
+# ---------------------------------------------------------------------
 # 可执行文件：load_onnx_model.out
 #   模型加载自检：打开 encoder / decoder / joiner，打印输入输出与 metadata。
 #   不依赖 OpenCV 和海康 SDK，只依赖 ONNX Runtime。
 # ---------------------------------------------------------------------
 add_executable(load_onnx_model.out
     load_onnx_model.cpp
+    audio_ai_process/text_utils.cpp
 )
 
 # 默认模型目录按工程根拼接，入口从任意工作目录启动都能找到 weight/
 target_compile_definitions(load_onnx_model.out PRIVATE
     HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
 )
+
+target_include_directories(load_onnx_model.out PRIVATE ${CMAKE_SOURCE_DIR})
 
 ort_link_target(load_onnx_model.out)

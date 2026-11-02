@@ -27,12 +27,12 @@
 
 #include "audio_ai_process/audio_preprocess.h"
 #include "audio_ai_process/spectrogram_image.h"
+#include "audio_ai_process/text_utils.h"
+
+#include "tools/wav_reader.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -43,169 +43,8 @@
 
 using namespace audio_ai;
 
-namespace {
-
-// ==================== WAV 读取 ====================
-
-// 小端读取：wav 的块长度、采样率等字段都按小端存放。
-// 不直接 memcpy 到整型，避免依赖主机字节序（ARM 上需要）。
-uint16_t read_le16(const unsigned char* p) {
-    return static_cast<uint16_t>(p[0]) |
-           static_cast<uint16_t>(static_cast<uint16_t>(p[1]) << 8);
-}
-
-uint32_t read_le32(const unsigned char* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-// 读入的 wav 内容：样本已统一成单声道 float [-1,1]。
-struct WavData {
-    std::vector<float> samples;
-    int sample_rate = 0;
-    int channels = 0;          // 文件原始声道数；samples 只保留第一声道
-    int bits_per_sample = 0;   // 16 = PCM16，32 = float32
-};
-
-// 取路径最后一段，作为信息条标签。
-// cv::putText 只支持 ASCII，标签带中文会静默变成问号。
-std::string base_name(const std::string& path) {
-    const size_t pos = path.find_last_of("/\\");
-    return pos == std::string::npos ? path : path.substr(pos + 1);
-}
-
-// 解析 wav 文件并转成 float 单声道。
-// 支持：PCM 16-bit、IEEE float 32-bit（含 WAVE_FORMAT_EXTENSIBLE 包装）；
-// 多声道只取第 0 声道，与 Python 版 soundfile 的 data[:, 0] 一致。
-// 失败时写 error 并返回 false，不修改 out 之外的任何状态。
-bool load_wav(const std::string& path, WavData& out, std::string& error) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error = "打不开 wav：" + path;
-        return false;
-    }
-
-    in.seekg(0, std::ios::end);
-    const std::streamoff file_size = in.tellg();
-    if (file_size < 12) {
-        error = "wav 文件太短：" + path;
-        return false;
-    }
-    in.seekg(0, std::ios::beg);
-
-    std::vector<unsigned char> bytes(static_cast<size_t>(file_size));
-    in.read(reinterpret_cast<char*>(bytes.data()), file_size);
-    if (!in) {
-        error = "读取 wav 失败：" + path;
-        return false;
-    }
-
-    if (std::memcmp(bytes.data(), "RIFF", 4) != 0 ||
-        std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
-        error = "不是 RIFF/WAVE 文件：" + path;
-        return false;
-    }
-
-    // 逐块扫描，只关心 fmt 与 data。块长度按 RIFF 规定做 2 字节对齐。
-    uint16_t format_tag = 0;
-    uint16_t channels = 0;
-    uint32_t sample_rate = 0;
-    uint16_t bits = 0;
-    bool have_fmt = false;
-    bool have_data = false;
-    size_t data_offset = 0;
-    size_t data_size = 0;
-
-    size_t pos = 12;
-    while (pos + 8 <= bytes.size()) {
-        const std::string id(reinterpret_cast<const char*>(bytes.data() + pos), 4);
-        const uint32_t chunk_size = read_le32(bytes.data() + pos + 4);
-        pos += 8;
-
-        // 文件被截断时按实际剩余字节算，避免越界；后续校验会兜底。
-        const size_t avail =
-            std::min<size_t>(chunk_size, bytes.size() - pos);
-
-        if (id == "fmt ") {
-            if (avail < 16) {
-                error = "fmt 块不完整：" + path;
-                return false;
-            }
-            format_tag = read_le16(bytes.data() + pos);
-            channels = read_le16(bytes.data() + pos + 2);
-            sample_rate = read_le32(bytes.data() + pos + 4);
-            bits = read_le16(bytes.data() + pos + 14);
-
-            // WAVE_FORMAT_EXTENSIBLE：真正格式藏在 SubFormat GUID 的前 2 字节。
-            // fmt 块偏移 24 处开始是 GUID（tag 2 + 4+2+2+4+2+2+4+2+2+4 ...），
-            // 这里只取前两字节的格式码。
-            if (format_tag == 0xFFFE && avail >= 40) {
-                format_tag = read_le16(bytes.data() + pos + 24);
-            }
-            have_fmt = true;
-        } else if (id == "data") {
-            data_offset = pos;
-            data_size = avail;
-            have_data = true;
-        }
-
-        if (have_fmt && have_data) {
-            break;
-        }
-        pos += static_cast<size_t>(chunk_size) + (chunk_size & 1u);
-    }
-
-    if (!have_fmt) {
-        error = "wav 缺少 fmt 块：" + path;
-        return false;
-    }
-    if (!have_data) {
-        error = "wav 缺少 data 块：" + path;
-        return false;
-    }
-    if (channels == 0 || sample_rate == 0 || bits == 0) {
-        error = "wav 头字段非法：" + path;
-        return false;
-    }
-
-    const bool is_pcm16 = (format_tag == 1 && bits == 16);
-    const bool is_float32 = (format_tag == 3 && bits == 32);
-    if (!is_pcm16 && !is_float32) {
-        error = "只支持 PCM16 / float32，当前 format=" +
-                std::to_string(format_tag) + " bits=" + std::to_string(bits) +
-                "：" + path;
-        return false;
-    }
-
-    const size_t bytes_per_sample = bits / 8;
-    const size_t frame_bytes = bytes_per_sample * channels;
-    const size_t n_samples = data_size / frame_bytes;
-    out.samples.resize(n_samples);
-    out.sample_rate = static_cast<int>(sample_rate);
-    out.channels = channels;
-    out.bits_per_sample = bits;
-
-    // 多声道只取第 0 声道；帧内偏移 0 就是第一声道。
-    const unsigned char* p = bytes.data() + data_offset;
-    for (size_t i = 0; i < n_samples; ++i) {
-        if (is_pcm16) {
-            const int16_t v = static_cast<int16_t>(read_le16(p + i * frame_bytes));
-            // /32768：与 Python/soundfile 读 int16 得到 float [-1,1] 的量纲一致。
-            out.samples[i] = static_cast<float>(v) / 32768.0f;
-        } else {
-            const unsigned char* q = p + i * frame_bytes;
-            const uint32_t raw = read_le32(q);
-            float v = 0.0f;
-            std::memcpy(&v, &raw, sizeof(v));
-            out.samples[i] = v;
-        }
-    }
-    return true;
-}
-
-}  // namespace
+// WAV 读取已抽到 tools/wav_reader.h（与 wav ASR 入口共用）；
+// 路径工具（base_name）在 text_utils.h，入口只做参数与装配。
 
 int main(int argc, char** argv) {
     // —— 一、运行参数（全部写死在 main，现场要改时一眼可见）——

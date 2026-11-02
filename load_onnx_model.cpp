@@ -28,6 +28,8 @@
  * 注意：CUDA EP 需要 cuDNN 9 在 LD_LIBRARY_PATH 里，具体见 onnxruntime/README.md。
  */
 
+#include "audio_ai_process/text_utils.h"
+
 #include <onnxruntime_cxx_api.h>
 
 #include <chrono>
@@ -40,6 +42,9 @@
 #include <vector>
 
 namespace {
+
+// 路径拼接在 text_utils.h，与 ASR 等入口共用。
+using audio_ai::join_path;
 
 // —— 默认模型目录 ——
 // 由 CMake 注入工程根路径，保证从任意工作目录启动都能找到模型；
@@ -76,16 +81,6 @@ struct ModelInfo {
     std::unique_ptr<Ort::Session> session;
     std::map<std::string, std::string> meta;
 };
-
-std::string join_path(const std::string& dir, const std::string& name) {
-    if (dir.empty()) {
-        return name;
-    }
-    if (dir.back() == '/') {
-        return dir + name;
-    }
-    return dir + "/" + name;
-}
 
 bool file_exists(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
