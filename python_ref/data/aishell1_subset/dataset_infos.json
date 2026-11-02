@@ -1,0 +1,1 @@
+{"default":{"features":{"Audio":{"_type":"Audio"},"Text":{"_type":"Value"}},"splits":{"test":{"name":"test","dataset_name":"aishell1_subset"},"train":{"name":"train","dataset_name":"aishell1_subset"}}}}

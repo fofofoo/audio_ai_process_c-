@@ -1,0 +1,1 @@
+{"default":{"train":{"meta":"aishell1_train_subset.csv","file":"aishell1_subset.zip"},"test":{"meta":"aishell1_test_subset.csv","file":"aishell1_subset.zip"},"validation":{"meta":"","file":""}}}

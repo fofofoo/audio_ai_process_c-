@@ -1,0 +1,39 @@
+# ===== 模型权重 =====
+# 从 ModelScope 下载，体积约 848M，不进版本库；换版本只改目录名，代码自动定位
+/weight/
+
+# ===== 上游 sherpa-onnx 源码副本 =====
+# 仅作阅读参考，不参与运行。需要时自行 clone：
+#   git clone https://github.com/k2-fsa/sherpa-onnx.git sharpa-onnx
+/sharpa-onnx/
+
+# ===== 数据集音频 =====
+# wav 体积大，用 data/aishell1_subset/download_aishell1_subset.py 重新拉取；
+# CSV / JSON / README 保留入库（CSV 是本仓库改过的 UTF-8 版）
+data/aishell1_subset/wav/
+
+# ===== 体积较大的二进制资料 =====
+# docx 是二进制不便 diff，png 是可再生成的截图
+doc/*.docx
+scripts/test_spectrogram.png
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 模型与归档文件（兜底） =====
+*.onnx
+*.tar.bz2
+*.tar.gz
+
+# ===== 编辑器 / 系统 =====
+.DS_Store
+Thumbs.db
+
+# ===== 压缩文件 =====
+*.zip
+*.tar
+
