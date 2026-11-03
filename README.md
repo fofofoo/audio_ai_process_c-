@@ -13,6 +13,8 @@
    10 秒后停止回调，保活后可长时间连续取流。支持 `pause_audio_forwarding()` /
    `resume_audio_forwarding()` 只停/起对讲线路，不重跑登录与解码器初始化；
    暂停会自动收尾当前 wav，恢复时按 200 ms 间隔重试以避开设备侧的操作节流。
+   可选 `set_audio_format` 在启动前主动设置对讲编码（G.722.1 自动 16 kHz / PCM 自动 32 kHz），
+   写前快照、写后读回复核，不一致拒绝启动，`stop()` 默认写回原配置。
 2. **实时取流接口**：`get_last_audio()` 一次取走自上次调用以来的全部 PCM16 样本，
    与是否正在录制无关；接口线程安全，可直接供前端、可视化与 ASR 消费。
 3. **流式 LogFBank 前端**：按 kaldi `snip_edges=False` 口径实现分帧、povey 窗、
@@ -87,7 +89,7 @@ wav 文件 --tools/wav_reader.h（RIFF 解析）-------------------+            
 
 - **设备链路**：G.722.1，16 kHz、单声道、PCM16；设备地址、端口、账号、语音通道
   写在各入口 `main` 顶部，默认 `10.168.2.65:8000`、`channel=1`。
-- **PCM 链路**：部分设备会把采样率固定为 32 kHz（请求 16 kHz 不生效），
+- **PCM 链路**：本机实测只能 32 kHz（请求 16 kHz 不生效），
   实际采样率以 `sample_rate()` 为准。
 - **wav 文件**：支持 PCM16 与 float32，多声道只取第一声道；不做重采样，
   非 16 kHz 的 wav 可以画图，但喂 ASR 前必须自行重采样。
@@ -244,7 +246,8 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | --- | --- | --- |
 | 各入口 `main` | 设备 IP、账号、通道、录制时长写死 | 换设备需改代码重新编译 |
 | `HkSdkAudioClient` | 每个实例都会 `NET_DVR_Init/Cleanup` | 同一进程不要同时创建音频与视频/热成像客户端 |
-| `HkSdkAudioClient` | PCM 路径采样率可能被设备固定为 32 kHz | 喂 16 kHz ASR 前必须重采样 |
+| `HkSdkAudioClient` | PCM 路径采样率被设备固定为 32 kHz（本机实测请求 16 kHz 无效） | 喂 16 kHz ASR 前必须重采样 |
+| `HkSdkAudioClient` | 主动设置编码写的是设备持久配置，且设备可能「成功但没生效」 | 默认关闭；开启后以读回复核为准，`stop()` 写回原配置 |
 | `HkSdkAudioClient` | 上行保活只在 G.722.1 下启用，PCM 路径未实测 | 设备切到 PCM 后若同样 10 秒断流，需按 PCM 帧长补发 |
 | `HkSdkAudioClient` | 暂停会关闭当前 wav；`StartVoiceCom` 同步调用约阻塞 1.2 秒 | 连续录音不能跨暂停；在 UI 线程调用 start/resume 会卡顿，应放后台 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |

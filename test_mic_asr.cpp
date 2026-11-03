@@ -209,6 +209,14 @@ int main(int argc, char** argv) {
     capture_config.voice_channel = kVoiceChannel;
     capture_config.verbose = true;
 
+    // 2.1.1 可选：启动前主动设置对讲编码（写设备持久配置，默认关闭）。
+    //       打开后 start() 会先快照原值 → 设置 → 读回复核，不一致直接拒绝
+    //       启动；stop() 默认把原配置写回。采样率跟随编码自动取：
+    //       G.722.1 → 16 kHz，PCM → 32 kHz（本机实测 PCM 只能是 32 kHz）。
+    capture_config.set_audio_format = false; // false=只读设备当前编码；true=启动前改成本文件的 audio_enc_type，退出时还原
+    capture_config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
+    capture_config.restore_audio_format = true; //< stop() 时是否写回设置前的设备配置
+
     // 2.2 建立语音转发：只登录 + 开流，不写 wav 文件。
     HkSdkAudioClient client(capture_config);
     if (!client.start()) {

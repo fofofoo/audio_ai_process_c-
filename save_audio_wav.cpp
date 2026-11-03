@@ -79,6 +79,12 @@ int main() {
     config.password = kPassword;
     config.voice_channel = kVoiceChannel;
     config.verbose = true;
+    // 可选：启动前主动设置对讲编码（写设备持久配置，默认关闭）。
+    // 打开后 start() 先快照原值再设置并读回复核，stop() 默认写回原配置。
+    // 采样率跟随编码自动取：G.722.1 → 16 kHz，PCM → 32 kHz。
+    config.set_audio_format = false;
+    config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
+    config.restore_audio_format = true;
 
     std::cout << "[Record] target: " << output_path.string() << "\n"
               << "[Record] device: " << kDeviceIp << ":" << kSdkPort

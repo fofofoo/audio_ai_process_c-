@@ -87,6 +87,16 @@ struct AudioCaptureConfig {
     int voice_channel = 1;                ///< 语音通道号，本机实测 1
     int pcm_sample_rate = 16000;          ///< rateEnum=0(默认) 时的兜底采样率；G.722.1 固定 16 kHz
     int encoded_frame_bytes = 80;         ///< G.722.1 单帧编码字节数：80 B / 40 ms
+
+    // —— 启动前主动设置语音对讲编码（可选）——
+    // 走 NET_DVR_SetDVRConfig(NET_DVR_SET_COMPRESSCFG_AUD, 1059) + NET_DVR_COMPRESSION_AUDIO。
+    // 注意：该接口写的是**设备持久配置**，会影响该设备上所有对讲客户端；
+    // 默认关闭，保持「只查询、不修改设备」的原有行为。
+    bool set_audio_format = false;        ///< 是否在 start() 登录后主动设置编码
+    int audio_enc_type = 0;               ///< 目标编码：0=G.722.1（自动 16k），8=PCM（自动 32k）；
+                                          ///< 采样率不单独配置，跟随编码取固定值
+    bool restore_audio_format = true;     ///< stop() 时是否写回设置前的设备配置
+
     int max_stream_samples = 40960;       ///< 取流缓冲上限（样本数）：40960 ≈ 2.56 s @16 kHz，
                                           ///< 与 Python mic 的 256×160 块对齐；满了丢最旧样本；
                                           ///< <=0 表示关闭取流缓存（get_last_audio 恒返回 false）
@@ -250,6 +260,10 @@ private:
     bool start_voice_forward();
     void add_forward_seconds_locked();
 
+    // —— 语音对讲编码设置（可选，写设备持久配置）——
+    bool apply_audio_format();
+    void restore_audio_format();
+
     // —— 上行保活（G.722.1）——
     bool init_uplink_keepalive();
     void start_uplink_keepalive();
@@ -285,6 +299,12 @@ private:
 
     AudioCodec m_codec = AudioCodec::kG7221;    ///< 设备当前编码
     int m_output_sample_rate = 16000;           ///< 实际写进 wav 头的采样率
+
+    // 主动设置编码时的原值快照：apply 前保存，stop()/启动失败时写回，
+    // 避免把设备留在「被本进程改过」的持久状态。
+    bool m_audio_format_saved = false;          ///< 是否已成功读到原配置
+    bool m_audio_format_changed = false;        ///< 是否已成功写入目标配置
+    NET_DVR_COMPRESSION_AUDIO m_saved_audio_format{}; ///< apply 前的配置快照
 
     // 上行保活：句柄用原子量给保活线程读；stop() 先停线程再关语音转发
     void* m_encoder = nullptr;                   ///< G.722 编码器（只在 init 时用）

@@ -133,8 +133,16 @@ bool HkSdkAudioClient::start() {
     if (m_user_id < 0 && !login_device()) {
         return false;
     }
-    // 3. 查询设备音频编码，query_audio_format() 
+    // 2.5 可选：按配置主动设置对讲编码。必须在查询之前，这样第 3 步读到的
+    //     就是设置后实际生效的值；apply 内部会先快照原配置，供停止时恢复。
+    if (m_config.set_audio_format && !apply_audio_format()) {
+        return false;
+    }
+    // 3. 查询设备音频编码，query_audio_format()
     if (!query_audio_format()) {
+        // 设置过编码但后续不可用（例如设备拒绝、查询失败）：先恢复原配置，
+        // 否则下次 start() 会把「已经改过的值」当成原值快照。
+        restore_audio_format();
         return false;
     }
 
@@ -145,6 +153,7 @@ bool HkSdkAudioClient::start() {
         if (m_decoder == nullptr) {
             set_error("NET_DVR_InitG722Decoder failed, error=" +
                       std::to_string(NET_DVR_GetLastError()));
+            restore_audio_format();
             return false;
         }
     }
@@ -160,6 +169,7 @@ bool HkSdkAudioClient::start() {
     // 四、初始化 hk_sdk 的语音对讲功能，并启动上行保活
     // 起流细节（含上行保活）封装在 start_voice_forward()，pause/resume 共用。
     if (!start_voice_forward()) {
+        restore_audio_format();
         return false;
     }
 
@@ -352,6 +362,15 @@ void HkSdkAudioClient::stop() {
             m_stats.wall_seconds =
                 std::chrono::duration<double>(now - m_start_time).count();
         }
+    }
+
+    // 本次 start() 主动改过设备编码时写回原配置；选择「保持新配置」则
+    // 只清快照。stop() 不注销登录，恢复请求仍可在当前会话内发出。
+    if (m_config.restore_audio_format) {
+        restore_audio_format();
+    } else {
+        m_audio_format_saved = false;
+        m_audio_format_changed = false;
     }
 }
 
@@ -692,6 +711,118 @@ bool HkSdkAudioClient::query_audio_format() {
                   << std::endl;
     }
     return true;
+}
+
+// 主动设置语音对讲编码：先快照设备原配置，再写目标值并读回复核。
+// 仅在 start() 登录后、StartVoiceCom 前调用；以下情况返回 false 并写 last_error：
+// 原配置读不到、SetDVRConfig 失败、或读回值与请求不一致（设备可能拒绝某组合，
+// 例如实测 PCM 16 kHz 被钉在 32 kHz）。失败时尽量写回快照，避免设备停在半改状态。
+bool HkSdkAudioClient::apply_audio_format() {
+    // 1) 快照原配置：优先读设备保存值（1058）；部分设备不支持该命令，
+    //    退回读当前生效值。两接口输出同一个 NET_DVR_COMPRESSION_AUDIO，
+    //    恢复时按快照原样写回。
+    NET_DVR_COMPRESSION_AUDIO saved{};
+    DWORD returned = 0;
+    if (!NET_DVR_GetDVRConfig(m_user_id, NET_DVR_GET_COMPRESSCFG_AUD, 0xFFFFFFFF,
+                              &saved, sizeof(saved), &returned)) {
+        saved = NET_DVR_COMPRESSION_AUDIO{};
+        if (!NET_DVR_GetCurrentAudioCompress(m_user_id, &saved)) {
+            set_error("save current audio format failed, error=" +
+                      std::to_string(NET_DVR_GetLastError()));
+            return false;
+        }
+    }
+    m_saved_audio_format = saved;
+    m_audio_format_saved = true;
+    m_audio_format_changed = false;
+
+    // 采样率不对外暴露，跟随编码取固定值：G.722.1 标准 16 kHz；
+    // PCM 本机实测只能 32 kHz（请求 16 kHz 会被设备忽略）。
+    // 其它编码没有解码/写盘路径，直接拒绝，避免写出内容与头不一致的 wav。
+    BYTE target_rate_enum = 0;
+    if (m_config.audio_enc_type == 0) {
+        target_rate_enum = 1;  // 16 kHz
+    } else if (m_config.audio_enc_type == 8) {
+        target_rate_enum = 2;  // 32 kHz
+    } else {
+        set_error("unsupported target audio enc type=" +
+                  std::to_string(m_config.audio_enc_type) +
+                  " (supported: G.722.1/0, PCM/8)");
+        return false;
+    }
+
+    // 2) 只改编码类型与采样率，其余字段（码率 / byres / bySupport）沿用快照，
+    //    避免把设备不认识的字段写坏。lChannel 按手册对 1059 固定为无效值。
+    NET_DVR_COMPRESSION_AUDIO target = saved;
+    target.byAudioEncType = static_cast<BYTE>(m_config.audio_enc_type);
+    target.byAudioSamplingRate = target_rate_enum;
+    if (!NET_DVR_SetDVRConfig(m_user_id, NET_DVR_SET_COMPRESSCFG_AUD, 0xFFFFFFFF,
+                              &target, sizeof(target))) {
+        set_error("NET_DVR_SetDVRConfig(NET_DVR_SET_COMPRESSCFG_AUD) failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+        return false;
+    }
+    m_audio_format_changed = true;
+
+    // 3) 读回复核：设备可能「返回成功但没接受请求」，wav 头与 ASR 输入都依赖
+    //    实际采样率，所以必须用读回值而不是请求值。编码类型必须一致；采样率
+    //    G.722.1 沿用 query_audio_format 的口径（0=默认、1=16k 都算 16 kHz），
+    //    PCM 必须是 32k，否则说明设备没接受请求。
+    NET_DVR_COMPRESSION_AUDIO actual{};
+    if (!NET_DVR_GetCurrentAudioCompress(m_user_id, &actual)) {
+        set_error("verify audio format failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+        restore_audio_format();
+        return false;
+    }
+    const bool enc_ok = actual.byAudioEncType == target.byAudioEncType;
+    const bool rate_ok =
+        (m_config.audio_enc_type == 0)
+            ? (actual.byAudioSamplingRate == 0 ||
+               actual.byAudioSamplingRate == 1)
+            : (actual.byAudioSamplingRate == 2);
+    if (!enc_ok || !rate_ok) {
+        set_error("audio format not applied: requested type=" +
+                  std::to_string(m_config.audio_enc_type) + " rate=" +
+                  std::to_string(target_rate_enum) +
+                  ", actual type=" + std::to_string(actual.byAudioEncType) +
+                  " rate=" + std::to_string(actual.byAudioSamplingRate));
+        restore_audio_format();
+        return false;
+    }
+
+    if (m_config.verbose) {
+        std::cout << "[Audio] audio format set: type="
+                  << static_cast<unsigned>(actual.byAudioEncType)
+                  << ", sampleRateEnum="
+                  << static_cast<unsigned>(actual.byAudioSamplingRate)
+                  << " (original saved for restore)" << std::endl;
+    }
+    return true;
+}
+
+// 把 apply_audio_format() 保存的原配置写回设备。尽力而为：失败只记录
+// last_error，不抛异常、不阻断 stop() 收尾；重复调用无副作用。
+// 登录会话已失效时无法写回，直接清标志，避免下次误用旧快照。
+void HkSdkAudioClient::restore_audio_format() {
+    if (!m_audio_format_saved || !m_audio_format_changed) {
+        return;
+    }
+    if (m_user_id < 0) {
+        m_audio_format_saved = false;
+        m_audio_format_changed = false;
+        return;
+    }
+    if (!NET_DVR_SetDVRConfig(m_user_id, NET_DVR_SET_COMPRESSCFG_AUD, 0xFFFFFFFF,
+                              &m_saved_audio_format,
+                              sizeof(m_saved_audio_format))) {
+        set_error("restore audio format failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+    } else if (m_config.verbose) {
+        std::cout << "[Audio] audio format restored" << std::endl;
+    }
+    m_audio_format_saved = false;
+    m_audio_format_changed = false;
 }
 
 // ==================== 回调与解码 ====================
