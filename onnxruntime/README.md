@@ -159,7 +159,7 @@ CUDA EP 创建失败时 ORT 会回退 CPU，推理仍可能成功但速度明显
 | CUDA | 11.4，`/usr/local/cuda-11.4` |
 | cuDNN | 8.6.0（JetPack 自带，`/usr/include` + `/usr/lib/aarch64-linux-gnu`） |
 | 编译器 | gcc / g++ 9.4 |
-| Python | 3.8 |
+| Python | ≥ 3.8（系统自带 3.8 即可；推荐独立 conda 环境，见 3.3.1） |
 
 选 1.18.0 而不是更新的版本：
 
@@ -172,76 +172,389 @@ CUDA EP 创建失败时 ORT 会回退 CPU，推理仍可能成功但速度明显
 > （JetPack 5 的 CUDA 11.4 只有 aarch64 原生工具链）。本节所有命令都在
 > Jetson 上执行。
 
-### 3.2 前置条件
+### 3.2 前置条件（设备实测）
+
+本节记录 Jetson Orin NX 16GB + JetPack 5.1.2 上的实测环境，并把「硬性要求」与
+「本机取值」分开写。判断依据来自 ORT 1.18.0 源码（`tools/ci_build/build.py`、
+`cmake/CMakeLists.txt`），不是经验估计。
 
 ```bash
-# CUDA
+# 以下命令在未激活 conda 的系统 shell 里执行
+
+# 架构（应为 aarch64）
+uname -m
+
+# CUDA（应为 11.4）
 ls /usr/local/cuda-11.4/bin/nvcc
-nvcc --version          # 应为 release 11.4
+nvcc --version
 
-# cuDNN
-grep CUDNN_MAJOR /usr/include/cudnn_version.h   # 应为 8
+# nvcc 允许的最高 GCC 主版本（JetPack 5.1.2 实测为 11，决定能配哪个 GCC）
+grep -n "__GNUC__ >" /usr/local/cuda-11.4/include/crt/host_config.h
 
-# 架构
-uname -m                # 应为 aarch64
+# cuDNN（major 应为 8；minor 记录实测值）
+grep CUDNN_MAJOR /usr/include/cudnn_version.h
+grep CUDNN_MINOR /usr/include/cudnn_version.h
 
-# 磁盘（源码 + 构建目录 + 依赖约需 25~30 GB）
+# GCC / G++：aarch64 必须支持 -march=armv8.2-a+bf16（GCC ≥ 10），见 3.2.3
+gcc --version | head -1
+g++ --version | head -1
+echo 'int main(){}' > /tmp/t.cpp
+g++ -march=armv8.2-a+bf16 -c /tmp/t.cpp -o /tmp/t.o && echo "bf16 OK"
+
+# 系统 GCC 不满足时，替代编译器是否能装（本机实测 10.5.0）
+apt-cache policy gcc-10 g++-10
+
+# 系统 libstdc++（gcc-10 编出来的库要在它上面跑，需 ≥ 10）
+dpkg -l libstdc++6 | tail -1
+
+# CMake（ORT 1.18.0 要求 >= 3.26；JetPack 5.1.2 自带 3.16.3，不够）
+cmake --version
+
+# Python（只要求解释器 >= 3.8）
+python3 -V
+
+# 内存与 swap（记录实测值；先不预置 swap）
+free -h
+swapon --show
+
+# 磁盘（源码 + 构建约 25~30 GB；本方案放 /mnt/data）
 df -h ~
+df -h /mnt/data
 ```
 
-JetPack 5.1.2 自带的 CMake 是 3.16，而 ORT 1.18.0 要求 **CMake ≥ 3.26**，
-必须先升级。
+源码完整性（`VERSION_NUMBER`、`cmake/external/onnx` 目录存在）无法在获取源码前
+检查，统一放到 3.3.3 解压之后验证。
 
-内存 16 GB 编译够用，但链接阶段（LTO）峰值较高，建议临时增加 8~16 GB swap：
+实测结果：
+
+| 项目 | 要求 | 本机实测 | 结论 |
+|---|---|---|---|
+| 架构 | aarch64 | aarch64 | ✅ |
+| CUDA | 11.x（本方案锁 11.4） | 11.4.315，`/usr/local/cuda-11.4` | ✅ |
+| nvcc 宿主编译器 | 不低于所选 GCC 主版本 | `host_config.h` 上限 `__GNUC__ > 11` | ✅ gcc-10 可用 |
+| cuDNN | 官方口径 8.9 | 8.6.0（major 8 / minor 6） | ⚠️ 可先按 8.6 编，见 3.6 |
+| 编译器 | aarch64 必须支持 `-march=armv8.2-a+bf16`（GCC ≥ 10） | gcc / g++ 9.4.0 不支持 bf16；gcc-10 10.5.0 可装 | ⚠️ 装 gcc-10 编，见 3.2.3 |
+| libstdc++6 | ≥ 10（配 gcc-10 产物） | 10.5.0-1ubuntu1~20.04 | ✅ |
+| CMake | **≥ 3.26** | 系统 3.16.3 | ❌ 必须先另装 3.28.3 |
+| Python | **≥ 3.8，且只要解释器** | 系统自带 3.8 | ✅ |
+| 内存 | 无硬性下限，先按实测环境直接编 | 15 GiB（可用约 12 GiB） | 先试，OOM 再处理 |
+| swap | 暂不预置 | 仅 7.6 GB zram | 先不动，见 3.2.5 |
+| 磁盘 | 源码 + 构建约 25~30 GB | `/mnt/data` 可用 389 GB | ✅ 构建放这里 |
+| 源码 | 完整发布包（tarball 或 git clone） | 官方 v1.18.0 tarball | ✅ 需加 `--skip_submodule_sync` |
+
+#### 3.2.1 四条硬门槛（不满足会直接失败）
+
+1. **CMake ≥ 3.26。** `cmake/CMakeLists.txt` 第一行是
+   `cmake_minimum_required(VERSION 3.26)`；3.16.3 在配置第一步就报错退出。
+   不能改源码降版本——构建脚本用到了 3.26 才引入的 CMake 语法，改版本号后
+   会在后续配置步骤以其它形式失败。
+2. **Python ≥ 3.8。** `tools/ci_build/build.py` 在模块加载时执行
+   `_check_python_version()`，低于 3.8 直接抛 `UsageError`；同时
+   `cmake/CMakeLists.txt` 在 `--build_shared_lib` 下执行
+   `find_package(Python 3.8 COMPONENTS Interpreter)`。JetPack 系统 Python
+   （Ubuntu 20.04 自带 3.8）版本上刚好达标；为了不改基础环境，编译推荐在
+   独立 conda 环境里进行，见 3.3.1。
+3. **源码必须是完整发布包（tarball 或 git clone）。** `--update` 默认会执行
+   `git submodule sync/update --recursive`；使用官方 tarball 时没有 `.git`，
+   必须加 `--skip_submodule_sync`。onnx 1.16.0、flatbuffers 23.5.26、protobuf、
+   eigen、cutlass 等仍由 `cmake/deps.txt` 下载，不依赖子模块目录。零散拷贝的
+   残缺目录（缺源文件）仍然不能用。
+4. **aarch64 编译器必须支持 `-march=armv8.2-a+bf16`（GCC ≥ 10）。**
+   `cmake/CMakeLists.txt` 会对 aarch64 执行
+   `check_cxx_compiler_flag(-march=armv8.2-a+bf16 HAS_ARM64_BFLOAT16)`，
+   失败即 `FATAL_ERROR`；JetPack 5.1.2 自带的 GCC 9.4 不满足。而且
+   `cmake/onnxruntime_mlas.cmake` 会用同一 flag 无条件编译 Sbgemm 内核，
+   跳过检查也会在编译期失败。装 gcc-10 的办法见 3.2.3。
+
+#### 3.2.2 Python 库：本构建不要求任何版本
+
+这是最容易误解的一点，结论如下：
+
+- `--build_shared_lib --skip_tests` **不需要** `onnx`、`numpy`、`flatbuffers`、
+  `protobuf`、`sympy`、`packaging` 等任何 pip 包。C++ 侧依赖全部来自
+  `cmake/deps.txt` 下载的源码包（onnx、protobuf、flatbuffers 等）。
+- PyPI 的 `onnx`（Python 模型格式库）只在 ORT 的 Python 测试里被
+  `import onnx`（`build.py` 约 2105 行）；导入失败只打印
+  「ONNX tests will be skipped」，`--skip_tests` 下根本不会执行。
+- `install_python_deps()`（numpy / sympy / packaging / cerberus / pytest 等）
+  只在 **Windows + `--enable_pybind`** 分支调用，Linux 构建不会触发。
+- `numpy` 只在开启 `--enable_pybind` 时由
+  `find_package(Python 3.8 COMPONENTS ... NumPy)` 检查；本方案不开 pybind。
+- 因此构建过程不检查这些 pip 包的版本，环境里装没装、版本新旧都无关紧要，
+  不需要为了编译去安装或降级。
+
+> 只有以后要跑 ORT 的 Python 测试或构建 Python wheel 时，才需要
+> `pip install onnx numpy ...`，并按 ORT 的 Python 包要求选版本。
+
+#### 3.2.3 编译工具：GCC ≥ 10（aarch64 硬门槛）
+
+本机第一次编译在配置阶段直接失败：
+
+```text
+CMake Error at CMakeLists.txt:659 (message):
+  The compiler doesn't support BFLOAT16!!!
+```
+
+原因不在 CMake、不在依赖包，在 GCC 版本：
+
+- ORT **1.17 起**在 `cmake/CMakeLists.txt` 给 aarch64 加了检查：
+  `check_cxx_compiler_flag(-march=armv8.2-a+bf16 HAS_ARM64_BFLOAT16)`，
+  失败即 `FATAL_ERROR`。1.17 / 1.18 / 1.19 / 1.20 都这么写，没有开关能关掉。
+- `+bf16` 是 GCC 10 才加进 AArch64 `-march` 的扩展。JetPack 5.1.2 自带
+  GCC 9.4 不认识，实测：
+
+  ```text
+  $ g++ -march=armv8.2-a+bf16 -c /tmp/t.cpp
+  cc1plus: error: invalid feature modifier ‘bf16’ in ‘-march=armv8.2-a+bf16’
+  cc1plus: note: valid arguments are: fp simd crypto crc lse fp16 rcpc rdma dotprod ...
+  ```
+
+- 这不只是"检查"：`cmake/onnxruntime_mlas.cmake` 会用同一个 flag 无条件编译
+  `SbgemmKernelNeon.S` 与 `sbgemm_kernel_neon.cpp`，所以跳过检查也会在编译期
+  以同样原因失败，打补丁没有意义。
+- 官方 BUILD 文档没写 aarch64 / Jetson 的 GCC 版本要求，这一条只能从源码检查
+  里读出来；本机已实测确认。
+
+解决：装 gcc-10 与 9.4 并存，不改系统默认编译器：
 
 ```bash
+sudo apt update
+sudo apt install -y gcc-10 g++-10
+g++-10 -march=armv8.2-a+bf16 -c /tmp/t.cpp -o /tmp/t.o && echo "bf16 OK"
+```
+
+兼容性已逐项核对：
+
+| 项目 | 实测 | 结论 |
+|---|---|---|
+| gcc-10 / g++-10 | focal-updates/universe，10.5.0 | ✅ 可装 |
+| CUDA 11.4 nvcc | `host_config.h` 只在 `__GNUC__ > 11` 时报错 | ✅ 10.5 可用 |
+| 系统 libstdc++6 | 10.5.0-1ubuntu1~20.04 | ✅ gcc-10 产物可直接运行 |
+
+编译时用三个定义把工具链显式指过去（3.3.5 的命令里同样要加）：
+
+```bash
+--cmake_extra_defines CMAKE_C_COMPILER=/usr/bin/gcc-10 \
+                      CMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+                      CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10
+```
+
+换编译器后必须清掉旧构建目录，否则 CMake 缓存里的 `/usr/bin/c++` 与新编译器
+冲突，配置直接报 "compiler changed"：
+
+```bash
+rm -rf build/Linux/Release
+```
+
+备选：不想动工具链可退到 **ORT 1.16.3**——它的 `cmake/CMakeLists.txt` 与
+`cmake/onnxruntime_mlas.cmake` 里都没有 bf16 检查与 bf16 编译标志，GCC 9.4
+可直接编；代价是要重新准备 1.16.3 那套依赖包，见 3.3.4。
+
+#### 3.2.4 cuDNN 8.6 与 8.9 的取舍
+
+JetPack 5.1.2 自带 cuDNN 8.6.0，ORT 1.18.0 官方口径是 8.9。本方案选择
+**先用 8.6 直接编译**：编译期一般不卡版本；运行期若个别算子报
+`CUDNN_STATUS_NOT_SUPPORTED`，再按 3.6 升级到 8.9 复测，不必提前替换系统库。
+
+#### 3.2.5 内存与 swap（先不加，OOM 再补）
+
+Orin NX 16GB 的 15 GiB 物理内存先直接编译，不预置磁盘 swap。CUDA kernel 的
+LTO 链接阶段峰值较高，若链接阶段被内核杀掉（日志出现 `Killed` 或
+`c++: fatal error: Killed signal terminated program`），再按下面步骤临时加
+16 GB 磁盘 swap，并可在 3.3.5 把 `--parallel 6` 降到 4 后重跑：
+
+```bash
+free -h
 swapon --show
-# 若不足，临时创建 8 GB（示例）
-sudo fallocate -l 8G /swapfile_ort
-sudo chmod 600 /swapfile_ort
-sudo mkswap /swapfile_ort
-sudo swapon /swapfile_ort
+
+sudo fallocate -l 16G /mnt/data/swapfile_ort
+sudo chmod 600 /mnt/data/swapfile_ort
+sudo mkswap /mnt/data/swapfile_ort
+sudo swapon -p 10 /mnt/data/swapfile_ort    # 优先级高于 zram 的 5
+
+# 验证完成后回收
+# sudo swapoff /mnt/data/swapfile_ort && sudo rm /mnt/data/swapfile_ort
 ```
 
 ### 3.3 编译步骤
 
-#### 3.3.1 升级 CMake
+> **后续 3.3.1 ~ 3.3.5 的所有命令都必须在 3.3.1 准备的虚拟 Python 环境里执行**
+> （复用已有环境如 `conda activate py310`，新建环境为 `conda activate ort-build`；
+> 用 venv 时对应 `source .../bin/activate`）。系统 shell 里的 `cmake` 仍是 3.16.3，
+> 未做任何修改；忘记激活会直接卡在 CMake 版本检查，或在错误的环境里安装依赖。
+
+#### 3.3.1 准备 Python ≥ 3.8 环境与 CMake ≥ 3.26
+
+**首选使用虚拟环境，不动 JetPack 基础环境的 CMake。** 已经有 conda 环境时
+建议直接复用，不要新建；Python 只要求 ≥ 3.8 且只要解释器，构建不依赖任何
+Python 库，所以只需往环境里加一个 CMake，不会升级或降级已有包。先关闭 base 自动激活：
 
 ```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install "cmake==3.28.3"
-cmake --version    # 应 >= 3.26
+conda config --set auto_activate_base false   # 必须关闭，否则新 shell 自动激活 base，影响 ROS 等系统包
 ```
 
-> PyPI 的 cmake 包提供 aarch64 wheel；若 pip 源不可用，也可从
-> https://cmake.org/download/ 下载 `cmake-3.28.3-linux-aarch64.tar.gz` 解压后加入 PATH。
-
-#### 3.3.2 安装 Python 构建依赖
+**分支 A：复用已有虚拟环境（推荐）**——把 `py310` 换成实际环境名：
 
 ```bash
-python3 -m pip install "numpy==1.24.4" onnx protobuf flatbuffers packaging sympy
+conda activate py310              # 已有环境，示例名
+which python3                     # 应为 <miniconda 安装目录>/envs/py310/bin/python3
+conda list cmake                  # 先查 conda 版 cmake；有则 conda remove -n py310 cmake -y
+pip install "cmake==3.28.3"       # 只新增 cmake 入口，不动其它包
+hash -r                           # 清 bash 缓存，避免仍执行旧 cmake
+which cmake && cmake --version    # 应显示 3.28.3
+
+# 失败（仍显示 3.16.3 或 Could not find CMAKE_ROOT）时：
+#   conda remove -n py310 cmake -y
+#   pip install --force-reinstall "cmake==3.28.3"
+#   hash -r
 ```
 
-Python 3.8 下 numpy 最高可用 1.24.4，不要装 numpy 2.x。
+**分支 B：没有现成环境时新建**：
+
+```bash
+conda create -n ort-build python=3.10 -y
+conda activate ort-build
+which python3
+pip install "cmake==3.28.3"
+hash -r
+which cmake && cmake --version    # 应显示 3.28.3
+```
+
+PyPI 的 `cmake` 包是 CMake 官方 aarch64 二进制的分发形式，安装后只落在
+conda 环境的 `bin/` 下，激活该环境时生效；退出环境后系统仍是 3.16.3，
+不影响其它项目。若 pip 源不可用，也可从 https://cmake.org/download/ 下载
+`cmake-3.28.3-linux-aarch64.tar.gz`，解压后只在编译 shell 里
+`export PATH=<解压目录>/bin:$PATH`。设备上没有 conda 时，也可用系统 Python 3.8
+建 `venv`，或直接用上面这种 tarball 方式；两者同样不修改系统环境。
+
+#### 3.3.2 Python 库（本构建不需要）
+
+按 3.2.2 的源码结论，`--build_shared_lib --skip_tests` 不要求任何 Python 库，
+**不要**执行 `pip install numpy onnx protobuf flatbuffers packaging sympy`。
+环境里已有什么包保持原样即可，不需要为编译额外安装或升级。
 
 #### 3.3.3 获取源码
 
-必须用完整 git 仓库（带子模块）。WSL 上那份解压目录缺 `.git` 和
-`cmake/external/onnx` 子模块，不能直接拷过去用。
+用官方 v1.18.0 发布包（tarball）。归档包不带 `.git`，`cmake/external/onnx` 子模块
+为空，但 ORT 构建所需的 onnx 由 `cmake/deps.txt` 通过 FetchContent 下载，不依赖该子模块
+（子模块只用于 fuzzing 和 WASM）。所以 tarball 能正常编译，
+**但 3.3.5 必须加 `--skip_submodule_sync`**。
 
 ```bash
-cd ~
-git clone --recursive --depth 1 -b v1.18.0 \
-    https://github.com/microsoft/onnxruntime.git onnxruntime-1.18.0
+cd /mnt/data/code/3rd
+wget https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.18.0.tar.gz
+tar -xzf v1.18.0.tar.gz                # 解压出 onnxruntime-1.18.0/
+cd onnxruntime-1.18.0
+
+cat VERSION_NUMBER                     # 应为 1.18.0
+ls cmake/external/onnx                 # 空目录属于正常
 ```
 
-国内网络如需代理，在 clone 与后续 `--update` 阶段都要能访问 GitHub
-（CMake 会继续下载 onnx 1.16.0、protobuf、eigen、cutlass 等依赖）。
+wget 被墙挡住时，在 URL 前加镜像前缀即可（如
+`https://ghfast.top/https://github.com/...`），或在能下载的机器上下好再拷进来。
+第三方依赖不在这里处理，统一走 3.3.4。
 
-#### 3.3.4 编译
+#### 3.3.4 预下载依赖
+
+Jetson 现场直连 GitHub 时，CMake 的 FetchContent 下载阶段会被中途掐断
+（实测 abseil 成功、date v3.0.1 报 curl `status_code: 56` /
+`Failure when receiving data from the peer`）。所以固定成两步：**先在能下载的机器上
+把依赖全部下好并校验，随项目拷到 Jetson，再改写 `cmake/deps.txt` 为本地路径**。
+这样 3.3.5 的配置阶段完全不需要网络。
+
+镜像用 `https://ghfast.top/`（备选 `https://gh-proxy.com/`、`https://ghproxy.net/`），
+下发的是原始文件，SHA1 与 deps.txt 一致；
+下载脚本 fetch_ort_deps.py 随仓库提供，onnxruntime源码路径写死在文件顶部，按需修改为本地路径：[fetch_ort_deps.py](fetch_ort_deps.py)。
+ fetch_ort_deps.py 脚本具备1.下载cmake依赖、2.修改本地cmake/deps.txt 两个功能，所以本地下载完成后，还需要将下好依赖拷贝过去，再把主控onnxruntime路径中的cmake/deps.txt也改成下好的依赖库路径。
+
+
+**为什么必须改 `cmake/deps.txt`**：CMake 配置阶段只读源码目录里的这一份
+（Jetson 上是 `/mnt/data/code/3rd/onnxruntime-1.18.0/cmake/deps.txt`），
+包堆在 `ort_deps/` 里它不会自己去找。deps.txt 的 URL 列本身支持本地路径，
+脚本就是把 URL 列改成指向本地文件：
+
+```
+date;https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.zip;2dac...
+  ↓ 改写后（路径按 fetch_ort_deps.py 所在目录生成）
+date;<fetch_ort_deps.py 所在目录>/install/onnxruntime-1.18.0/ort_deps/date-v3.0.1.zip;2dac...
+```
+
+**要改的是 Jetson 上那份，不是开发机这份**。开发机改写后是 `/home/liyun/...`，
+Jetson 上不存在；两边各自跑一遍脚本，各自生成自己的路径。
+
+**第一步：在有VPN的主机上预下载ONNX的CMake依赖**：
 
 ```bash
-cd ~/onnxruntime-1.18.0
+cd <项目根>
+python3 -I onnxruntime/fetch_ort_deps.py
+```
+
+包落在 `fetch_ort_deps.py` 所在目录的 `install/onnxruntime-1.18.0/ort_deps/`，文件名是
+`<依赖名>-<原文件名>`，约 40 个、几百 MB。注意这个目录在 `.gitignore` 里，
+**git 不会把包带到 Jetson**。
+
+**第二步：把 `ort_deps/` 物理拷到 Jetson 项目的同名位置，再在 Jetson 上重跑脚本**。
+用平时同步项目的方式（rsync / scp / U 盘均可），且要包含被 ignore 的 `install/`：
+
+```
+开发机 <fetch_ort_deps.py 所在目录>/install/onnxruntime-1.18.0/ort_deps/
+   ↓ 拷贝
+Jetson <fetch_ort_deps.py 所在目录>/install/onnxruntime-1.18.0/ort_deps/
+```
+
+然后在 Jetson 上执行：
+
+```bash
+conda activate py310
+python3 -I <项目根>/onnxruntime/fetch_ort_deps.py
+```
+
+这一步不下载，只做两件事：逐个校验 SHA1（全部命中就打印 `[已存在]`），
+然后把 `/mnt/data/code/3rd/onnxruntime-1.18.0/cmake/deps.txt` 改写成 Jetson 的绝对路径。
+**不能直接把开发机改写好的 deps.txt 拷过去**——里面的绝对路径是开发机的，拷过去全部失效。
+
+要点：
+
+- 脚本按存在性自动选源码目录：开发机 `/home/liyun/code/AI/3rd/onnxruntime-1.18.0`，
+  Jetson `/mnt/data/code/3rd/onnxruntime-1.18.0`。
+- **`ort_deps/` 路径固定为 `<fetch_ort_deps.py 所在目录>/install/onnxruntime-1.18.0/ort_deps/`**，
+  与项目根无关。把脚本拷到别处执行（例如直接放进 ORT 源码目录），路径会跟着变成
+  `<源码目录>/install/onnxruntime-1.18.0/ort_deps/`，此时把包放在仓库 `onnxruntime/` 下就不会被识别。
+  要固定位置就改脚本顶部的 `DEPS_DIR`。只要 `deps.txt` 改写后的路径与实际文件一致，构建都能用。
+- 任何一项失败时**不改写** `deps.txt`，换 `MIRROR` 后重跑，已完成的会跳过。
+- `eigen` 在 gitlab.com，不走镜像；连不上时单独手动下载放进 `ort_deps/` 再重跑。
+- **`eigen` 的 SHA1 已被脚本覆盖**：GitLab 重新生成过归档，同一 commit
+  （`e7248b26...`）的 zip 字节变了，ORT 1.18.0 记录的 `be8be39f...` 对不上；
+  实测 GitLab 现版 `32b145f5...` 与 GitHub 镜像同 commit 归档解压后文件树零差异，
+  只是打包元数据不同。脚本里 `SHA1_OVERRIDES` 已写入实测值并在改写 deps.txt 时带上，
+  否则手动下载和 CMake 自下都会校验失败。上游 v1.19/v1.20 仍是旧 hash，
+  v1.22 起才换 commit。
+- 不想跑第二次时，也可以在 Jetson 上手工把 deps.txt 的 URL 换成
+  `ort_deps/<依赖名>-<原文件名>`，效果相同；文件名对不上会漏。
+- 首次运行会把原文件备份成 `cmake/deps.txt.orig`；想恢复联网构建用
+  `cp cmake/deps.txt.orig cmake/deps.txt`。日常不用改回去——有预下载的本地路径，
+  配置阶段就不会再碰网络。
+
+#### 3.3.5 编译
+
+编译约 1.5~3 小时，**命令要写日志**：日志是失败后唯一能回看的东西。
+用 NoMachine / 本地桌面时直接在当前终端跑即可（进程在机器上，断开远程桌面不会杀它，
+只要不关终端、不注销、不重启）；从 SSH 登录时才需要套一层 `tmux`
+（终端复用器，断线后 `tmux attach -t ort-build` 可回到原来的会话）。
+
+**换 gcc 后必须从空的构建目录开始**：之前用 9.4 配置失败时已经生成过
+`build/Linux/Release/CMakeCache.txt`，CMake 记住了 `/usr/bin/c++`，再用新编译器
+会直接报 "compiler changed"。先删掉（只含失败的配置产物，依赖会从本地
+`ort_deps/` 重新解压，不联网），再跑下面的命令。gcc-10 的安装见 3.2.3。
+
+```bash
+rm -rf /mnt/data/code/3rd/onnxruntime-1.18.0/build/Linux/Release
+
+conda activate py310              # 换成实际使用的编译环境
+cd /mnt/data/code/3rd/onnxruntime-1.18.0
+
+# 仅 SSH 登录时取消注释；NoMachine / 本地桌面直接跳过
+# tmux new -s ort-build           # 断线后 tmux attach -t ort-build 回到现场
 
 ./build.sh --config Release \
   --build_shared_lib \
@@ -251,10 +564,28 @@ cd ~/onnxruntime-1.18.0
   --cuda_version 11.4 \
   --disable_types float8 \
   --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=87 \
+  --cmake_extra_defines CMAKE_C_COMPILER=/usr/bin/gcc-10 \
+                        CMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+                        CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10 \
   --parallel 6 \
   --skip_tests \
-  --update --build
+  --skip_submodule_sync \
+  --update --build 2>&1 | tee /mnt/data/ort_build_$(date +%m%d_%H%M).log
 ```
+
+跑过 3.3.4 后，`--update` 的配置阶段读的是本地包，全程不需要网络；如果恢复成
+`deps.txt.orig`，则会在这一步联网下载依赖（几百 MB）。日志出现
+`-- Configuring done` / `-- Build files have been written to:` 后即进入编译。
+
+配置阶段先确认两行再走开：`HAS_ARM64_BFLOAT16 - Success` 和
+`C++ compiler version: 10.5.0`。如果仍显示 9.4.0、或继续报
+`The compiler doesn't support BFLOAT16`，说明三个 `-D` 没生效——先查有没有
+删掉旧 `build/Linux/Release`，再核对路径 `/usr/bin/gcc-10` 是否存在。
+
+`build.sh` **只编译不安装**：v1.18.0 的 `build.py` 没有 `--install` /
+`--install_prefix` 参数（argparse 严格解析，传了直接 `unrecognized arguments` 退出），
+产物留在 `build/Linux/Release/`，安装路径在 3.4 再决定。日志里的
+`Failed to import psutil` 只是让 build.py 退回 `NVCC_THREADS=1`，不影响结果。
 
 关键参数说明：
 
@@ -267,13 +598,15 @@ cd ~/onnxruntime-1.18.0
 | `--cuda_version 11.4` | 让构建脚本按 CUDA 11.4 做特性开关检查 |
 | `--disable_types float8` | **必须**。CUDA 11.4 < 11.8，没有 FP8 类型；不加会报 `Float 8 types require CUDA>=11.8` |
 | `CMAKE_CUDA_ARCHITECTURES=87` | Orin NX 的 compute capability；显式指定后不再走 ORT 默认的多架构列表，编译更快 |
+| `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` / `CMAKE_CUDA_HOST_COMPILER` | 把整条工具链指向 `/usr/bin/gcc-10`、`/usr/bin/g++-10`。**必须三个一起给**：前两个决定 C/C++，第三个决定 nvcc 的宿主编译器（不指定会按 PATH 退回 gcc 9）。原因见 3.2.3 |
 | `--parallel 6` | Orin NX 8 核，留出余量；内存紧张时降到 4 |
 | `--skip_tests` | 跳过单元测试，节省 30 分钟以上 |
+| `--skip_submodule_sync` | tarball 没有 `.git`，跳过 `git submodule update`；onnx 仍由 `deps.txt` 下载 |
 | `--update --build` | 先配置（下载第三方依赖）再编译 |
 
 > 若设备是 Xavier 系列，把 `87` 改成 `72`；Nano 改成 `53`。
 
-编译约 1.5~3 小时（取决于 Orin NX 散热与 swap 情况）。
+编译时长取决于 Orin NX 散热与是否触发 swap。
 
 ### 3.4 安装到本目录
 
@@ -281,7 +614,7 @@ cd ~/onnxruntime-1.18.0
 例如 `/home/nvidia/audio_ai_process`）：
 
 ```bash
-ORT_SRC="$HOME/onnxruntime-1.18.0"
+ORT_SRC="/mnt/data/code/3rd/onnxruntime-1.18.0"
 BUILD="$ORT_SRC/build/Linux/Release"
 DEST="<项目根>/onnxruntime/install/onnxruntime-1.18.0"
 
@@ -337,7 +670,7 @@ ldd "$DEST/lib/libonnxruntime_providers_cuda.so" \
 用 CUDA EP 跑一个模型：
 
 ```bash
-ORT_SRC="$HOME/onnxruntime-1.18.0"
+ORT_SRC="/mnt/data/code/3rd/onnxruntime-1.18.0"
 DEST="<项目根>/onnxruntime/install/onnxruntime-1.18.0"
 
 export LD_LIBRARY_PATH="$DEST/lib:/usr/local/cuda-11.4/lib64:$LD_LIBRARY_PATH"
@@ -352,7 +685,9 @@ export LD_LIBRARY_PATH="$DEST/lib:/usr/local/cuda-11.4/lib64:$LD_LIBRARY_PATH"
 | 现象 | 原因与处理 |
 |---|---|
 | `Float 8 types require CUDA>=11.8` | 漏了 `--disable_types float8`；与 `--cuda_version 11.4` 必须同时出现 |
-| CMake 报版本过低 | JetPack 自带 3.16，按 3.3.1 升级到 ≥ 3.26 |
+| CMake 报版本过低 | JetPack 自带 3.16，按 3.3.1 在 conda 环境装 3.28.3；`which cmake` 必须指向 env 的 `bin` |
+| 装了 cmake 仍显示 3.16.3 | 先 `hash -r` 清 bash 的命令缓存；仍不对再检查 conda 环境是否激活、`which cmake` 是否指向 env 的 `bin` |
+| pip 装了 cmake 仍报 `Could not find CMAKE_ROOT` | 多半是 shell 缓存仍指向旧的 conda cmake（其模块目录已缺失）；`hash -r` 后重试，仍不行再新建干净环境 |
 | 链接阶段被杀（OOM） | 增大 swap，`--parallel` 降到 4 |
 | 编译报找不到 cuDNN 符号 | JetPack 5.1.2 自带 cuDNN 8.6，低于 ORT 1.18.0 要求的 8.9；可到 NVIDIA 开发者网站下载 JetPack 5 对应的 cuDNN 8.9 aarch64 deb 升级 |
 | 运行时报 `CUDNN_STATUS_NOT_SUPPORTED` | 同上，优先升级到 cuDNN 8.9；也可临时改用 CPU EP 验证模型本身 |
@@ -383,3 +718,10 @@ export LD_LIBRARY_PATH="$DEST/lib:/usr/local/cuda-11.4/lib64:$LD_LIBRARY_PATH"
 |---|---|
 | 2026-11-02 | 创建；合并原 `install/onnxruntime-1.18.0/README.md` 与 `USAGE.md`，统一放在本文件 |
 | 2026-11-02 | 目标设备确认 Jetson Orin NX 16GB（sm_87）；WSL 侧 cuDNN 9.10.2 安装完成并校验 |
+| 2026-11-03 | 按 Jetson 实测重写 3.2 前置条件；确认 C++ 共享库构建不要求任何 Python 库，复用已有 conda 环境与 `/mnt/data` 构建路径；源码改用官方 tarball + `--skip_submodule_sync` |
+| 2026-11-03 | 编译首次实测：补 `tee` 日志（tmux 仅 SSH 需要，NoMachine 桌面不需要）；确认 v1.18.0 `build.py` 无 `--install`，产物在 `build/Linux/Release/`，安装见 3.4 |
+| 2026-11-03 | 依赖下载实测 date v3.0.1 被 GitHub 掐断（curl 56）；新增 `fetch_ort_deps.py`（镜像下载 + SHA1 校验 + 改写 deps.txt 为本地路径），依赖预先下载到 `install/onnxruntime-1.18.0/ort_deps/` |
+| 2026-11-03 | 章节固定为 3.3.4 预下载依赖 / 3.3.5 编译：Jetson 现场下载失败，改为开发机先下好、随项目同步后在 Jetson 上重跑脚本校验并改写路径；3.3.4 补充「为什么必须改 deps.txt」与跨机同步的路径说明 |
+| 2026-11-03 | 实测 eigen 归档 SHA1 过期（GitLab 重新打包，同 commit 内容与 GitHub 镜像零差异）；脚本增加 `SHA1_OVERRIDES`，将 eigen 期望值改为 `32b145f5...` 并写入改写后的 deps.txt |
+| 2026-11-03 | 编译实测配置阶段失败：ORT 1.17 起对 aarch64 强制要求 `-march=armv8.2-a+bf16`（GCC ≥ 10），JetPack 5.1.2 自带 GCC 9.4 不满足；新增 3.2.3 编译工具小节，3.2 前置检查命令与实测表补充 nvcc 上限、libstdc++、gcc-10 可装性；硬门槛由三条改为四条 |
+| 2026-11-03 | 3.3.5 编译命令改用 gcc-10（`CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` / `CMAKE_CUDA_HOST_COMPILER` 三个定义），补充换编译器必须清空 `build/Linux/Release` 与配置阶段的验收点 |
