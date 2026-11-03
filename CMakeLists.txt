@@ -264,6 +264,53 @@ endif()
 ort_link_target(test_wav_asr.out)
 
 # ---------------------------------------------------------------------
+# 可执行文件：test_mic_asr.out
+#   设备实时音频 -> AudioPreprocess -> AsrDecoder（ORT 三模型）-> 文本
+#   + SpectrogramImage 窗口与底部识别文字；依赖海康 SDK、OpenCV、ORT。
+# ---------------------------------------------------------------------
+add_executable(test_mic_asr.out
+    test_mic_asr.cpp
+    audio_ai_process/audio_preprocess.cpp
+    audio_ai_process/asr_decode.cpp
+    audio_ai_process/text_utils.cpp
+    audio_ai_process/text_renderer.cpp
+    audio_ai_process/spectrogram_image.cpp
+    ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
+)
+
+target_compile_definitions(test_mic_asr.out PRIVATE
+    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+target_include_directories(test_mic_asr.out PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${HK_MIC_DIR}
+    ${HIK_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_mic_asr.out PRIVATE
+    ${OpenCV_LIBS}
+    ${HIK_LIBS}
+    Threads::Threads
+)
+
+set_target_properties(test_mic_asr.out PROPERTIES
+    BUILD_RPATH "${HIK_LIB_ROOT}"
+    INSTALL_RPATH "${HIK_LIB_ROOT}"
+)
+
+# 中文识别结果渲染：与 test_wav_asr.out 相同的可选 FreeType 依赖，
+# 找不到时 text_renderer 编译成空实现，入口回退 cv::putText。
+if(FREETYPE_FOUND)
+    target_compile_definitions(test_mic_asr.out PRIVATE HK_HAVE_FREETYPE=1)
+    target_include_directories(test_mic_asr.out PRIVATE ${FREETYPE_INCLUDE_DIRS})
+    target_link_libraries(test_mic_asr.out PRIVATE ${FREETYPE_LIBRARIES})
+endif()
+
+ort_link_target(test_mic_asr.out)
+
+# ---------------------------------------------------------------------
 # 可执行文件：load_onnx_model.out
 #   模型加载自检：打开 encoder / decoder / joiner，打印输入输出与 metadata。
 #   不依赖 OpenCV 和海康 SDK，只依赖 ONNX Runtime。

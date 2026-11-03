@@ -55,6 +55,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "HCNetSDK.h"
@@ -89,6 +90,9 @@ struct AudioCaptureConfig {
     int max_stream_samples = 40960;       ///< 取流缓冲上限（样本数）：40960 ≈ 2.56 s @16 kHz，
                                           ///< 与 Python mic 的 256×160 块对齐；满了丢最旧样本；
                                           ///< <=0 表示关闭取流缓存（get_last_audio 恒返回 false）
+    bool uplink_keepalive = true;         ///< G.722.1 下每 40 ms 回发一帧静音。
+                                          ///< 手册要求语音转发双向；实测只收不发时设备
+                                          ///< 约 10 秒后停掉回调，置 false 会复现该断流
     bool verbose = true;                  ///< 是否打印登录、编码格式、错误信息
 };
 
@@ -105,6 +109,8 @@ struct AudioCaptureStats {
     uint64_t stream_samples_taken = 0;   ///< 已被 get_last_audio() 取走的累计样本数
     uint64_t decode_errors = 0;       ///< DecodeG722Frame 失败次数
     uint64_t write_errors = 0;        ///< fwrite 失败次数
+    uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（G.722 80 B/帧）
+    uint64_t uplink_send_errors = 0;  ///< 上行保活发送失败次数；持续增长说明会话已失效
     uint64_t dropped_partial_bytes = 0; ///< stop() 时不足一帧而丢弃的字节数
     double wall_seconds = 0.0;        ///< 从 start() 到 stop() 的墙钟时长
 };
@@ -215,6 +221,12 @@ private:
     void decode_pending_locked();
     void append_stream_locked(const unsigned char* data, size_t bytes);
 
+    // —— 上行保活（G.722.1）——
+    bool init_uplink_keepalive();
+    void start_uplink_keepalive();
+    void stop_uplink_keepalive();
+    void uplink_keepalive_loop();
+
     // —— wav 写入 ——
     bool write_pcm_locked(const unsigned char* data, size_t size);
     static void write_u16(FILE* f, uint16_t value);
@@ -242,6 +254,13 @@ private:
 
     AudioCodec m_codec = AudioCodec::kG7221;    ///< 设备当前编码
     int m_output_sample_rate = 16000;           ///< 实际写进 wav 头的采样率
+
+    // 上行保活：句柄用原子量给保活线程读；stop() 先停线程再关语音转发
+    void* m_encoder = nullptr;                   ///< G.722 编码器（只在 init 时用）
+    std::vector<unsigned char> m_silence_frame;  ///< 80 B G.722 静音帧，线程只读
+    std::atomic<LONG> m_voice_handle_atomic{-1}; ///< 保活线程看到的语音转发句柄
+    std::atomic<bool> m_keepalive_running{false};
+    std::thread m_keepalive_thread;
 
     // wav 文件
     FILE* m_wav = nullptr;

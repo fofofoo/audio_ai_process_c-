@@ -78,6 +78,11 @@ HkSdkAudioClient::~HkSdkAudioClient() {
         NET_DVR_ReleaseG722Decoder(m_decoder);
         m_decoder = nullptr;
     }
+    // 保活用的 G.722 编码器与解码器一样按实例复用，析构时统一释放。
+    if (m_encoder != nullptr) {
+        NET_DVR_ReleaseG722Encoder(m_encoder);
+        m_encoder = nullptr;
+    }
     if (m_sdk_initialized) {
         NET_DVR_Cleanup();
         m_sdk_initialized = false;
@@ -164,7 +169,30 @@ bool HkSdkAudioClient::start() {
         return false;
     }
 
-    // 五、打印登录、编码格式、错误信息
+    // 五、上行保活：手册要求语音转发双向（除了收设备音频，也要用
+    //     NET_DVR_VoiceComSendData 发编码数据回去）。实测只收不发时，设备
+    //     在约 10 秒后停止回调，窗口和识别随之冻结；每 40 ms 回发一帧
+    //     80 字节 G.722 静音即可长期维持。PCM 路径未实测，暂不启用。
+    if (m_config.uplink_keepalive && m_codec == AudioCodec::kG7221) {
+        if (init_uplink_keepalive()) {
+            start_uplink_keepalive();
+            if (m_config.verbose) {
+                std::cout << "[Audio] uplink keepalive: 每 40 ms 回发一帧 G.722 静音"
+                          << std::endl;
+            }
+        } else if (m_config.verbose) {
+            std::cout << "[Audio] uplink keepalive 初始化失败，设备可能在约 10 "
+                         "秒后停止语音转发"
+                      << std::endl;
+        }
+    } else if (m_config.verbose && m_config.uplink_keepalive &&
+               m_codec == AudioCodec::kPcm) {
+        std::cout << "[Audio] PCM 路径暂未启用上行保活；若音频在约 10 秒后中断，"
+                     "需要按 PCM 帧长补发"
+                  << std::endl;
+    }
+
+    // 六、打印登录、编码格式、错误信息
     if (m_config.verbose) {
         std::cout << "[Audio] voice com started, channel=" << m_config.voice_channel
                   << ", recording=off" << std::endl;
@@ -238,11 +266,15 @@ void HkSdkAudioClient::stop_record() {
 void HkSdkAudioClient::stop() {
     const bool was_running = m_running.exchange(false);
 
+    // 先停上行保活线程，再关语音转发：反过来会让线程往正在销毁的句柄发数据。
+    stop_uplink_keepalive();
+
     // 让设备关掉这条语音对讲线路，不再转发回调
     if (m_voice_handle >= 0) {
         NET_DVR_StopVoiceCom(m_voice_handle);
         m_voice_handle = -1;
     }
+    m_voice_handle_atomic.store(-1);
 
     // 录制中退出时先收尾文件：此时回调已停止，可安全 fclose + 改名。
     stop_record();
@@ -261,6 +293,82 @@ void HkSdkAudioClient::stop() {
             const auto now = std::chrono::steady_clock::now();
             m_stats.wall_seconds =
                 std::chrono::duration<double>(now - m_start_time).count();
+        }
+    }
+}
+
+// ==================== 上行保活 ====================
+
+// 建 G.722 编码器并预编码一帧静音。
+// 前置条件：设备编码已确定为 G.722.1，调用时语音转发已启动。
+// 编码器按实例复用（重复 start 不重建）；静音帧只在这里写一次，
+// 保活线程只读，因此两者不需要额外加锁。
+bool HkSdkAudioClient::init_uplink_keepalive() {
+    if (m_encoder == nullptr) {
+        NET_DVR_AUDIOENC_INFO enc_info{};
+        enc_info.in_frame_size =
+            static_cast<DWORD>(kPcmBytesPerFrame);  // 640 点 PCM16 = 1280 B
+        m_encoder = NET_DVR_InitG722Encoder(&enc_info);
+        if (m_encoder == nullptr) {
+            set_error("NET_DVR_InitG722Encoder failed, error=" +
+                      std::to_string(NET_DVR_GetLastError()));
+            return false;
+        }
+    }
+
+    // 设备只校验「上行数据与当前编码一致」，内容可以是静音：把 640 个 0
+    // 采样点编成一帧 G.722（默认 80 B）。长度取配置里的 encoded_frame_bytes，
+    // 改码率时不用改代码。
+    m_silence_frame.assign(static_cast<size_t>(m_config.encoded_frame_bytes), 0);
+    std::vector<unsigned char> pcm(kPcmBytesPerFrame, 0);
+    NET_DVR_AUDIOENC_PROCESS_PARAM param{};
+    param.in_buf = pcm.data();
+    param.out_buf = m_silence_frame.data();
+    param.out_frame_size = static_cast<DWORD>(m_silence_frame.size());
+    if (!NET_DVR_EncodeG722Frame(m_encoder, &param)) {
+        set_error("NET_DVR_EncodeG722Frame failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+        return false;
+    }
+    return true;
+}
+
+// 启动保活线程。句柄先写进原子量再起线程，线程不会读到旧值或半初始化状态。
+void HkSdkAudioClient::start_uplink_keepalive() {
+    m_voice_handle_atomic.store(m_voice_handle);
+    m_keepalive_running.store(true);
+    m_keepalive_thread = std::thread(&HkSdkAudioClient::uplink_keepalive_loop, this);
+}
+
+// 停保活线程并清空句柄。可重复调用；join 最多等循环里的一小片 sleep（5 ms）。
+void HkSdkAudioClient::stop_uplink_keepalive() {
+    m_keepalive_running.store(false);
+    if (m_keepalive_thread.joinable()) {
+        m_keepalive_thread.join();
+    }
+    m_voice_handle_atomic.store(-1);
+}
+
+// 保活线程主体：每 40 ms 发一帧 G.722 静音（一帧正好 640 点 = 40 ms）。
+// 发送失败只计数，不打印、不退出：偶发网络抖动不应该把线程打死，
+// 持续失败可以从 stats.uplink_send_errors 看出来。
+void HkSdkAudioClient::uplink_keepalive_loop() {
+    while (m_keepalive_running.load()) {
+        const LONG handle = m_voice_handle_atomic.load();
+        if (handle >= 0 && !m_silence_frame.empty()) {
+            const bool ok = NET_DVR_VoiceComSendData(
+                handle, reinterpret_cast<char*>(m_silence_frame.data()),
+                static_cast<DWORD>(m_silence_frame.size()));
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (ok) {
+                ++m_stats.uplink_sent_frames;
+            } else {
+                ++m_stats.uplink_send_errors;
+            }
+        }
+        // 分 8 片睡，stop() 的 join 不用等满一整帧。
+        for (int i = 0; i < 8 && m_keepalive_running.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 }

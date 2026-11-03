@@ -2,7 +2,7 @@
 
 本文说明海康 HCNetSDK 语音转发链路里三个最容易混淆的概念：**G.722.1 协议帧**、**海康 SDK 的解码单元**、**网络回调包**。它们分别是 20 ms、40 ms 和「任意长度」，混为一谈会直接导致误判码率、误算包频率、误写 wav 头。
 
-全文围绕一条链路展开：第一章拆开帧长、回调包与解码单元三个易混概念，并依次展开两个核心接口（`NET_DVR_StartVoiceCom_MR_V30` 与 G.722.1 解码接口族）、两条数据路径、40 ms 的成立条件、频率与数据量、常见误解和已知限制；第二章按生命周期讲客户端的落地实现（start 六步 → 回调分流 → stop 收尾）。接入方式、编码选型、录音流程见根 [README.md](../README.md)，客户端实现见 [hk_sdk_audio_client.cpp](../hk_sdk_h264_src/hk_sdk_audio_client.cpp)。
+全文围绕一条链路展开：第一章拆开帧长、回调包与解码单元三个易混概念，并依次展开两个核心接口（`NET_DVR_StartVoiceCom_MR_V30` 与 G.722.1 解码接口族）、两条数据路径、40 ms 的成立条件、频率与数据量、常见误解和已知限制；第二章按生命周期讲客户端的落地实现（start 六步 → 回调分流 → stop 收尾）。接入方式、编码选型、录音流程见根 [README.md](../README.md)，客户端实现见 [hk_sdk_audio_client.cpp](hk_sdk_audio_client.cpp)。
 
 ## 结论速查
 
@@ -70,7 +70,7 @@ SDK 为什么固定这个比例，手册没有解释，但从接口形态可以�
 
 ### 1.4 核心接口 1：NET_DVR_StartVoiceCom_MR_V30
 
-第二章 2.2 的 start 第 6 步和整条回调链都绕不开这个接口。它是整条链路唯一「出数据」的入口：登录、查编码、开文件都是为它做准备，解码、统计、写 wav 都是在处理它推回来的数据。它位于 [hk_sdk_audio_client.cpp:151](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L151)。
+第二章 2.2 的 start 第 6 步和整条回调链都绕不开这个接口。它是整条链路唯一「出数据」的入口：登录、查编码、开文件都是为它做准备，解码、统计、写 wav 都是在处理它推回来的数据。它位于 [hk_sdk_audio_client.cpp:151](hk_sdk_audio_client.cpp#L157)。
 
 #### 1.4.1 它是什么
 
@@ -108,7 +108,7 @@ void CALLBACK f(LONG  lVoiceComHandle,   // 与返回值相同的对讲句柄
 
 - 返回 `LONG` 句柄，`< 0` 失败，失败码用 `NET_DVR_GetLastError()` 取；
 - 句柄只供 `NET_DVR_StopVoiceCom()` 使用，不参与数据读取；
-- 失败收尾（[hk_sdk_audio_client.cpp:160-169](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L160-L169)）：撤销运行标志 → 锁内 `close_wav()` → 记录错误。此时还没有回调，`.part` 会被改名成合法但为空的 wav，便于确认失败时间点。
+- 失败收尾（[hk_sdk_audio_client.cpp:160-169](hk_sdk_audio_client.cpp#L165-L169)）：撤销运行标志 → 锁内 `close_wav()` → 记录错误。此时还没有回调，`.part` 会被改名成合法但为空的 wav，便于确认失败时间点。
 
 #### 1.4.4 byAudioFlag 是最关键的一个字节
 
@@ -117,7 +117,7 @@ void CALLBACK f(LONG  lVoiceComHandle,   // 与返回值相同的对讲句柄
 | 1 | 设备端编码后的音频（拾音器） | 接收，进入解码或直接写盘 |
 | 其他 | 本地麦克风、控制数据等 | 丢弃，否则会把噪声或控制帧写进 wav |
 
-客户端在 [hk_sdk_audio_client.cpp:396](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L396) 做的第一个判断就是 `flag != 1` 直接返回。这个判断比帧长、包长都重要：漏判一次，整段 wav 就会被无关数据污染。
+客户端在 [hk_sdk_audio_client.cpp:396](hk_sdk_audio_client.cpp#L581) 做的第一个判断就是 `flag != 1` 直接返回。这个判断比帧长、包长都重要：漏判一次，整段 wav 就会被无关数据污染。
 
 #### 1.4.5 为什么是这个接口，而不是另外几个
 
@@ -145,6 +145,20 @@ stop()： NET_DVR_StopVoiceCom         ← 必须先停，阻断新回调
 
 另外 `NET_DVR_Init` / `NET_DVR_Cleanup` 是实例级的，本类与可见光/热成像客户端混跑会互相清理，详见项目 [CLAUDE.md](../CLAUDE.md) 约束 1。
 
+#### 1.4.7 上行保活：只收不发约 10 秒后设备停流
+
+手册《语音对讲转发广播模块》写明语音转发是**双向**的：「除了接收设备发送过来语音数据，也需要发送语音数据给设备」，发送用 `NET_DVR_VoiceComSendData`（G.722 每次 80 字节）。
+
+实测（`test_mic_asr` 与独立探针，2026-11-03）：只收不发时，设备稳定送满约 **10.5 秒**（180 个回调包 / 168960 样本，`stream_dropped_samples = 0`）后回调彻底停止；窗口停止滚动、识别不再出字，但主循环与取流缓冲都正常。每 40 ms 回发一帧 **G.722 静音**后，连续 30 秒以上回调不断。
+
+实现要点：
+
+- 静音帧由 `NET_DVR_InitG722Encoder` + `NET_DVR_EncodeG722Frame` 把 640 个 0 采样点编成 80 B，只编一次、线程只读；
+- 保活线程每 40 ms 调一次 `NET_DVR_VoiceComSendData`，句柄用原子量传递；
+- `stop()` 必须先停线程再 `NET_DVR_StopVoiceCom`，否则线程可能往正在销毁的句柄发数据；
+- 统计里 `uplink_sent_frames` / `uplink_send_errors` 可判断保活是否正常；
+- 配置项 `uplink_keepalive` 默认开启；PCM 路径未实测，暂不启用。
+
 ### 1.5 核心接口 2：G.722.1 解码接口族
 
 第二章 2.3 的 G.722.1 分支里，`decode_pending_locked` 循环调用的就是这一族接口。`StartVoiceCom` 负责把编码字节取回来，解码接口负责把编码字节变成 PCM——没有它，G.722.1 路径就只是一个不断变长的二进制缓冲。
@@ -161,9 +175,9 @@ stop()： NET_DVR_StopVoiceCom         ← 必须先停，阻断新回调
 
 | 动作 | 位置 |
 | --- | --- |
-| 创建 | [hk_sdk_audio_client.cpp:125](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L125)（`start()` 第 4 步） |
-| 解码 | [hk_sdk_audio_client.cpp:455](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L455)（`decode_pending_locked()` 循环内） |
-| 释放 | [hk_sdk_audio_client.cpp:77](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L77)（析构） |
+| 创建 | [hk_sdk_audio_client.cpp:125](hk_sdk_audio_client.cpp#L133)（`start()` 第 4 步） |
+| 解码 | [hk_sdk_audio_client.cpp:455](hk_sdk_audio_client.cpp#L645)（`decode_pending_locked()` 循环内） |
+| 释放 | [hk_sdk_audio_client.cpp:77](hk_sdk_audio_client.cpp#L78)（析构） |
 
 创建放在 `start()`、释放在析构，而不是成对放在 `start()`/`stop()`：`stop()` 之后仍然可以再次 `start()`，句柄可以复用，没必要反复申请释放。
 
@@ -211,7 +225,7 @@ G.722.1 属于自适应预测编码，解码器内部保留前一帧的预测状
 
 #### 1.5.5 平台差异
 
-同一组接口在不同平台签名不同（见 [HCNetSDK.h:52014-52029](../hk_sdk_h264_src/hk_sdk/include/HCNetSDK.h#L52014-L52029)）：
+同一组接口在不同平台签名不同（见 [HCNetSDK.h:52014-52029](hk_sdk/include/HCNetSDK.h#L52016-L52029)）：
 
 | 平台 | `InitG722Decoder` | `DecodeG722Frame` |
 | --- | --- | --- |
@@ -256,11 +270,11 @@ SDK 里还有 `NET_DVR_DecodeG711Frame`、`NET_DVR_DecodeG726Frame`，但本项�
 
 | 步骤 | 位置 |
 | --- | --- |
-| 回调分流（`byAudioFlag == 1` 才收） | [hk_sdk_audio_client.cpp:396](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L396) |
-| 编码字节累积 + 触发切帧 | [hk_sdk_audio_client.cpp:426](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L426) |
-| 按 80 字节逐帧解码 | [hk_sdk_audio_client.cpp:435](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L435) |
-| 解码输出缓冲（1280 B × 4 预留） | [hk_sdk_audio_client.cpp:43](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L43) |
-| 追加写 wav | [hk_sdk_audio_client.cpp:495](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L495) |
+| 回调分流（`byAudioFlag == 1` 才收） | [hk_sdk_audio_client.cpp:396](hk_sdk_audio_client.cpp#L581) |
+| 编码字节累积 + 触发切帧 | [hk_sdk_audio_client.cpp:426](hk_sdk_audio_client.cpp#L611) |
+| 按 80 字节逐帧解码 | [hk_sdk_audio_client.cpp:435](hk_sdk_audio_client.cpp#L645) |
+| 解码输出缓冲（1280 B × 4 预留） | [hk_sdk_audio_client.cpp:43](hk_sdk_audio_client.cpp#L57) |
+| 追加写 wav | [hk_sdk_audio_client.cpp:495](hk_sdk_audio_client.cpp#L689) |
 
 边界处理：
 
@@ -279,7 +293,7 @@ SDK 里还有 `NET_DVR_DecodeG711Frame`、`NET_DVR_DecodeG726Frame`，但本项�
 PCM（`byAudioEncType == 8`）不经过编码器，也就没有“帧”和“最小单元”：
 
 - 回调数据是裸 PCM16 样本流，长度任意；
-- 不需要组帧、不需要解码，直接按字节追加（[hk_sdk_audio_client.cpp:415](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L415)）；
+- 不需要组帧、不需要解码，直接按字节追加（[hk_sdk_audio_client.cpp:415](hk_sdk_audio_client.cpp#L601)）；
 - 写入时长完全由「字节数 ÷ 采样率」决定，没有 40 ms 约束；
 - 采样率必须取设备实际返回值（本机实测被固定为 32 kHz，请求 16 kHz 不生效）。
 
@@ -327,9 +341,11 @@ PCM（`byAudioEncType == 8`）不经过编码器，也就没有“帧”和“�
 | G.722.1 路径 | 固定按 80 字节切帧，未做抖动缓冲 | 设备推送节奏突变时可能短暂累积；残包停止时丢弃 |
 | 音频链路 | 不补静音 | 静音段在 wav 中被压缩，音频时长小于墙钟 |
 | 码率 | 按 16 kbps 假设推导 40 ms | 设备改码率后需重新核对解码单元与时长关系 |
+| 上行保活 | `NET_DVR_VoiceComSendData` 回发静音失败只计数 `uplink_send_errors`，不触发重连 | 会话失效后回调会再次停流，需调用方看统计或重开 `start()` |
+| 上行保活 | PCM 编码路径未实测，暂不启用（`uplink_keepalive` 只对 G.722.1 生效） | 设备切 PCM 后若同样 10 秒断流，需另行验证 |
 ## 二、落地实现：客户端工作流（HkSdkAudioClient）
 
-第一章讲数据形态、两个核心接口与各种边界，这一章讲客户端按什么顺序把它们串起来。实现全部在 [hk_sdk_audio_client.cpp](../hk_sdk_h264_src/hk_sdk_audio_client.cpp)，下面按生命周期串一遍。流式数据的处理的核心是构建一个缓存池，不断地将输入端数据存入缓存池中，输出端规定需要的数据包大小，每当缓存池累计数据大于一帧输出数据大小就开始从缓存池打捞数据，一次性将满足条件的所有数据移走，在完成数据输出的同时删除缓存池中的对应数据。
+第一章讲数据形态、两个核心接口与各种边界，这一章讲客户端按什么顺序把它们串起来。实现全部在 [hk_sdk_audio_client.cpp](hk_sdk_audio_client.cpp)，下面按生命周期串一遍。流式数据的处理的核心是构建一个缓存池，不断地将输入端数据存入缓存池中，输出端规定需要的数据包大小，每当缓存池累计数据大于一帧输出数据大小就开始从缓存池打捞数据，一次性将满足条件的所有数据移走，在完成数据输出的同时删除缓存池中的对应数据。
 
 ### 2.1 总览
 
@@ -337,40 +353,44 @@ PCM（`byAudioEncType == 8`）不经过编码器，也就没有“帧”和“�
 构造 HkSdkAudioClient(cfg)      只保存配置 + 预分配解码缓冲，不碰 SDK、不连设备
   │
 start()                         六步，任一步失败立刻返回 false，不做中途回滚
-  ├─ 0. 清零状态                 m_stats / m_encoded_buf / m_data_bytes / 编码默认值
+  ├─ 0. 清零状态                 m_stats / m_encoded_buf / m_stream_buf / 编码默认值
   ├─ 1. init_sdk()               NET_DVR_Init + 连接超时 3 s / 重试 1 次
   ├─ 2. login_device()           NET_DVR_Login_V40 → m_user_id
   ├─ 3. query_audio_format()     只读查询，只接受 G.722.1(type 0) / PCM(type 8)
   ├─ 4. InitG722Decoder          按实例复用，PCM 模式也创建
-  ├─ 5. open_wav()               建目录 → 写 44 字节占位头 → 打开 .wav.part
-  └─ 6. StartVoiceCom_MR_V30     登记回调 + this，返回语音对讲句柄
-       │
+  ├─ 5. StartVoiceCom_MR_V30     登记回调 + this，返回语音对讲句柄
+  └─ 6. 上行保活                 G.722.1 且 uplink_keepalive 时建编码器并起线程
+       │                         每 40 ms 回发一帧 80 B G.722 静音
        │   ◀── SDK 回调线程持续触发，与主线程并发
        ▼
-   voice_callback → on_voice_data → 加锁 → 过滤 → 分流 → 解码/直写 → fwrite
+   voice_callback → on_voice_data → 加锁 → 过滤 → 分流 → 解码/直写 → 写盘 + 取流缓冲
        │
-stop()                          停流 → 冲刷残包 → 回填 wav 头 → 改名
-  └─ 析构                         Logout → ReleaseG722Decoder → NET_DVR_Cleanup
+   start_record(path)            打开 .wav.part 并开始写盘（不写文件也能取流）
+       │
+stop()                          停保活线程 → 停流 → 冲刷残包 → 回填 wav 头 → 改名
+  └─ 析构                         Logout → ReleaseG722Decoder / Encoder → NET_DVR_Cleanup
 ```
 
 ### 2.2 start() 六步：顺序不能换
 
 | 步 | 函数 | 关键动作 | 失败会怎样 |
 | --- | --- | --- | --- |
-| 0 | 内联 | 清统计、清编码缓冲、编码与采样率给默认值 | — |
-| 1 | [`init_sdk()`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L265) | `NET_DVR_Init`、`SetConnectTime(3000, 1)` | 没有 SDK，后面全部无意义 |
-| 2 | [`login_device()`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L279) | 用 ip / 端口 / 账号 / 密码登录，保存 `m_user_id` | 没有身份，所有 `NET_DVR_*` 都会失败 |
-| 3 | [`query_audio_format()`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L310) | `NET_DVR_GetCurrentAudioCompress` 只读查询 | 编码不支持则拒绝启动，避免写出标错采样率的 wav |
+| 0 | 内联 | 清统计、清编码与取流缓冲、编码与采样率给默认值 | — |
+| 1 | [`init_sdk()`](hk_sdk_audio_client.cpp#L450) | `NET_DVR_Init`、`SetConnectTime(3000, 1)` | 没有 SDK，后面全部无意义 |
+| 2 | [`login_device()`](hk_sdk_audio_client.cpp#L464) | 用 ip / 端口 / 账号 / 密码登录，保存 `m_user_id` | 没有身份，所有 `NET_DVR_*` 都会失败 |
+| 3 | [`query_audio_format()`](hk_sdk_audio_client.cpp#L495) | `NET_DVR_GetCurrentAudioCompress` 只读查询 | 编码不支持则拒绝启动，避免写出标错采样率的 wav |
 | 4 | `NET_DVR_InitG722Decoder` | 建解码器；当前是 PCM 也建 | 运行中设备切回 G.722.1 就无法解码 |
-| 5 | [`open_wav()`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L522) | 建目录、写占位头、打开 `.part` | 无法落盘，直接失败 |
-| 6 | [`NET_DVR_StartVoiceCom_MR_V30`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L151) | 申请对讲会话、登记回调 | 没有数据来源，撤销运行标志并收尾文件 |
+| 5 | [`NET_DVR_StartVoiceCom_MR_V30`](hk_sdk_audio_client.cpp#L157) | 申请对讲会话、登记回调 | 没有数据来源，撤销运行标志并返回 |
+| 6 | `init_uplink_keepalive()` / `start_uplink_keepalive()` | 建 G.722 编码器、编好静音帧、起 40 ms 回发线程 | 只打印提示，不影响取流；但设备约 10 秒后会停流 |
+
+`start()` **不打开文件**：wav 由 `start_record(path)` 单独开启，取流缓冲（`get_last_audio()`）也独立于录制。这样语音转发可以在不录制的情况下长时间运行。
 
 顺序为什么不能调：
 
 - **1 → 2 → 3**：没初始化不能登录，没登录不能查编码；
-- **3 → 5**：wav 头的采样率由 `query_audio_format()` 决定，必须先知道编码再写头；
-- **5 → 6**：文件必须先打开，否则首包到达时 `m_wav` 还是空，音频直接丢；
-- **`m_running` → 6**：SDK 可能在本函数返回前就同步触发第一个回调，标志晚置位会丢首包。
+- **3 → 4/5**：编码类型决定走解码还是直写，也决定第 6 步是否启用上行保活；
+- **`m_running` → 5**：SDK 可能在本函数返回前就同步触发第一个回调，标志晚置位会丢首包；
+- **5 → 6**：保活线程要用 `StartVoiceCom` 返回的句柄，句柄没拿到之前发不了。
 
 失败策略是「一路返回，不回头清理」：已经登录的会话、已经初始化的 SDK、已经创建的解码器都保留，由析构统一释放；下次 `start()` 直接复用。这也是 `start()` 可重复调用的原因。
 
@@ -386,9 +406,9 @@ stop()                          停流 → 冲刷残包 → 回填 wav 头 → �
 
 **第 4 步 · 创建解码器。** 用 `NET_DVR_InitG722Decoder` 申请一个 G.722 解码器句柄，按实例复用，重复 `start()` 不会重建。即便当前编码是 PCM 也照样创建：设备编码是持久配置，运行期间被切回 G.722.1 的情况虽然少见，但没有解码器就没有退路。这个句柄在析构里统一释放，不在 `stop()` 里销毁。
 
-**第 5 步 · 打开录音文件。** `open_wav()` 先把配置里的路径解析成绝对路径，避免从不同工作目录运行时写到不同位置；再逐级创建父目录；然后以 `.wav.part` 为名打开文件，写入 44 字节标准头，其中 `RIFF` 和 `data` 两处长度先写 0 占位；最后用 `ftell` 校验文件位置确实是 44 字节，及早发现写盘失败。输出路径为空（`--probe` 只统计模式）时这一步直接返回成功，但不建任何文件，后续写入自动变成空操作。必须在这里把文件准备好，因为下一包音频可能在 `StartVoiceCom` 返回之前就到达。
+**第 5 步 · 发起语音对讲。** 先把 `m_running` 置为 `true`，再调用 `NET_DVR_StartVoiceCom_MR_V30`。顺序不能反：SDK 可能在这个函数返回前就异步触发第一个回调，而回调里第一个动作就是检查 `m_running`，标志晚置位等于丢掉首包。函数返回语音对讲句柄，小于 0 表示失败，此时撤销运行标志并记录错误。成功后记录起始时刻，作为墙钟时长统计的起点。这一步只建流，不打开任何文件。
 
-**第 6 步 · 发起语音对讲。** 先把 `m_running` 置为 `true`，再调用 `NET_DVR_StartVoiceCom_MR_V30`。顺序不能反：SDK 可能在这个函数返回前就异步触发第一个回调，而回调里第一个动作就是检查 `m_running`，标志晚置位等于丢掉首包。函数返回语音对讲句柄，小于 0 表示失败，此时要撤销运行标志、在锁内关闭刚打开的文件、记录错误——`.part` 会被改名成一个合法但内容为空的 wav，便于确认失败发生的时间点。成功后记录起始时刻，作为墙钟时长统计的起点。
+**第 6 步 · 上行保活。** 手册要求语音转发双向，只收不发时设备约 10 秒后停止回调（详见 [1.4.7](#147-上行保活只收不发约-10-秒后设备停流)）。当前编码是 G.722.1 且 `uplink_keepalive` 为真时：`init_uplink_keepalive()` 用 `NET_DVR_InitG722Encoder` + `NET_DVR_EncodeG722Frame` 把 640 个 0 采样点编成一帧 80 B 静音（只编一次，线程只读），`start_uplink_keepalive()` 再把句柄写进原子量并起线程，每 40 ms 调一次 `NET_DVR_VoiceComSendData`。初始化失败只打印提示、不影响取流；PCM 路径未实测，暂不启用。
 
 ### 2.3 回调线程的一次处理
 
@@ -411,7 +431,7 @@ SDK 回调线程
 1. **必须攒缓冲**：回调包长度任意（实测平均 168 B ≈ 2 帧），一次回调可能不足一帧、刚好一帧、或多帧，不能拿「一包」当「一帧」；
 2. **必须在锁内**：`m_encoded_buf`、`m_stats`、`m_wav`、`m_data_bytes` 同时被回调线程和主线程 `stop()` 访问。
 
-[`decode_pending_locked()`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L435) 的 `_locked` 后缀表示「调用方已持锁」，函数内部不再加锁（`std::mutex` 不可重入）。
+[`decode_pending_locked()`](hk_sdk_audio_client.cpp#L645) 的 `_locked` 后缀表示「调用方已持锁」，函数内部不再加锁（`std::mutex` 不可重入）。
 
 #### 逐步展开
 
@@ -435,15 +455,18 @@ SDK 回调线程
 
 ### 2.4 stop()：顺序同样不能反
 
-实现见 [stop()](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L184)。
+实现见 [stop()](hk_sdk_audio_client.cpp#L266)。
 
 ```
-1. m_running.exchange(false)     软闸：回调看到就丢，但拦不住已经进入的调用
-2. NET_DVR_StopVoiceCom          硬闸：让 SDK 停止派发回调
-3. 锁内：缓冲残包计入 dropped_partial_bytes 后丢弃
-4. close_wav：回填 RIFF/data 长度 → fflush → fclose → .part 改名 .wav
-5. 记录 wall_seconds（仅本次确实运行过才更新）
+1. stop_uplink_keepalive()        先停保活线程（置标志 → join → 句柄清 -1）
+2. m_running.exchange(false)     软闸：回调看到就丢，但拦不住已经进入的调用
+3. NET_DVR_StopVoiceCom          硬闸：让 SDK 停止派发回调
+4. 锁内：缓冲残包计入 dropped_partial_bytes 后丢弃
+5. close_wav：回填 RIFF/data 长度 → fflush → fclose → .part 改名 .wav
+6. 记录 wall_seconds（仅本次确实运行过才更新）
 ```
+
+保活线程必须最先停：它每 40 ms 用语音对讲句柄调用 `NET_DVR_VoiceComSendData`，如果先 `StopVoiceCom` 再停线程，线程可能正拿着已失效的句柄发数据。`stop_uplink_keepalive()` 的 `join` 最多等循环里的一小片 `sleep_for(5 ms)`，不会阻塞很久。
 
 `fclose` 必须晚于 `StopVoiceCom`。反过来的话，已经在排队的回调仍会执行 `fwrite`，写向一个已经关闭的 `FILE*`，属于未定义行为。`m_running` 只是软闸，真正阻断回调的是 `StopVoiceCom`。
 
@@ -453,8 +476,9 @@ SDK 回调线程
 | --- | --- |
 | 调用线程（main） | 构造 / 析构 / `start()` / `stop()` / `get_stats()` / `output_path()` |
 | SDK 回调线程 | `voice_callback` → `on_voice_data` → `decode_pending_locked` → `write_pcm_locked` |
+| 上行保活线程 | `uplink_keepalive_loop()`：每 40 ms 调 `NET_DVR_VoiceComSendData` |
 
-一把 `m_mutex` 保护 `m_stats`、`m_encoded_buf`、`m_data_bytes`、`m_wav`。回调线程内除了「首次出错打印」之外不做 I/O 等待，避免反压 SDK 造成丢包。
+一把 `m_mutex` 保护 `m_stats`、`m_encoded_buf`、`m_data_bytes`、`m_wav`；保活线程同样在锁内累加 `uplink_sent_frames` / `uplink_send_errors`。回调线程内除了「首次出错打印」之外不做 I/O 等待，避免反压 SDK 造成丢包。保活线程句柄走 `m_voice_handle_atomic`，不碰 `m_mutex` 保护的字段。
 
 另外 `is_running()` 只反映本类标志，**不代表链路在出音频**：设备静音时 SDK 可能长时间不下发回调，此时它仍然是 `true`。
 
@@ -472,7 +496,7 @@ SDK 回调线程
 
 - 先写 44 字节标准头，`RIFF` / `data` 两处长度先写 0，`stop()` 时回填；
 - 用 `.wav.part` 过渡，收尾才 `rename` 成 `.wav`：录制中途崩溃/强杀不会留下「看起来合法但长度错误」的文件；同目录 `rename` 是原子操作；
-- 头字段按**小端**逐字节写（[`write_u16`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L625) / [`write_u32`](../hk_sdk_h264_src/hk_sdk_audio_client.cpp#L635)），不直接 `fwrite` 主机字节序，保证大端平台（部分 ARM 板）也能正确解析；
+- 头字段按**小端**逐字节写（[`write_u16`](hk_sdk_audio_client.cpp#L858) / [`write_u32`](hk_sdk_audio_client.cpp#L868)），不直接 `fwrite` 主机字节序，保证大端平台（部分 ARM 板）也能正确解析；
 - `m_data_bytes` 只统计 PCM 负载，不含 44 字节头；
 - 设备静音可能不下发包，客户端也不补静音，因此 **wav 音频时长可能小于墙钟时长**。
 

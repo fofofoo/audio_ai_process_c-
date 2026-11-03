@@ -9,8 +9,10 @@
 1. **设备音频采集与录制**：通过 HCNetSDK 语音转发直接拿设备端拾音器的编码音频，
    不依赖本地声卡；G.722.1 由 SDK 解码成 16 kHz 单声道 PCM，录制开关可随时开始/结束，
    wav 先写 `.part` 再原子改名，异常中断不会留下看似完整的半截文件。
+   G.722.1 下客户端自动每 40 ms 回发一帧 80 B 静音保活——实测只收不发时设备约
+   10 秒后停止回调，保活后可长时间连续取流。
 2. **实时取流接口**：`get_last_audio()` 一次取走自上次调用以来的全部 PCM16 样本，
-   与是否正在录制无关；接口线程安全，可直接供前端、可视化或后续 ASR 消费。
+   与是否正在录制无关；接口线程安全，可直接供前端、可视化与 ASR 消费。
 3. **流式 LogFBank 前端**：按 kaldi `snip_edges=False` 口径实现分帧、povey 窗、
    逐帧预加重、512 点 FFT、80 通道 Mel 滤波和取对数；输入块长任意，出帧结果与块长无关。
 4. **双数据源滚动语谱图**：设备实时流与 wav 文件都能画成 4 秒滚动窗口，
@@ -25,6 +27,10 @@
    支持单文件、多文件或目录批量识别，窗口底部实时显示中文结果
    （FreeType 渲染，缺字体自动回退 ASCII），`--no-window` 可只跑文本。
    权重包自带四个 wav 与 Python 参考实现**逐 token 一致**，CPU 上 RTF ≈ 0.06。
+8. **实时麦克风语音识别**：把设备取流、LogFBank 前端与 `AsrDecoder` 串成主循环，
+   边说话边出字；窗口同时滚动显示语谱图与中文识别结果，`--no-window` 只打印文本。
+   无新数据时 10 ms 让出 CPU，Ctrl+C / `q` / `Esc` 退出都会补完尾帧再打印统计；
+   `--seconds N` 可限时自检。设备采样率不是 16 kHz 时直接报错退出，不静默重采样。
 
 **一句话亮点：从设备取流、流式前端到中文 ASR 与实时可视化全链路 C++，且与 Python 参考实现逐位、逐 token 对齐。**
 
@@ -44,6 +50,7 @@
 | `test_spectrogram_cv_mic.cpp` | 设备实时语谱图入口 |
 | `test_spectrogram_cv_wav.cpp` | wav 文件语谱图入口 |
 | `test_wav_asr.cpp` | wav 语音识别入口：文本 +（可选）语谱图与中文识别条 |
+| `test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 文本 + 滚动语谱图 |
 | `tools/fbank_dump.cpp` | 前端对拍工具：裸 float32 PCM → 裸 float32 特征 |
 | `tools/compare_fbank.py` | 调 Python 参考实现与 C++ 工具逐点比较 |
 | `tools/compare_asr.py` | 调 Python 参考实现与 C++ token 导出逐 token 比较 |
@@ -167,6 +174,12 @@ DISPLAY=:0 ./build/test_wav_asr.out weight/sherpa-onnx-x-asr-480ms-streaming-zip
 
 # CUDA EP（失败自动回退 CPU）
 ./build/test_wav_asr.out --no-window --cuda weight/.../test_wavs/1.wav
+
+# 实时麦克风语音识别：窗口底部实时显示中文，q / Esc 退出
+DISPLAY=:0 ./build/test_mic_asr.out
+
+# 只打印文本；跑 10 秒自动收尾退出（无人值守自检）
+./build/test_mic_asr.out --no-window --seconds 10
 ```
 
 WSLg 下如果窗口打不开，先确认 `DISPLAY=:0`；环境里可能残留无效的远程 `DISPLAY`。
@@ -227,19 +240,21 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | 各入口 `main` | 设备 IP、账号、通道、录制时长写死 | 换设备需改代码重新编译 |
 | `HkSdkAudioClient` | 每个实例都会 `NET_DVR_Init/Cleanup` | 同一进程不要同时创建音频与视频/热成像客户端 |
 | `HkSdkAudioClient` | PCM 路径采样率可能被设备固定为 32 kHz | 喂 16 kHz ASR 前必须重采样 |
+| `HkSdkAudioClient` | 上行保活只在 G.722.1 下启用，PCM 路径未实测 | 设备切到 PCM 后若同样 10 秒断流，需按 PCM 帧长补发 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |
 | `tools/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
+| `test_mic_asr.cpp` | 设备采样率不是 16 kHz（PCM 编码下为 32 kHz）时直接报错退出 | 需把设备音频编码切回 G.722.1 才能识别 |
 | `test_wav_asr.cpp` | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + `hyp` + `decoder_out`）必须 `reset()` 才能换音频 | 多文件 / 多路复用时要按流隔离实例或串行调用 |
-| 当前阶段 | 已完成 wav ASR 推理；设备实时链路目前只到特征与语谱图 | 麦克风实时识别还未接入，后续与拆库一起做 |
+| 当前阶段 | wav 与设备实时两条链路都已接入 ASR，但仍在同一进程内直接组合 | 后续拆成「ASR 处理库 + 麦克风采集库」两个零耦合库 |
 | `weight/`、`onnxruntime/install/` | 体积大且按模型/平台分发，不入库 | 克隆后需自行放置权重与 ORT 预编译库，否则推理目标无法构建 |
 | `hk_mic_client/hk_sdk/` | 厂商预编译库，体积较大且按平台分目录 | 换平台需确认对应目录与运行期依赖完整 |
 
 ## 后续计划
 
-1. **麦克风实时识别**：把设备取流、前端与 `AsrDecoder` 串起来，边说话边出字；
-   注意设备 PCM 可能被固定为 32 kHz，需要先重采样到 16 kHz。
-2. **拆成两个库**：ASR 处理库（初始化 / reset / 喂 PCM / 取文本）与麦克风采集库
+1. **拆成两个库**：ASR 处理库（初始化 / reset / 喂 PCM / 取文本）与麦克风采集库
    （打开设备、按块输出 PCM），两库零耦合。
+2. **PCM 32 kHz 支持**：设备切到 PCM 编码时采样率被钉在 32 kHz，实时入口当前
+   直接报错退出；需要补一条带抗混叠低通的重采样路径后再接 ASR。
