@@ -10,7 +10,9 @@
    不依赖本地声卡；G.722.1 由 SDK 解码成 16 kHz 单声道 PCM，录制开关可随时开始/结束，
    wav 先写 `.part` 再原子改名，异常中断不会留下看似完整的半截文件。
    G.722.1 下客户端自动每 40 ms 回发一帧 80 B 静音保活——实测只收不发时设备约
-   10 秒后停止回调，保活后可长时间连续取流。
+   10 秒后停止回调，保活后可长时间连续取流。支持 `pause_audio_forwarding()` /
+   `resume_audio_forwarding()` 只停/起对讲线路，不重跑登录与解码器初始化；
+   暂停会自动收尾当前 wav，恢复时按 200 ms 间隔重试以避开设备侧的操作节流。
 2. **实时取流接口**：`get_last_audio()` 一次取走自上次调用以来的全部 PCM16 样本，
    与是否正在录制无关；接口线程安全，可直接供前端、可视化与 ASR 消费。
 3. **流式 LogFBank 前端**：按 kaldi `snip_edges=False` 口径实现分帧、povey 窗、
@@ -25,10 +27,12 @@
    CPU 与 CUDA EP 两条路径均已实测通过。
 7. **wav 流式语音识别**：三个 session 串成完整流水线，实现贪心搜索与文本还原；
    支持单文件、多文件或目录批量识别，窗口底部实时显示中文结果
-   （FreeType 渲染，缺字体自动回退 ASCII），`--no-window` 可只跑文本。
+   （FreeType 渲染，缺字体自动回退 ASCII；只显示最近 50 个字，完整文本看 stdout），
+   `--no-window` 可只跑文本。
    权重包自带四个 wav 与 Python 参考实现**逐 token 一致**，CPU 上 RTF ≈ 0.06。
 8. **实时麦克风语音识别**：把设备取流、LogFBank 前端与 `AsrDecoder` 串成主循环，
-   边说话边出字；窗口同时滚动显示语谱图与中文识别结果，`--no-window` 只打印文本。
+   边说话边出字；窗口同时滚动显示语谱图与中文识别结果（底部只显示最近 50 个字），
+   `--no-window` 只打印文本。
    无新数据时 10 ms 让出 CPU，Ctrl+C / `q` / `Esc` 退出都会补完尾帧再打印统计；
    `--seconds N` 可限时自检。设备采样率不是 16 kHz 时直接报错退出，不静默重采样。
 
@@ -99,6 +103,7 @@ wav 文件 --tools/wav_reader.h（RIFF 解析）-------------------+            
 | 类 | 主要接口 | 说明 |
 | --- | --- | --- |
 | `hk_isapi::HkSdkAudioClient` | `start()` / `stop()` | 建立或断开语音转发，不涉及文件 |
+| | `pause_audio_forwarding()` / `resume_audio_forwarding()` | 只停/起对讲线路，保留登录与解码器；暂停自动收尾 wav |
 | | `start_record(path)` / `stop_record()` | 开始/结束 wav 写盘，可多段录制 |
 | | `get_last_audio(samples)` | 取走并清空累积 PCM16；无新数据返回 `false` |
 | | `get_stats()` / `last_error()` / `sample_rate()` | 统计、错误与当前采样率 |
@@ -175,7 +180,7 @@ DISPLAY=:0 ./build/test_wav_asr.out weight/sherpa-onnx-x-asr-480ms-streaming-zip
 # CUDA EP（失败自动回退 CPU）
 ./build/test_wav_asr.out --no-window --cuda weight/.../test_wavs/1.wav
 
-# 实时麦克风语音识别：窗口底部实时显示中文，q / Esc 退出
+# 实时麦克风语音识别：窗口底部实时显示中文，q / Esc 退出，空格暂停/恢复语音转发
 DISPLAY=:0 ./build/test_mic_asr.out
 
 # 只打印文本；跑 10 秒自动收尾退出（无人值守自检）
@@ -241,6 +246,7 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | `HkSdkAudioClient` | 每个实例都会 `NET_DVR_Init/Cleanup` | 同一进程不要同时创建音频与视频/热成像客户端 |
 | `HkSdkAudioClient` | PCM 路径采样率可能被设备固定为 32 kHz | 喂 16 kHz ASR 前必须重采样 |
 | `HkSdkAudioClient` | 上行保活只在 G.722.1 下启用，PCM 路径未实测 | 设备切到 PCM 后若同样 10 秒断流，需按 PCM 帧长补发 |
+| `HkSdkAudioClient` | 暂停会关闭当前 wav；`StartVoiceCom` 同步调用约阻塞 1.2 秒 | 连续录音不能跨暂停；在 UI 线程调用 start/resume 会卡顿，应放后台 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |
 | `tools/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |

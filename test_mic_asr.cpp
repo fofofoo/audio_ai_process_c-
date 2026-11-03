@@ -60,7 +60,7 @@
  * 用法（项目根目录）
  * ============================================================
  *   ./build/test_mic_asr.out
- *       实时识别，窗口底部显示中文结果；q / Esc 退出
+ *       实时识别，窗口底部显示中文结果；q / Esc 退出，空格暂停/恢复语音转发
  *   ./build/test_mic_asr.out --no-window
  *       只打印文本（无显示器 / 远程调试用）
  *   ./build/test_mic_asr.out --seconds 10 --no-window
@@ -152,6 +152,9 @@ int main(int argc, char** argv) {
         {"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0},
     };
     const int kCjkFontHeight = 24;  // 像素字高；底部白条高 56 px
+    const size_t kMaxStatusChars = 50;  // 底部只显示最近 50 个字：
+                                        // 50 个汉字 ≈ 50 × 24 = 1200 px，
+                                        // 正好占满画布宽度，再多会画出界
 
     // 1.5 数据与节奏常量。
     //     int16 → float 的归一化系数。直接拿 int16 当浮点喂前端会让 log
@@ -294,13 +297,16 @@ int main(int argc, char** argv) {
     // 底部白条文字：优先 FreeType 渲染 UTF-8 中文，失败回退 ASCII putText。
     // Python 版这里用 cv2.putText（只支持 ASCII），C++ 补上中文渲染，
     // 位置与字号保持 (8, rows - 20) / 24 px 的观感。
+    // 识别结果是累积假设，会越积越长；这里只取最近 kMaxStatusChars 个字
+    // 当滑动窗口（按码点截断，不会切碎中文），完整文本仍写在 stdout。
     auto draw_status_text = [&](cv::Mat& frame, const std::string& text) {
+        const std::string shown = utf8_tail(text, kMaxStatusChars);
         const cv::Point org(8, frame.rows - 20);
         if (text_renderer.ready()) {
-            text_renderer.draw(frame, text, org, kCjkFontHeight);
+            text_renderer.draw(frame, shown, org, kCjkFontHeight);
             return;
         }
-        cv::putText(frame, text, org, cv::FONT_HERSHEY_SIMPLEX, 0.7,
+        cv::putText(frame, shown, org, cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     };
 
@@ -336,18 +342,47 @@ int main(int argc, char** argv) {
     std::cout << "识别结果（Ctrl+C"
               << (no_window ? " 退出" : " 或窗口里按 q/Esc 退出")
               << "）：" << std::endl;
+    if (!no_window) {
+        std::cout << "窗口操作：q / Esc 退出，空格暂停/恢复语音转发" << std::endl;
+    }
 
     // —— 五、主循环（对应 Python 第 4 节）——
     // 取一块音频 → 算特征 → 喂解码器 → 画字 → 显示，如此往复。
     bool quit = false;
     bool quit_by_key = false;  // 区分「按键退出」和「Ctrl+C / 到点退出」
     bool auto_exit = false;    // --seconds 到点
+    bool paused = false;       // 语音转发是否被空格暂停（与退出无关）
     cv::Mat canvas;
     std::vector<int16_t> pcm;
     std::vector<float> chunk;
     std::string shown;
     double peak = 0.0;  // 峰值幅度（float 域），用于判断麦克风是否真采到声音
     const auto t_start = std::chrono::steady_clock::now();
+
+    // 空格切换「暂停 / 恢复语音转发」：库内部只停/起对讲线路，
+    // 不重登录、不重建编码器；恢复后设备约 1.2 秒才送首包。
+    // 暂停期间没有新数据，窗口不会自然刷新，这里手动重画一次状态。
+    auto toggle_pause = [&]() {
+        if (!paused) {
+            if (client.pause_audio_forwarding()) {
+                paused = true;
+                std::cout << "\n[ASR] 已暂停语音转发，按空格恢复\n";
+            } else {
+                std::cout << "\n[ASR] 暂停失败：" << client.last_error() << "\n";
+            }
+        } else {
+            std::cout << "\n[ASR] 正在恢复语音转发（首包约 1.2 秒后到达）...\n";
+            if (client.resume_audio_forwarding()) {
+                paused = false;
+            } else {
+                std::cout << "[ASR] 恢复失败：" << client.last_error() << "\n";
+            }
+        }
+        if (!no_window && !canvas.empty()) {
+            draw_status_text(canvas, paused ? shown + "  [已暂停]" : shown);
+            cv::imshow(kWindow, canvas);
+        }
+    };
 
     while (!quit) {
         // 5.0 退出条件：Ctrl+C 置位，或 --seconds 到点。两者都不依赖有没有
@@ -378,6 +413,8 @@ int main(int argc, char** argv) {
                 if (key == 27 || key == 'q') {
                     quit = true;
                     quit_by_key = true;
+                } else if (key == ' ') {
+                    toggle_pause();
                 }
             } else {
                 std::this_thread::sleep_for(
@@ -420,15 +457,19 @@ int main(int argc, char** argv) {
         if (!no_window) {
             // 5.7 识别结果画到底部白条，再显示：与 Python 版一致，每个块都
             //     重画、都 imshow，这样语谱图和文字始终是同一帧。
-            draw_status_text(canvas, text);
+            // 暂停时在底部追加状态，避免用户以为窗口卡住。
+            draw_status_text(canvas, paused ? text + "  [已暂停]" : text);
             cv::imshow(kWindow, canvas);
         }
 
-        // 5.8 按键：有数据时按 1 ms 的节拍泵事件，保证 q/Esc 及时响应。
+        // 5.8 按键：有数据时按 1 ms 的节拍泵事件，保证 q/Esc 及时响应；
+        //     空格暂停/恢复语音转发（暂停期间不再有新数据进来）。
         const int key = no_window ? -1 : (cv::waitKey(1) & 0xFF);
         if (key == 27 || key == 'q') {
             quit = true;
             quit_by_key = true;
+        } else if (key == ' ') {
+            toggle_pause();
         }
     }
 
@@ -481,8 +522,9 @@ int main(int argc, char** argv) {
     std::cout << "\n\n" << std::string(74, '=') << "\n"
               << "识别结果：" << final_text << "\n"
               << std::string(74, '=') << "\n"
-              << "时长 " << wall_seconds << "s   喂入样本 " << front.n_samples()
-              << "   产出帧 " << front.n_frames() << "\n"
+              << "时长 " << wall_seconds << "s   实际转发 " << stats.forward_seconds
+              << "s   喂入样本 " << front.n_samples() << "   产出帧 "
+              << front.n_frames() << "\n"
               << "encoder 调用 " << decoder.n_chunks() << " 次 / 共 "
               << decoder.n_enc_frames() << " 帧   token " << ids.size()
               << " 个\n"

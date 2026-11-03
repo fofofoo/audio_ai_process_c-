@@ -73,6 +73,23 @@ std::vector<uint32_t> utf8_decode(const std::string& text) {
     return out;
 }
 
+// 从尾部逐字节回溯，遇到「非续字节」（10xxxxxx 之外）记一个字符边界。
+// 数够 max_chars 个字符就从该边界截取；不是按字节截断，中文不会被切碎。
+// 非法 UTF-8 也只会让边界判断偏保守，不会越界或死循环。
+std::string utf8_tail(const std::string& text, size_t max_chars) {
+    if (max_chars == 0) return std::string();
+    size_t count = 0;
+    size_t i = text.size();
+    while (i > 0) {
+        --i;
+        if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) {
+            ++count;
+            if (count == max_chars) return text.substr(i);
+        }
+    }
+    return text;  // 字符数不足 max_chars，整串返回
+}
+
 // 按码点范围选择 1~4 字节模板依次写出，与 utf8_decode 互为逆过程。
 void utf8_append(std::string& out, uint32_t cp) {
     if (cp < 0x80) {

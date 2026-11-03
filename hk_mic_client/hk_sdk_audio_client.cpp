@@ -48,6 +48,12 @@ constexpr size_t kPcmBufferSize = kPcmBytesPerFrame * 4;
 // close_wav 再回填 RIFF 与 data 两个长度字段。
 constexpr size_t kWavHeaderSize = 44;
 
+// 暂停后恢复的重试节奏：实测 StopVoiceCom 后约 200 ms 内设备会拒绝
+// 重新起流（error 29 NET_DVR_DVROPRATEFAILED），间隔 200 ms 起流稳定；
+// 5 次最多覆盖约 1 秒，足够吸收设备侧释放会话的抖动。
+constexpr int kResumeRetryCount = 5;
+constexpr int kResumeRetryMs = 200;
+
 }  // namespace
 
 // ==================== 构造与状态访问 ====================
@@ -97,6 +103,11 @@ bool HkSdkAudioClient::start() {
     if (m_running.load()) {
         return true;
     }
+    // 暂停中再调 start() 视为恢复：不重跑初始化、不清统计，
+    // 与 resume_audio_forwarding() 完全等价。
+    if (m_paused.load()) {
+        return resume_audio_forwarding();
+    }
 
     // 零、上一轮统计与缓冲清零，避免重复 start() 时统计累加。
     m_last_error.clear();
@@ -142,37 +153,76 @@ bool HkSdkAudioClient::start() {
     // start() 只负责把语音转发拉起来；文件由 start_record(path) 打开，
     // 因此首包到达时若尚未开始录制，回调只会解码后丢弃（见 on_voice_data）。
 
-    // 置位运行标志必须早于 StartVoiceCom：SDK 可能在本函数返回前就异步
-    // 触发首个回调，on_voice_data 里会检查该标志，否则首包会被丢掉。
-    m_running.store(true);
+    // 会话层资源都已就绪：后续 pause/resume 只动对讲线路，不再重跑这些步骤。
+    m_session_ready.store(true);
     m_start_time = std::chrono::steady_clock::now();
 
-    // 四、初始化hk_sdk的语音对讲功能，在 voice_callback 回调中获取麦克风音频
-    // 4.1 启动设备端语音对讲（MR = Multi-Route 多路语音，V30 为版本号）。
-    // 它向固件申请开一条语音对讲会话：已登录用户 X 请求在通道 1 上做语音对讲，让设备把一直在采集、编码的音频推给本客户端；它既不启动采集，也不修改设备配置。
-    // 它不是独立客户端或进程，只是让 SDK 把「设备编码后的音频」异步推给回调voice_callback：
-    // 编码格式（G.722.1 / PCM）、采样率、码率、时长、文件格式 需要使用另外的接口去固件配置
-    // NET_DVR_StartVoiceCom_MR_V30	回调直接给设备编码后的音频，不需要本地声卡
-    // m_voice_handle 是语音对讲句柄（LONG），< 0 表示失败，成功时该句柄仅供 NET_DVR_StopVoiceCom() 使用。
-    m_voice_handle = NET_DVR_StartVoiceCom_MR_V30( 
-        m_user_id,                                      // 登录设备时拿到的用户 ID
-        static_cast<DWORD>(m_config.voice_channel),     // 语音通道号，本机实测为 1；
-        &HkSdkAudioClient::voice_callback,              // C 风格回调，SDK 用它把音频推回来
-        this                                            // this指向 HkSdkAudioClient 类初始化后的地址，HK_SDK每次音频回调时将数据回传过来
-    );
-    // 4.2 起流失败：撤销运行标志即可。start() 不打开文件，没有需要收尾的 wav；
-    // 若上一轮录制遗留了文件，stop_record() 已在 stop() 里收尾。
-    if (m_voice_handle < 0) {
-        m_running.store(false);
-        set_error("NET_DVR_StartVoiceCom_MR_V30 failed, error=" +
-                  std::to_string(NET_DVR_GetLastError()));
+    // 四、初始化 hk_sdk 的语音对讲功能，并启动上行保活
+    // 起流细节（含上行保活）封装在 start_voice_forward()，pause/resume 共用。
+    if (!start_voice_forward()) {
         return false;
     }
 
-    // 五、上行保活：手册要求语音转发双向（除了收设备音频，也要用
-    //     NET_DVR_VoiceComSendData 发编码数据回去）。实测只收不发时，设备
-    //     在约 10 秒后停止回调，窗口和识别随之冻结；每 40 ms 回发一帧
-    //     80 字节 G.722 静音即可长期维持。PCM 路径未实测，暂不启用。
+    // 五、打印登录、编码格式、错误信息
+    if (m_config.verbose) {
+        std::cout << "[Audio] voice com started, channel=" << m_config.voice_channel
+                  << ", recording=off" << std::endl;
+    }
+    return true;
+}
+
+// 起流并启动上行保活：start() 与 resume_audio_forwarding() 共用。
+// 前置条件：SDK 已初始化、已登录、编码已确认、解码器已建。
+// 失败时撤销运行标志并写 last_error，句柄保持 -1；成功时开始累计转发时长。
+bool HkSdkAudioClient::start_voice_forward() {
+    // 启动设备端语音对讲（MR = Multi-Route 多路语音，V30 为版本号）。
+    // 它向固件申请开一条语音对讲会话：已登录用户 X 请求在通道 1 上做语音对讲，
+    // 让设备把一直在采集、编码的音频推给本客户端；它既不启动采集，也不修改
+    // 设备配置，只是让 SDK 把「设备编码后的音频」异步推给 voice_callback。
+    // 编码格式、采样率、码率、时长、文件格式由另外的接口在固件侧配置。
+    // 返回句柄 < 0 表示失败，成功时该句柄仅供 NET_DVR_StopVoiceCom() 使用。
+    //
+    // 需要重试：设备在上一会话刚结束时（StopVoiceCom 后约 200 ms 内，或上一个
+    // 进程刚退出）会返回 error 29 NET_DVR_DVROPRATEFAILED。实测间隔 200 ms
+    // 再起就能成功，所以这里只对 29 重试；网络、权限等其它错误立即返回，
+    // 避免无谓等待。
+    DWORD last_error_code = 0;
+    for (int attempt = 0; attempt < kResumeRetryCount; ++attempt) {
+        // 置位运行标志必须早于 StartVoiceCom：SDK 可能在本函数返回前就异步
+        // 触发首个回调，on_voice_data 里会检查该标志，否则首包会被丢掉。
+        m_running.store(true);
+        m_voice_handle = NET_DVR_StartVoiceCom_MR_V30(
+            m_user_id,                                  // 登录设备时拿到的用户 ID
+            static_cast<DWORD>(m_config.voice_channel), // 语音通道号，本机实测为 1
+            &HkSdkAudioClient::voice_callback,          // C 风格回调，SDK 用它把音频推回来
+            this                                        // 回调时原样回传，用来还原实例
+        );
+        if (m_voice_handle >= 0) {
+            break;
+        }
+        last_error_code = NET_DVR_GetLastError();
+        m_running.store(false);
+        // 只有「设备操作失败」值得等一个节拍再试；最后一次失败也不再等。
+        if (last_error_code != NET_DVR_DVROPRATEFAILED ||
+            attempt + 1 == kResumeRetryCount) {
+            break;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kResumeRetryMs));
+    }
+    if (m_voice_handle < 0) {
+        set_error("NET_DVR_StartVoiceCom_MR_V30 failed, error=" +
+                  std::to_string(last_error_code));
+        return false;
+    }
+
+    m_last_error.clear();
+    m_forward_start = std::chrono::steady_clock::now();
+
+    // 上行保活：手册要求语音转发双向（除了收设备音频，也要用
+    // NET_DVR_VoiceComSendData 发编码数据回去）。实测只收不发时，设备
+    // 在约 10 秒后停止回调，窗口和识别随之冻结；每 40 ms 回发一帧
+    // 80 字节 G.722 静音即可长期维持。PCM 路径未实测，暂不启用。
     if (m_config.uplink_keepalive && m_codec == AudioCodec::kG7221) {
         if (init_uplink_keepalive()) {
             start_uplink_keepalive();
@@ -191,13 +241,17 @@ bool HkSdkAudioClient::start() {
                      "需要按 PCM 帧长补发"
                   << std::endl;
     }
-
-    // 六、打印登录、编码格式、错误信息
-    if (m_config.verbose) {
-        std::cout << "[Audio] voice com started, channel=" << m_config.voice_channel
-                  << ", recording=off" << std::endl;
-    }
     return true;
+}
+
+// 把本段转发时长累加进统计：调用方必须已持有 m_mutex。
+// 只在真正转发过时累加，避免重复调用把时长叠加多次。
+void HkSdkAudioClient::add_forward_seconds_locked() {
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - m_forward_start).count();
+    if (seconds > 0.0) {
+        m_stats.forward_seconds += seconds;
+    }
 }
 
 // 开启录制：在已启动的语音转发上打开 wav，并置位录制标志。
@@ -266,6 +320,9 @@ void HkSdkAudioClient::stop_record() {
 void HkSdkAudioClient::stop() {
     const bool was_running = m_running.exchange(false);
 
+    // stop 之后不再是「暂停」状态：下次 start() 要走完整初始化而不是恢复。
+    m_paused.store(false);
+
     // 先停上行保活线程，再关语音转发：反过来会让线程往正在销毁的句柄发数据。
     stop_uplink_keepalive();
 
@@ -290,11 +347,93 @@ void HkSdkAudioClient::stop() {
         }
         // 墙钟时长只在本次确实运行过时更新，避免重复 stop() 把统计清零。
         if (was_running) {
+            add_forward_seconds_locked();
             const auto now = std::chrono::steady_clock::now();
             m_stats.wall_seconds =
                 std::chrono::duration<double>(now - m_start_time).count();
         }
     }
+}
+
+// 暂停语音转发：只拆对讲线路，保留 SDK/登录/解码器，不重跑 start() 初始化。
+// 与 stop() 的区别是「之后还能 resume」：录制文件按约定自动收尾，
+// 取流缓冲保留（调用方可以把暂停前的样本取完）。
+bool HkSdkAudioClient::pause_audio_forwarding() {
+    // exchange 保证并发调用时只有一方真正执行拆除；已在暂停则幂等成功。
+    if (!m_running.exchange(false)) {
+        if (m_paused.load()) {
+            return true;
+        }
+        set_error("pause_audio_forwarding: not started");
+        return false;
+    }
+
+    // 先停上行保活线程，再关语音转发：反过来会让线程往正在销毁的句柄发数据。
+    stop_uplink_keepalive();
+    if (m_voice_handle >= 0) {
+        NET_DVR_StopVoiceCom(m_voice_handle);
+        m_voice_handle = -1;
+    }
+    m_voice_handle_atomic.store(-1);
+
+    // 按约定：暂停即收尾当前 wav，恢复后需要重新 start_record()。
+    // 此时回调已停止，可以安全 fclose + 改名。
+    stop_record();
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        add_forward_seconds_locked();
+
+        // 线路断开时缓冲里可能留着半帧，留着会污染恢复后的第一帧。
+        if (!m_encoded_buf.empty()) {
+            m_stats.dropped_partial_bytes += m_encoded_buf.size();
+            m_encoded_buf.clear();
+        }
+    }
+
+    m_paused.store(true);
+    if (m_config.verbose) {
+        std::cout << "[Audio] audio forwarding paused" << std::endl;
+    }
+    return true;
+}
+
+// 恢复语音转发：重建解码器 → 重新起流 → 起保活。
+// 设备在 StopVoiceCom 后约 200 ms 内会拒绝重新起流（error 29，
+// NET_DVR_DVROPRATEFAILED），因此这里按 200 ms 间隔重试，最多 5 次。
+bool HkSdkAudioClient::resume_audio_forwarding() {
+    if (m_running.load()) {
+        return true;
+    }
+    if (!m_session_ready.load()) {
+        set_error("resume_audio_forwarding: start() has not succeeded");
+        return false;
+    }
+
+    // 暂停期间设备重新开始编码，旧解码器的自适应预测状态可能和码流对不上；
+    // 重建一次成本很低，换来确定性。此刻没有回调（线路已停），可安全释放。
+    if (m_decoder != nullptr) {
+        NET_DVR_ReleaseG722Decoder(m_decoder);
+        m_decoder = nullptr;
+    }
+    m_decoder = NET_DVR_InitG722Decoder();
+    if (m_decoder == nullptr) {
+        set_error("NET_DVR_InitG722Decoder failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+        return false;
+    }
+
+    // 起流失败（error 29）的重试在 start_voice_forward() 内部完成，
+    // 这里失败说明 5 次都没成功，last_error 已是最后一次的错误码。
+    if (!start_voice_forward()) {
+        return false;
+    }
+
+    m_paused.store(false);
+    if (m_config.verbose) {
+        std::cout << "[Audio] audio forwarding resumed" << std::endl;
+    }
+    return true;
 }
 
 // ==================== 上行保活 ====================

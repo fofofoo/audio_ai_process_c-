@@ -47,6 +47,16 @@ std::vector<uint32_t> utf8_decode(const std::string& text);
 /// 把单个 Unicode 码点按 UTF-8 编码追加到 out 末尾（1~4 字节）。
 void utf8_append(std::string& out, uint32_t cp);
 
+/**
+ * @brief 取 UTF-8 字符串末尾最多 max_chars 个码点（滑动窗口截断）。
+ *
+ * 从尾部按 UTF-8 首/续字节边界回溯，不会把中文等多字节字符切成半个；
+ * 不足 max_chars 个字符时原样返回，max_chars == 0 返回空串。
+ * 用于「识别结果越积越长、画面只放得下最近若干字」的显示场景，
+ * 不影响调用方保存的完整文本。
+ */
+std::string utf8_tail(const std::string& text, size_t max_chars);
+
 // —— 系统路径 ——
 // 各入口拼模型路径、取文件名、展开目录时共用，口径见实现文件。
 

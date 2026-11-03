@@ -111,8 +111,9 @@ struct AudioCaptureStats {
     uint64_t write_errors = 0;        ///< fwrite 失败次数
     uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（G.722 80 B/帧）
     uint64_t uplink_send_errors = 0;  ///< 上行保活发送失败次数；持续增长说明会话已失效
-    uint64_t dropped_partial_bytes = 0; ///< stop() 时不足一帧而丢弃的字节数
-    double wall_seconds = 0.0;        ///< 从 start() 到 stop() 的墙钟时长
+    uint64_t dropped_partial_bytes = 0; ///< stop()/pause 时不足一帧而丢弃的字节数
+    double wall_seconds = 0.0;        ///< 从 start() 到 stop() 的墙钟时长（含暂停时间）
+    double forward_seconds = 0.0;     ///< 累计实际转发时长：暂停/停止时累加，不含暂停时间
 };
 
 /**
@@ -153,6 +154,30 @@ public:
     void stop();
 
     /**
+     * @brief 暂停语音转发：只关闭对讲线路，保留 SDK、登录会话与解码器。
+     *
+     * 等价于只调用 NET_DVR_StopVoiceCom，不重跑 start() 的初始化。
+     * 若正在录制，会先自动 stop_record() 收尾当前 wav；取流缓冲里已经
+     * 缓存的样本保留，调用方仍可用 get_last_audio() 取完。
+     * @return 暂停成功或本来就处于暂停返回 true；从未 start() 返回 false。
+     * @note 设备侧约 200 ms 内不接受重新起流，恢复由 resume_audio_forwarding()
+     *       内部重试处理；暂停期间 is_running() 返回 false。
+     */
+    bool pause_audio_forwarding();
+
+    /**
+     * @brief 恢复语音转发：重新调用 StartVoiceCom，起保活线程。
+     *
+     * 不重新登录、不重建编码器；为提高与暂停前编码流的匹配度，会重建
+     * G.722 解码器。设备在 StopVoiceCom 后约 200 ms 才允许重新起流，
+     * 因此 StartVoiceCom 失败时按 200 ms 间隔重试，最多 5 次。
+     * @return 起流成功或本来就在转发返回 true；未 start() 或重试全部失败返回 false。
+     * @note 返回 true 只代表设备接受了起流请求，首个音频回调约 1.2 秒后到达
+     *       （与冷启动 start() 的延迟一致），不是丢数据。
+     */
+    bool resume_audio_forwarding();
+
+    /**
      * @brief 开启录制：打开 wav 文件并开始追加 PCM 数据。
      * @param wav_path 输出路径（绝对或相对路径均可，父目录不存在会自动创建）。
      * @return 成功返回 true；以下情况返回 false 并写入 last_error()：
@@ -170,7 +195,7 @@ public:
      */
     void stop_record();
 
-    /// 当前是否处于采集状态（仅表示语音转发已启动，不代表收到音频）
+    /// 当前是否正在转发（暂停后返回 false；不代表一定有音频，设备静音时也可能没数据）
     bool is_running() const;
 
     /// 当前是否正在写 wav
@@ -221,6 +246,10 @@ private:
     void decode_pending_locked();
     void append_stream_locked(const unsigned char* data, size_t bytes);
 
+    // —— 语音转发起停（start / pause / resume 复用）——
+    bool start_voice_forward();
+    void add_forward_seconds_locked();
+
     // —— 上行保活（G.722.1）——
     bool init_uplink_keepalive();
     void start_uplink_keepalive();
@@ -244,7 +273,9 @@ private:
     bool m_sdk_initialized = false;
 
     // 采集状态
-    std::atomic<bool> m_running{false};     ///< 语音转发是否已启动（start/stop 控制）
+    std::atomic<bool> m_session_ready{false}; ///< SDK/登录/编码/解码器已就绪（start 成功后置位）
+    std::atomic<bool> m_paused{false};        ///< 是否处于「暂停」而非「停止」：start() 据此选择恢复
+    std::atomic<bool> m_running{false};       ///< 是否正在转发（start/resume 置 true，pause/stop 置 false）
     std::atomic<bool> m_recording{false};   ///< 是否正在写 wav（start_record/stop_record 控制）
     mutable std::mutex m_mutex;
     std::vector<unsigned char> m_encoded_buf;   ///< 编码字节缓冲，按 80 字节切帧
@@ -269,7 +300,8 @@ private:
     uint64_t m_data_bytes = 0;    ///< 已写入的 PCM 字节数
 
     // 计时
-    std::chrono::steady_clock::time_point m_start_time;
+    std::chrono::steady_clock::time_point m_start_time;   ///< 本次 start() 的墙钟起点
+    std::chrono::steady_clock::time_point m_forward_start; ///< 本段转发的起点，pause/stop 时结算
 
     std::string m_last_error;
 };

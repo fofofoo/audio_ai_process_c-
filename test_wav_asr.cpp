@@ -144,6 +144,10 @@ int main(int argc, char** argv) {
         {"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0},
     };
     const int kCjkFontHeight = 24;  // 像素字高；底部白条高 56 px
+    const size_t kMaxStatusChars = 50;  // 底部只显示最近 50 个字：
+                                        // 50 个汉字 ≈ 50 × 24 = 1200 px，
+                                        // 正好占满画布宽度，再多会画出界；
+                                        // 完整文本仍由 stdout / token 导出保留
 
     // —— 二、命令行与输入展开 ——
     // 2.1 解析开关；其余位置参数当作 wav 文件或目录（可以传多个）。
@@ -263,13 +267,16 @@ int main(int argc, char** argv) {
     // 底部白条文字：优先 FreeType 渲染 UTF-8 中文，失败回退 ASCII putText。
     // Python 版这里用 cv2.putText（只支持 ASCII），C++ 补上中文渲染，
     // 位置与字号保持 (8, rows - 20) / 24 px 的观感。
+    // 识别结果是累积假设，会越积越长；这里只取最近 kMaxStatusChars 个字
+    // 当滑动窗口（按码点截断，不会切碎中文），完整文本写 stdout 不受影响。
     auto draw_status_text = [&](cv::Mat& frame, const std::string& text) {
+        const std::string shown = utf8_tail(text, kMaxStatusChars);
         const cv::Point org(8, frame.rows - 20);
         if (text_renderer.ready()) {
-            text_renderer.draw(frame, text, org, kCjkFontHeight);
+            text_renderer.draw(frame, shown, org, kCjkFontHeight);
             return;
         }
-        cv::putText(frame, text, org, cv::FONT_HERSHEY_SIMPLEX, 0.7,
+        cv::putText(frame, shown, org, cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     };
 
