@@ -6,7 +6,7 @@
 | 平台 | 版本 | 目录 | 来源 | 运行时依赖 | 状态 |
 |---|---|---|---|---|---|
 | x86_64（WSL / PC） | 1.23.2 | `install/onnxruntime-1.23.2/` | 官方预编译 GPU 包 | CUDA 12.x + cuDNN 9.x | 已就绪 |
-| aarch64（Jetson Orin NX） | 1.18.0 | `install/onnxruntime-1.18.0/` | 源码编译 | CUDA 11.4 + cuDNN 8.x | 待设备上编译安装 |
+| aarch64（Jetson Orin NX） | 1.18.0 | `install/onnxruntime-1.18.0/` | 源码编译 | CUDA 11.4 + cuDNN 8.x | 已在 Jetson 上编译通过（2026-11-03） |
 
 目录布局：
 
@@ -167,6 +167,60 @@ CUDA EP 创建失败时 ORT 会回退 CPU，推理仍可能成功但速度明显
 - 1.18.0 是最后一批官方明确支持 CUDA 11.x 的版本；
 - 1.18.1 起 cuDNN 要求跳到 9.x，因此锁定 **1.18.0**（该版本要求 cuDNN 8.9，
   与 JetPack 自带的 8.6 存在小版本差，见 3.6 节）。
+
+**当前选 1.18.0 的困难（本次实测）**：官方 CI/打包镜像的最低 CUDA 是 11.8，而 JetPack 5
+只有 11.4，nvcc 前端更旧，编译时需要手工处理四处源码级问题——3.3.6 的三处
+`missing return statement`（`common.cuh`、`max_pool_with_index.cu`、CUTLASS MoE）和
+3.3.7 的 `resize_antialias_impl.cu` cicc 错误。四处都不是代码缺陷，改动量很小
+（两处各补一行 return、一处换成两个重载、一处替换文件），但必须知道位置，否则
+会在 53%（`common.cuh`）、58%（`resize_antialias_impl.cu`）、62%（`max_pool_with_index.cu`）、
+75%（CUTLASS MoE）附近反复中断。
+
+**换来的优势**：1.18.0 与 JetPack 5 的 CUDA 11.4 / cuDNN 8.x 同代，Jetson 上运行时
+不需要像 x86 侧那样额外挂 cuDNN 9；算子覆盖比 1.17.0 全（含 CUDA 版 Resize
+antialias）；C/C++ API 与 x86 侧 1.23.2 一致，项目里同一套调用代码不用按平台分叉。
+本次编译完成后已在真机验证：`onnxruntime_test_all --gtest_filter='*Cuda*:*CUDA*'`
+跑的 29 个用例全部通过，说明 CUDA EP 在 Jetson 上能正常执行，不只是编得过。
+
+**备选：1.17.0（源码层面零补丁）**
+
+先看两个版本的 CUDA 口径对照（直接查源码，不是凭印象）：
+
+| 版本 | CMake 硬性下限检查 | 官方 CI / 打包镜像 | 对本机 CUDA 11.4 的含义 |
+|---|---|---|---|
+| 1.18.0 | **有**：`CMAKE_CUDA_COMPILER_VERSION < 11.4` 直接 `FATAL_ERROR`（`cmake/CMakeLists.txt`） | CUDA **11.8.0** + cuDNN 8（`tools/ci_build/github/linux/docker/Dockerfile.manylinux2_28_cuda`）；`dockerfiles/Dockerfile.cuda` 另用 12.1.1 | 11.4 是能过配置的最低值，但低于官方口径，源码层问题要自己补 |
+| 1.17.0 | **无**：只有 `< 11.6` 时关掉 flash attention（`STATUS`，不报错） | 同样是 CUDA **11.8.0** + cuDNN 8；TensorRT 支线另有 11.6 镜像 | 没有硬性拦截，11.4 仍属低于官方口径，但不会在 CMake 阶段被拒 |
+
+结论：**两个版本的官方口径都是 CUDA 11.8**，1.18.0 额外用 `FATAL_ERROR` 把 11.4 定为
+硬下限；编译前先查这两处（CMake 的版本检查 + `Dockerfile.*` 的 CI 镜像），比出问题再
+翻日志快得多。`--disable_types float8` 的 11.8 判定两版也一样（不传 `--cuda_version`
+就不触发）。
+
+1.18.0 在 CUDA 11.4 下需要 3.3.6 的三处 `missing return statement` 修改和 3.3.7 的
+一个替换文件。如果换机重装想省掉这些，可以改用 **1.17.0**：逐文件对照 1.17.0 源码后
+确认，这四处补丁对应的代码在 1.17.0 中都不存在或写法不同。
+
+| 1.18.0 需要处理的位置 | 1.17.0 的对应实现 | 是否需要补丁 |
+|---|---|---|
+| `cu_inc/common.cuh` 的 `_IsInf`（`IsInfTyped` 模板） | 没有 `IsInfTyped`，该段是 1.18 新增 | 否 |
+| `nn/max_pool_with_index.cu` 的布局分派 lambda | 只有单模板 `MaxPoolWithIndexKernel`，无 `if constexpr` | 否 |
+| CUTLASS `moe/cutlass_extensions/.../moe_cutlass_kernel.h` 的 `CreateMMA` lambda | 是 `moe/ft_moe/moe_cutlass_kernel.h`，第 388 行直接 `Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);` | 否 |
+| `tensor/resize_antialias_impl.cu` 的 cicc LLVM IR 错误 | 没有 CUDA 版 antialias 实现，该文件不存在（只有 CPU 的 `upsample_antialias.h`） | 否 |
+
+代价与限制：
+
+- **没有 CUDA 版 Resize antialias**。模型里 `Resize` 带 `antialias=1` 时该节点会回退
+  CPU，结果正确但会切分 CUDA 图、多一次拷贝；当前 ASR 三模型不涉及。
+- **省不掉 gcc-10**：1.17.0 的 `cmake/CMakeLists.txt` 有与 1.18.0 完全相同的
+  `check_cxx_compiler_flag(-march=armv8.2-a+bf16)` + `FATAL_ERROR` 检查，CMake ≥ 3.26、
+  `--skip_submodule_sync`、`onnxruntime_BUILD_UNIT_TESTS=OFF` 也都一样。
+- 依赖清单不同，`fetch_ort_deps.py` 要按 1.17.0 自己的 `cmake/deps.txt` 重新预下载。
+- **未在真机实编验证**：以上是源码对照结论。1.17.0 的 CUDA 目录里 `if constexpr`
+  仅 10 处、其中唯一的 `.cu` 是 `softmax_impl.cu`（写法与 1.18.0 相同，本次没报错），
+  同类型的误报概率明显更低；但 CUTLASS 模板在 CUDA 11.4 下仍可能有未知风险。
+
+因此主线仍锁 1.18.0（补丁已实测跑通），1.17.0 只作为换机重装或 1.18.0 再遇到新
+nvcc 问题时的退路；切换时要同步改根 `CMakeLists.txt` 的 ORT 路径与本 README。
 
 > WSL 是 x86_64 机器，无法生成 aarch64 库，也不能用普通交叉编译代替
 > （JetPack 5 的 CUDA 11.4 只有 aarch64 原生工具链）。本节所有命令都在
@@ -569,6 +623,7 @@ cd /mnt/data/code/3rd/onnxruntime-1.18.0
                         CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10 \
   --parallel 6 \
   --skip_tests \
+  --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
   --skip_submodule_sync \
   --update --build 2>&1 | tee /mnt/data/ort_build_$(date +%m%d_%H%M).log
 ```
@@ -600,13 +655,241 @@ cd /mnt/data/code/3rd/onnxruntime-1.18.0
 | `CMAKE_CUDA_ARCHITECTURES=87` | Orin NX 的 compute capability；显式指定后不再走 ORT 默认的多架构列表，编译更快 |
 | `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` / `CMAKE_CUDA_HOST_COMPILER` | 把整条工具链指向 `/usr/bin/gcc-10`、`/usr/bin/g++-10`。**必须三个一起给**：前两个决定 C/C++，第三个决定 nvcc 的宿主编译器（不指定会按 PATH 退回 gcc 9）。原因见 3.2.3 |
 | `--parallel 6` | Orin NX 8 核，留出余量；内存紧张时降到 4 |
-| `--skip_tests` | 跳过单元测试，节省 30 分钟以上 |
+| `--skip_tests` | 只是**不运行**测试，测试目标照样会编译。要和下一行配合才是「既不编也不跑」 |
+| `onnxruntime_BUILD_UNIT_TESTS=OFF` | **不编译**测试目标（`onnxruntime_test_all`、`onnxruntime_shared_lib_test`、`onnx_test_runner`、`onnxruntime_perf_test`），省约 10%~15% 的编译时间与磁盘；对最终 `libonnxruntime.so` 的功能没有影响。改这个 CMake 开关会触发一次重新配置，已编好的库目标不会重编 |
 | `--skip_submodule_sync` | tarball 没有 `.git`，跳过 `git submodule update`；onnx 仍由 `deps.txt` 下载 |
 | `--update --build` | 先配置（下载第三方依赖）再编译 |
 
 > 若设备是 Xavier 系列，把 `87` 改成 `72`；Nano 改成 `53`。
 
 编译时长取决于 Orin NX 散热与是否触发 swap。
+
+> 如果不关单元测试目标，编译到 84% 左右会满屏这样的提示：
+> `note: parameter passing for argument of type 'std::pair<float, float>' when C++17 is enabled changed to match C++14 in GCC 10.1`。
+> 这是 GCC 10.1 修正 C++17 下 `std::pair` 传参 ABI 的 note（不是 error / warning）。
+> 整个 ORT 用同一个 gcc-10、同一标准编译，ABI 一致，可以直接忽略；加上
+> `onnxruntime_BUILD_UNIT_TESTS=OFF` 后不再编译测试代码，这类提示也就没了。
+
+#### 3.3.6 CUDA 11.4 的 nvcc 误报 missing return statement（需手工补一行）
+
+**现象**：配置阶段全部通过后，编译到 53% 左右在
+`onnxruntime/core/providers/cuda/math/unary_elementwise_ops_impl.cu` 报 12 个错误：
+
+```
+error: missing return statement at end of non-void function
+"onnxruntime::cuda::_IsInf<T, detect_positive, detect_negative>::operator()
+ [with T=float, detect_positive=true, detect_negative=false]"
+...
+make[2]: *** [.../unary_elementwise_ops_impl.cu.o] Error 1
+make[1]: *** [.../onnxruntime_providers_cuda.dir/all] Error 2
+```
+
+这不是警告，CUDA provider 直接编不过。日志里后面还在编 CPU 的 `.cc` 是
+`--parallel` 的其他并行任务在收尾，最终 `build.py` 仍以失败退出。
+
+**原因**：`onnxruntime/core/providers/cuda/cu_inc/common.cuh` 的 `_IsInf::operator()`
+用的是 `if constexpr` 链，四个分支（含最后的 `else`）每个都 `return`，源码本身
+没有漏返回（上游 v1.20.1 一字不差）。是 CUDA 11.4 的 nvcc 前端太旧，分支分析
+认不出所有路径都返回，误报缺 return。与 3.2.3 的 bf16 同源：ORT 1.18 的代码
+超出了 JetPack 5.1.2 自带编译器的能力。
+
+**处理**：在 `if constexpr` 链结束后补一句永远执行不到的 `return false;`，只为哄过
+老版前端，不改变任何语义。用 gedit 打开（第 546~559 行是这一段）：
+
+```bash
+gedit +552 /mnt/data/code/3rd/onnxruntime-1.18.0/onnxruntime/core/providers/cuda/cu_inc/common.cuh
+```
+
+把这段：
+
+```cpp
+    } else if constexpr (detect_negative) {
+      return isinf_details::IsInfTyped<T>::IsInfNeg(a);
+    } else {
+      return false;
+    }
+  }
+};
+```
+
+改成：
+
+```cpp
+    } else if constexpr (detect_negative) {
+      return isinf_details::IsInfTyped<T>::IsInfNeg(a);
+    } else {
+      return false;
+    }
+    // nvcc 11.4 的返回路径分析认不出 if constexpr 已覆盖所有分支，
+    // 显式补一句让它放过；实际不可达，不改语义。
+    return false;
+  }
+};
+```
+
+**第二处同类误报：`max_pool_with_index.cu`（62%~63%）**
+
+补完 `common.cuh` 重跑，编译到 62%~63% 时
+`onnxruntime/core/providers/cuda/nn/max_pool_with_index.cu` 第 52 行再报 5 个同格式错误：
+
+```
+error: missing return statement at end of non-void function
+"lambda [](int, int, int, int, int)->int64_t"
+  detected during instantiation of MaxPoolWithIndexKernel<T,Layout>
+  [with T=float, Layout=false] ...
+make[2]: *** [.../max_pool_with_index.cu.o] Error 1
+make[1]: *** [.../onnxruntime_providers_cuda.dir/all] Error 2
+```
+
+`compute_offset` lambda 里只有 `if constexpr (Layout == LAYOUT_NCHW)` 和
+`else if constexpr (Layout == LAYOUT_NHWC)` 两个分支、没有最后的 `else`。`Layout`
+是 bool 模板参数，两个分支实际已覆盖全部取值，但 CUDA 11.4 同样认不出，
+处理方式和 `common.cuh` 一致——**只是返回值要跟函数返回类型一致，这里是 `int64_t`**：
+
+```bash
+gedit +48 /mnt/data/code/3rd/onnxruntime-1.18.0/onnxruntime/core/providers/cuda/nn/max_pool_with_index.cu
+```
+
+把第 52~55 行改成：
+
+```cpp
+    } else if constexpr (Layout == LAYOUT_NHWC) {
+      return (((n_index * height + h_index) * width + w_index) * depth + d_index) * channels + c_index;
+    }
+    // nvcc 11.4 的返回路径分析认不出 if constexpr 已覆盖所有分支，
+    // 显式补一句让它放过；实际不可达，不改语义。
+    return 0;
+  };
+```
+
+**第三处同类误报：`moe_cutlass_kernel.h` 的 `CreateMMA` lambda（CUTLASS / MoE，75% 左右）**
+
+`contrib_ops/cuda/moe/ft_moe/moe_gemm_kernels_fp16_uint4.cu` 会报 36 个错误，真正位置在
+`onnxruntime/contrib_ops/cuda/moe/cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h`：
+
+```
+moe_cutlass_kernel.h(373): error: missing return statement at end of non-void function
+"lambda []()->cutlass::gemm::threadblock::MmaMultistage<...>"
+  detected during instantiation of MoeFCGemm<...>::run_kernel_ ...
+```
+
+同一个模板被多种配置实例化，所以同一条错误会重复很多遍，「大量报错」其实是复读。
+
+原因还是 nvcc 11.4 认不出 `if constexpr` 分支已经覆盖所有返回路径。但这处**不能照抄前两处**
+在末尾补一句 return：
+
+- lambda 的返回类型是整个 CUTLASS `Mma` 模板，写不出一个通用的兜底值；
+- 它有两种实例：普通 `MmaMultistage` 用 4 参数构造，DQ 版本 `DqMmaMultistage` 只接受
+  带 `group_size` 的 5 参数构造，补在 if/else 后面的任何一句都会在其中一种实例下编不过。
+
+处理方式：把 lambda 换成按 `use_dq_gemm` 分派的两个函数重载，每个函数体只有一条 return，
+每种实例只实例化自己需要的构造函数。
+
+第一处，把第 368~374 行的 `CreateMMA` lambda **连同下面的调用一起**替换：
+
+```bash
+gedit +368 /mnt/data/code/3rd/onnxruntime-1.18.0/onnxruntime/contrib_ops/cuda/moe/cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h
+```
+
+改前：
+
+```cpp
+      // Construct thread-scoped matrix multiply
+      auto CreateMMA = [&]() {
+        if constexpr (use_dq_gemm<Mma>::value)
+          return Mma(shared_storage.main_loop, params.group_size, thread_idx, warp_idx, lane_idx);
+        else
+          return Mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+      };
+      Mma mma = CreateMMA();
+```
+
+改后：
+
+```cpp
+      // Construct thread-scoped matrix multiply
+      Mma mma = create_mma<Mma>(shared_storage, params.group_size, thread_idx, warp_idx, lane_idx,
+                                use_dq_gemm<Mma>{});
+```
+
+第二处，在第 53~54 行 `use_dq_gemm` 的定义之后插入两个重载：
+
+```cpp
+// nvcc 11.4 的返回路径分析认不出 if constexpr 已覆盖所有分支，会在 run_kernel_ 里
+// 构造 mma 的 lambda 上误报 missing return statement。按 use_dq_gemm 拆成两个只有
+// 单条 return 的重载，每种实例只实例化自己需要的构造函数，绕开该误报。
+template <typename Mma, typename SharedStorage>
+CUTLASS_DEVICE Mma create_mma(SharedStorage& shared_storage, int group_size, int thread_idx,
+                              int warp_idx, int lane_idx, platform::true_type) {
+  return Mma(shared_storage.main_loop, group_size, thread_idx, warp_idx, lane_idx);
+}
+
+template <typename Mma, typename SharedStorage>
+CUTLASS_DEVICE Mma create_mma(SharedStorage& shared_storage, int /*group_size*/, int thread_idx,
+                              int warp_idx, int lane_idx, platform::false_type) {
+  return Mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+}
+```
+
+- **替换时务必连 `Mma mma = CreateMMA();` 一起换掉**。只删 lambda 定义、留下旧调用，
+  下一轮会报 `identifier "CreateMMA" is undefined`（第一轮实测踩过）。
+- 改完直接重跑 3.3.5 的命令，增量编译只重编包含这个头文件的几个 MoE `.cu`
+  （`moe_gemm_kernels_fp16_uint4.cu`、`fp16_fp16`、`fp32_fp32` 等），几分钟。
+- 这类 `missing return statement` 在 nvcc 里本来是警告 #940-D，被 ORT 的
+  `COMPILE_WARNING_AS_ERROR ON`（等价 nvcc `-Werror all-warnings`）升级成了 error。
+  不想逐处补的话可以整体加 `--compile_no_warning_as_error`，代价是编译参数变化会全量重编。
+
+- 三处修改都只需做一次；**重新解压 ORT 源码后要重做**，否则下次编译还会报。
+- 改完直接重跑 3.3.5 的命令，不用清 `build/Linux/Release`：CMake 沿用已有目标
+  文件，只重编改过的 `.cu` 及其后续目标。
+- 若其他 `.cu` 再报同样格式的错误，先看返回类型：简单类型按上面的方式在函数末尾补一句
+  不可达的 return（`bool` → `return false;`，`int64_t` → `return 0;`）；如果返回类型是
+  复杂模板、且不同实例的构造函数不同，就按第三处的办法拆成按标记分派的重载。
+
+#### 3.3.7 CUDA 11.4 的 cicc 生成错误 LLVM IR（`resize_antialias_impl.cu`，用替换文件）
+
+**现象**：继续编译到 `onnxruntime/core/providers/cuda/tensor/resize_antialias_impl.cu`
+时，日志先刷出大量：
+
+```
+Call parameter type does not match function signature!
+  %tmp141 = load %struct._ZSt5tupleIJllEE*, %struct._ZSt5tupleIJllEE** %__T1875, align 8
+ call void @_ZN11onnxruntime4cuda37_SetupBilinearUpsampleFilterAntiAliasIf...
+<unnamed>: parse Invalid record (Producer: 'LLVM7.0.1' Reader: 'LLVM 7.0.1')
+make[2]: *** [.../resize_antialias_impl.cu.o] Error 1
+```
+
+**原因**：这不是 `if constexpr` 的返回路径问题，而是 CUDA 11.4 的 nvcc 设备端编译器
+cicc（基于 LLVM 7）的已知 bug：`_SetupBilinearUpsampleFilterAntiAlias` 和
+`_SetupTrilinerarUpsampleFilterAntiAlias` 两个 `__global__` kernel 按值接收
+`std::tuple` 参数，且是在 `DISPATCH_ANTIALIAS_FILTER_SETUP` 宏的 lambda 里启动的，
+cicc 在这个组合下生成的 LLVM IR 参数类型不匹配，直接解析失败。CUDA 11.6 / 11.8
+配 GCC 10.x 也会复现；官方已不再支持 CUDA 11.x 与 Ubuntu 20.04，不会修。
+JetPack 5.1.2 也换不到 CUDA 11.8 / 12。
+
+来源：microsoft/onnxruntime issue
+[#20330 "Build on Linux with CUDA support"](https://github.com/microsoft/onnxruntime/issues/20330)。
+该 issue 里多位 Jetson 用户复现了同样的报错，维护者确认是 nvcc/cicc 的问题且不再修复；
+issue 后半段由 OlegZhavoronkov 给出可用的手工改法——把宏内的 kernel 启动语句挪进
+独立的 `__host__` 包装函数。3.3.7 的替换文件就是按这个思路整理出的 1.18.0 完整版本。
+
+**处理**：不用手工改源码。项目 `onnxruntime/install/onnxruntime-1.18.0/` 下已放好
+改过的 `resize_antialias_impl.cu`（1.18.0 原文件 + 两个 `__host__` 包装函数 + 三处
+调用点改名，纯编译期改写、语义不变），直接覆盖源码里的同名文件：
+
+```bash
+cp <项目根>/onnxruntime/install/onnxruntime-1.18.0/resize_antialias_impl.cu \
+   /mnt/data/code/3rd/onnxruntime-1.18.0/onnxruntime/core/providers/cuda/tensor/   
+```
+或者在onnxruntime根目录
+```bash
+cp /install/onnxruntime-1.18.0/resize_antialias_impl.cu \
+   /mnt/data/code/3rd/onnxruntime-1.18.0/onnxruntime/core/providers/cuda/tensor/   
+```
+
+- 覆盖后直接重跑 3.3.5 的命令，增量编译只重编这个 `.cu`，不用清 `build/Linux/Release`。
+- `install/` 不入库，这个替换文件只在本地；**换机器或重新拉仓库时要重新放进
+  `onnxruntime/install/onnxruntime-1.18.0/`**，重新解压 ORT 源码后也要重新 `cp`。
 
 ### 3.4 安装到本目录
 
@@ -689,6 +972,8 @@ export LD_LIBRARY_PATH="$DEST/lib:/usr/local/cuda-11.4/lib64:$LD_LIBRARY_PATH"
 | 装了 cmake 仍显示 3.16.3 | 先 `hash -r` 清 bash 的命令缓存；仍不对再检查 conda 环境是否激活、`which cmake` 是否指向 env 的 `bin` |
 | pip 装了 cmake 仍报 `Could not find CMAKE_ROOT` | 多半是 shell 缓存仍指向旧的 conda cmake（其模块目录已缺失）；`hash -r` 后重试，仍不行再新建干净环境 |
 | 链接阶段被杀（OOM） | 增大 swap，`--parallel` 降到 4 |
+| 编译报 `missing return statement at end of non-void function`（`_IsInf`、`max_pool_with_index.cu` 的 lambda、或 CUTLASS/MoE 的 `moe_cutlass_kernel.h`） | CUDA 11.4 的 nvcc 前端对 `if constexpr` 误报，不是代码问题；按 3.3.6 处理：简单返回类型补一句不可达的 return（`bool` → `return false;`，`int64_t` → `return 0;`），复杂模板按 `moe_cutlass_kernel.h` 那样拆成按标记分派的重载 |
+| 编译刷大量 `Call parameter type does not match function signature!`，最后 `parse Invalid record (Producer: 'LLVM7.0.1')`（`resize_antialias_impl.cu`） | CUDA 11.4 的 cicc 在宏内启动带 `std::tuple` 参数的 kernel 时生成错误 LLVM IR，不是代码问题；按 3.3.7 用 `install/onnxruntime-1.18.0/resize_antialias_impl.cu` 覆盖源码同名文件后重跑 |
 | 编译报找不到 cuDNN 符号 | JetPack 5.1.2 自带 cuDNN 8.6，低于 ORT 1.18.0 要求的 8.9；可到 NVIDIA 开发者网站下载 JetPack 5 对应的 cuDNN 8.9 aarch64 deb 升级 |
 | 运行时报 `CUDNN_STATUS_NOT_SUPPORTED` | 同上，优先升级到 cuDNN 8.9；也可临时改用 CPU EP 验证模型本身 |
 | `no kernel image is available for execution on the device` | 架构没对上：确认编译时 `CMAKE_CUDA_ARCHITECTURES=87`，且没有链接到 x86 的库 |
@@ -725,3 +1010,10 @@ export LD_LIBRARY_PATH="$DEST/lib:/usr/local/cuda-11.4/lib64:$LD_LIBRARY_PATH"
 | 2026-11-03 | 实测 eigen 归档 SHA1 过期（GitLab 重新打包，同 commit 内容与 GitHub 镜像零差异）；脚本增加 `SHA1_OVERRIDES`，将 eigen 期望值改为 `32b145f5...` 并写入改写后的 deps.txt |
 | 2026-11-03 | 编译实测配置阶段失败：ORT 1.17 起对 aarch64 强制要求 `-march=armv8.2-a+bf16`（GCC ≥ 10），JetPack 5.1.2 自带 GCC 9.4 不满足；新增 3.2.3 编译工具小节，3.2 前置检查命令与实测表补充 nvcc 上限、libstdc++、gcc-10 可装性；硬门槛由三条改为四条 |
 | 2026-11-03 | 3.3.5 编译命令改用 gcc-10（`CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` / `CMAKE_CUDA_HOST_COMPILER` 三个定义），补充换编译器必须清空 `build/Linux/Release` 与配置阶段的验收点 |
+| 2026-11-03 | 编译到 53% 实测 CUDA 11.4 的 nvcc 误报 `missing return statement`（`common.cuh` 的 `_IsInf` 用了 `if constexpr` 链，源码无误、上游 1.20.1 相同）；新增 3.3.6 记录现象、原因与 gedit 补一行 `return false;` 的处理，3.6 常见问题补对应条目 |
+| 2026-11-03 | 编译到 62%~63% 实测第二处同格式误报（`max_pool_with_index.cu` 的 `int64_t` lambda），3.3.6 补充该处处理并说明补的返回值必须与函数类型一致；随后 58% 回退重编时实测 `resize_antialias_impl.cu` 触发 cicc 的 LLVM IR 错误，新增 3.3.7，替换文件放 `install/onnxruntime-1.18.0/`，3.6 补对应条目 |
+| 2026-11-03 | 实测 84%~86% 阶段仍会编译单元测试目标（`--skip_tests` 只跳过运行），3.3.5 编译命令增加 `onnxruntime_BUILD_UNIT_TESTS=OFF` 并在参数表说明两者区别；补充 GCC 10.1 的 `std::pair` 传参 ABI note 不是报错、可忽略 |
+| 2026-11-03 | 编译到 75% 左右实测第三处 `missing return statement`（CUTLASS `moe_cutlass_kernel.h` 的 `CreateMMA` lambda，36 个错误为同一模板的多次实例化）；返回类型是复杂模板且 DQ/非 DQ 构造函数不同，改为 `create_mma` 标记分派重载，3.3.6 补充该小节与「漏改调用会报 CreateMMA undefined」的坑 |
+| 2026-11-03 | **1.18.0 在 Jetson Orin NX 上完整编译通过**：3.3.5 命令（gcc-10 + `onnxruntime_BUILD_UNIT_TESTS=OFF`）配合 3.3.6 三处源码修改与 3.3.7 替换文件，四类 nvcc 问题即本次实测的全部源码级障碍；3.1 补充选 1.18.0 的困难与优势对比 |
+| 2026-11-03 | **编译产物与 CUDA EP 真机验证**：`build/Linux/Release/` 下为 `libonnxruntime.so.1.18.0`（20 MB，核心库）、`libonnxruntime_providers_cuda.so`（CUDA kernel 所在）、`libonnxruntime_providers_shared.so`，三者安装时必须同目录；`onnxruntime_test_all --gtest_filter='*Cuda*:*CUDA*'` 在 3.2 秒内跑完 29 个用例并全部 PASSED，另有 2 个源码自带 `DISABLED_` 用例未跑。日志中的 `transformer_memcpy.cc` 2 个 Memcpy 节点提示、`SimplifiedLayerNormalization` 的 `MergeShapeInfo` / `VerifyOutputSizes` 形状不一致（{4,20,1,16} → {4,20,1,1}）都是上游测试模型的 warning，ORT 自动退回宽松合并，不影响数值结果 |
+| 2026-11-03 | 新评估 1.17.0 备选路线：逐文件对照源码确认 1.18.0 的四处补丁在 1.17.0 中都不需要（无 `IsInfTyped`、`max_pool_with_index.cu` 无布局分派 lambda、MoE 用 ft_moe 直接构造 `Mma`、无 CUDA antialias 实现）；限制（无 CUDA antialias、仍要 gcc-10、依赖清单不同）与切换成本写入 3.1，主线仍保持 1.18.0；同时补两版 CUDA 口径对照：1.18.0 有 `CMAKE_CUDA_COMPILER_VERSION < 11.4` 的 `FATAL_ERROR`，1.17.0 只有 `< 11.6` 关 flash attention，两者官方 CI/打包镜像均为 CUDA 11.8.0 |
