@@ -1,30 +1,29 @@
 ##################################################################################
-#  海康设备端音频录制 demo  ——  最小可构建配置
+#  音频 AI 处理工程 —— 两个零耦合库 + 可执行入口
 #
-#  目标：
-#    save_audio_wav.out           录制固定时长设备音频并保存为 wav
-#    test_spectrogram_cv_mic.out  设备实时音频 -> LogFBank -> OpenCV 语谱图
-#    test_spectrogram_cv_wav.out  wav 文件    -> LogFBank -> OpenCV 语谱图
+#  库：
+#    lib_hk_sdk_audio_client.so  麦克风采集：登录、语音转发、G.722.1 解码、
+#                               可选降采样、wav 录制、取流缓冲与统计
+#    lib_audio_ai_process.so     ASR 处理：LogFBank 前端、AsrDecoder（ORT）、
+#                               语谱图与文本渲染
 #
-#  只依赖：
-#    - hk_mic_client/hk_sdk_audio_client.{h,cpp}   音频采集客户端
-#    - hk_mic_client/hk_sdk/                       HCNetSDK 头文件与库
+#  两个库互不 include 对方头文件；组合关系只出现在可执行入口里。
 #
 #  构建：
 #    cmake -S . -B build && cmake --build build -j
-#  运行：
-#    ./build/save_audio_wav.out        # wav 写入 <工程根>/results/
+#  安装：
+#    cmake --install build     # 产物在 <工程根>/install/<库名>/{include,lib}
 ##################################################################################
 
 cmake_minimum_required(VERSION 3.10)
-project(hk_audio_record LANGUAGES CXX)
+project(audio_ai_process LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release)
 
 # ---------------------------------------------------------------------
-# 平台检测：按架构选择 SDK 库目录（SDK 自带三套预编译库）
+# 平台检测：按架构选择 HCNetSDK 库目录（SDK 自带三套预编译库）
 # ---------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -51,13 +50,39 @@ else()
 endif()
 
 # ---------------------------------------------------------------------
+# OpenCV：ASR 库的语谱图 / 文本渲染，以及入口里的 imshow / waitKey
+# ---------------------------------------------------------------------
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui)
+message(STATUS "OpenCV version: ${OpenCV_VERSION}")
+
+# ---------------------------------------------------------------------
+# HCNetSDK 与采集库路径
+# ---------------------------------------------------------------------
+set(HK_MIC_DIR    "${CMAKE_SOURCE_DIR}/hk_mic_client")
+set(HIK_SDK_ROOT  "${HK_MIC_DIR}/hk_sdk")
+set(HIK_INCLUDE_DIRS "${HIK_SDK_ROOT}/include")
+set(HIK_LIB_ROOT  "${HIK_SDK_ROOT}/lib/${HIK_LIB_SUBDIR}")
+
+# 音频链路只需要这三个库；其余 .so 是它们的运行期依赖，通过 RPATH 找到
+set(HIK_LIBS
+    ${HIK_LIB_ROOT}/libhcnetsdk${HIK_LIB_SUFFIX}
+    ${HIK_LIB_ROOT}/libHCCore${HIK_LIB_SUFFIX}
+    ${HIK_LIB_ROOT}/libPlayCtrl${HIK_LIB_SUFFIX}
+)
+
+message(STATUS "HIK SDK root : ${HIK_SDK_ROOT}")
+message(STATUS "HIK SDK libs : ${HIK_LIB_ROOT}")
+
+find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------
 # ONNX Runtime：按架构选择项目内托管的版本
 #
-#   x86_64  (WSL / PC)       -> onnxruntime-1.23.2（官方预编译，CUDA 12.x + cuDNN 9.x）
-#   aarch64 (Jetson Orin NX) -> onnxruntime-1.18.0（按 onnxruntime/README.md 第 3 节源码编译）
+#   x86_64  (WSL / PC)       -> onnxruntime-1.23.2
+#   aarch64 (Jetson Orin NX) -> onnxruntime-1.18.0
 #
-# 两个目录结构统一为 <root>/include 与 <root>/lib，CMake 只认这套路径。
-# 需要推理能力的目标调用 ort_link_target(<target>)，一次性设置 include、链接和 RPATH。
+# 找不到时只跳过依赖 ORT 的目标（asr_decode.cpp / 三个 ASR 入口），
+# 音频采集、语谱图与 fbank 对拍仍可构建。
 # ---------------------------------------------------------------------
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(ORT_VERSION_DIR "onnxruntime-1.18.0")
@@ -76,7 +101,6 @@ if(EXISTS "${ORT_LIBRARY}")
     set(ORT_FOUND TRUE)
     message(STATUS "ONNX Runtime root : ${ORT_ROOT}")
 else()
-    # 不中断现有构建：当前工程还没有推理目标时，ORT 缺失不影响音频链路。
     set(ORT_FOUND FALSE)
     message(WARNING
         "ONNX Runtime 未安装：${ORT_LIBRARY}\n"
@@ -90,8 +114,8 @@ function(ort_link_target target)
     if(NOT ORT_FOUND)
         message(FATAL_ERROR "ort_link_target(${target}) 失败：ONNX Runtime 未安装")
     endif()
-    target_include_directories(${target} PRIVATE ${ORT_INCLUDE_DIR})
-    target_link_libraries(${target} PRIVATE ${ORT_LIBRARY})
+    target_include_directories(${target} PUBLIC ${ORT_INCLUDE_DIR})
+    target_link_libraries(${target} PUBLIC ${ORT_LIBRARY})
     set_target_properties(${target} PROPERTIES
         BUILD_RPATH   "${ORT_LIB_DIR}"
         INSTALL_RPATH "${ORT_LIB_DIR}"
@@ -99,235 +123,240 @@ function(ort_link_target target)
 endfunction()
 
 # ---------------------------------------------------------------------
-# SDK 与客户端路径
+# FreeType：text_renderer.cpp 用系统字体渲染中文（cv::putText 只支持 ASCII）。
+# 找不到时 text_renderer 编译成空实现，入口靠 ready() 回退 ASCII。
+# 注意 OpenCV 可能来自 /usr/local（自带 build 无 freetype 模块），
+# 因此不混链发行版 libopencv_freetype。
 # ---------------------------------------------------------------------
-set(HK_MIC_DIR "${CMAKE_SOURCE_DIR}/hk_mic_client")
-set(HIK_SDK_ROOT "${HK_MIC_DIR}/hk_sdk")
-set(HIK_INCLUDE_DIRS "${HIK_SDK_ROOT}/include")
-set(HIK_LIB_ROOT "${HIK_SDK_ROOT}/lib/${HIK_LIB_SUBDIR}")
-
-# 音频链路只需要这三个库；其余 .so 是它们的运行期依赖，通过 RPATH 找到
-set(HIK_LIBS
-    ${HIK_LIB_ROOT}/libhcnetsdk${HIK_LIB_SUFFIX}
-    ${HIK_LIB_ROOT}/libHCCore${HIK_LIB_SUFFIX}
-    ${HIK_LIB_ROOT}/libPlayCtrl${HIK_LIB_SUFFIX}
-)
-
-message(STATUS "HIK SDK root : ${HIK_SDK_ROOT}")
-message(STATUS "HIK SDK libs : ${HIK_LIB_ROOT}")
-
-find_package(Threads REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui)
-message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-
-# ---------------------------------------------------------------------
-# 可执行文件：save_audio_wav.out
-# ---------------------------------------------------------------------
-add_executable(save_audio_wav.out
-    save_audio_wav.cpp
-    ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
-    ${HK_MIC_DIR}/audio_resampler.cpp
-)
-
-# 注入工程根目录：main 用它把 wav 默认写到 <工程根>/results/
-target_compile_definitions(save_audio_wav.out PRIVATE
-    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
-)
-
-target_include_directories(save_audio_wav.out PRIVATE
-    ${HK_MIC_DIR}
-    ${HIK_INCLUDE_DIRS}
-)
-
-target_link_libraries(save_audio_wav.out PRIVATE
-    ${HIK_LIBS}
-    Threads::Threads
-)
-
-# 运行期在 SDK 库目录里找 libhcnetsdk 及其依赖（HCNetSDKCom 等）
-set_target_properties(save_audio_wav.out PROPERTIES
-    BUILD_RPATH "${HIK_LIB_ROOT}"
-    INSTALL_RPATH "${HIK_LIB_ROOT}"
-)
-
-# ---------------------------------------------------------------------
-# 可执行文件：test_spectrogram_cv_mic.out
-#   设备音频 -> get_last_audio -> AudioPreprocess -> SpectrogramImage -> imshow
-# ---------------------------------------------------------------------
-add_executable(test_spectrogram_cv_mic.out
-    test_spectrogram_cv_mic.cpp
-    audio_ai_process/audio_preprocess.cpp
-    audio_ai_process/spectrogram_image.cpp
-    ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
-    ${HK_MIC_DIR}/audio_resampler.cpp
-)
-
-target_include_directories(test_spectrogram_cv_mic.out PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${HK_MIC_DIR}
-    ${HIK_INCLUDE_DIRS}
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_spectrogram_cv_mic.out PRIVATE
-    ${OpenCV_LIBS}
-    ${HIK_LIBS}
-    Threads::Threads
-)
-
-set_target_properties(test_spectrogram_cv_mic.out PROPERTIES
-    BUILD_RPATH "${HIK_LIB_ROOT}"
-    INSTALL_RPATH "${HIK_LIB_ROOT}"
-)
-
-# ---------------------------------------------------------------------
-# 可执行文件：test_spectrogram_cv_wav.out
-#   wav 文件 -> AudioPreprocess -> SpectrogramImage -> imshow
-#   不依赖海康 SDK；wav 解析写在本入口的匿名 namespace 里。
-# ---------------------------------------------------------------------
-add_executable(test_spectrogram_cv_wav.out
-    test_spectrogram_cv_wav.cpp
-    audio_ai_process/audio_preprocess.cpp
-    audio_ai_process/spectrogram_image.cpp
-    audio_ai_process/text_utils.cpp
-)
-
-target_include_directories(test_spectrogram_cv_wav.out PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_spectrogram_cv_wav.out PRIVATE
-    ${OpenCV_LIBS}
-    Threads::Threads
-)
-
-# ---------------------------------------------------------------------
-# 可执行文件：fbank_dump.out
-#   前端对拍工具：raw float32 PCM -> AudioPreprocess -> raw float32 特征
-#   由 tools/compare_fbank.py 调用，与 Python 参考实现逐点比较。
-# ---------------------------------------------------------------------
-add_executable(fbank_dump.out
-    tools/fbank_dump.cpp
-    audio_ai_process/audio_preprocess.cpp
-)
-
-target_include_directories(fbank_dump.out PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(fbank_dump.out PRIVATE
-    ${OpenCV_LIBS}
-    Threads::Threads
-)
-
-# ---------------------------------------------------------------------
-# 可执行文件：test_wav_asr.out
-#   wav 文件 -> AudioPreprocess -> AsrDecoder（ORT 三模型）-> 文本
-#   可选 SpectrogramImage 窗口 + 底部识别文字；依赖 OpenCV 与 ONNX Runtime。
-# ---------------------------------------------------------------------
-add_executable(test_wav_asr.out
-    test_wav_asr.cpp
-    audio_ai_process/audio_preprocess.cpp
-    audio_ai_process/asr_decode.cpp
-    audio_ai_process/text_utils.cpp
-    audio_ai_process/text_renderer.cpp
-    audio_ai_process/spectrogram_image.cpp
-)
-
-target_compile_definitions(test_wav_asr.out PRIVATE
-    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
-)
-
-target_include_directories(test_wav_asr.out PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_wav_asr.out PRIVATE
-    ${OpenCV_LIBS}
-    Threads::Threads
-)
-
-# FreeType：text_renderer.cpp 按 UTF-8 渲染中文识别结果（cv::putText 只支持 ASCII）。
-# 直接用系统 FreeType，不依赖 opencv_contrib；找不到时 text_renderer 编译成空实现，
-# 入口靠 ready() 回退 ASCII，不影响构建与识别。注意 OpenCV 可能来自 /usr/local
-# （自带 build 无 freetype 模块），因此不混链发行版 libopencv_freetype。
 find_package(Freetype QUIET)
 if(FREETYPE_FOUND)
-    target_compile_definitions(test_wav_asr.out PRIVATE HK_HAVE_FREETYPE=1)
-    target_include_directories(test_wav_asr.out PRIVATE ${FREETYPE_INCLUDE_DIRS})
-    target_link_libraries(test_wav_asr.out PRIVATE ${FREETYPE_LIBRARIES})
+    message(STATUS "FreeType found: 中文识别结果用系统字体渲染")
 else()
-    message(STATUS "FreeType 未找到：test_wav_asr 窗口文字回退 ASCII")
+    message(STATUS "FreeType 未找到：识别结果窗口文字回退 ASCII")
 endif()
 
-ort_link_target(test_wav_asr.out)
-
-# ---------------------------------------------------------------------
-# 可执行文件：test_mic_asr.out
-#   设备实时音频 -> AudioPreprocess -> AsrDecoder（ORT 三模型）-> 文本
-#   + SpectrogramImage 窗口与底部识别文字；依赖海康 SDK、OpenCV、ORT。
-# ---------------------------------------------------------------------
-add_executable(test_mic_asr.out
-    test_mic_asr.cpp
-    audio_ai_process/audio_preprocess.cpp
-    audio_ai_process/asr_decode.cpp
-    audio_ai_process/text_utils.cpp
-    audio_ai_process/text_renderer.cpp
-    audio_ai_process/spectrogram_image.cpp
+# =====================================================================
+#  一、麦克风采集库（不依赖 OpenCV / ORT）
+# =====================================================================
+add_library(hk_sdk_audio_client SHARED
     ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
     ${HK_MIC_DIR}/audio_resampler.cpp
 )
 
-target_compile_definitions(test_mic_asr.out PRIVATE
-    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
-)
-
-target_include_directories(test_mic_asr.out PRIVATE
-    ${CMAKE_SOURCE_DIR}
+# 公共头文件 hk_sdk_audio_client.h 直接 include "HCNetSDK.h"，
+# 因此 SDK 头文件路径必须对使用方可见；SDK 库本身只在本库内部链接。
+target_include_directories(hk_sdk_audio_client PUBLIC
     ${HK_MIC_DIR}
     ${HIK_INCLUDE_DIRS}
-    ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(test_mic_asr.out PRIVATE
-    ${OpenCV_LIBS}
+target_link_libraries(hk_sdk_audio_client PRIVATE
     ${HIK_LIBS}
     Threads::Threads
 )
 
-set_target_properties(test_mic_asr.out PROPERTIES
-    BUILD_RPATH "${HIK_LIB_ROOT}"
-    INSTALL_RPATH "${HIK_LIB_ROOT}"
+set_target_properties(hk_sdk_audio_client PROPERTIES
+    OUTPUT_NAME "_hk_sdk_audio_client"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    BUILD_RPATH   "${HIK_LIB_ROOT}"
+    INSTALL_RPATH "$ORIGIN"
 )
 
-# 中文识别结果渲染：与 test_wav_asr.out 相同的可选 FreeType 依赖，
-# 找不到时 text_renderer 编译成空实现，入口回退 cv::putText。
-if(FREETYPE_FOUND)
-    target_compile_definitions(test_mic_asr.out PRIVATE HK_HAVE_FREETYPE=1)
-    target_include_directories(test_mic_asr.out PRIVATE ${FREETYPE_INCLUDE_DIRS})
-    target_link_libraries(test_mic_asr.out PRIVATE ${FREETYPE_LIBRARIES})
+# =====================================================================
+#  二、ASR 处理库（不依赖 HCNetSDK / 采集库）
+# =====================================================================
+set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
+
+set(AAP_SOURCES
+    ${AAP_DIR}/audio_preprocess.cpp
+    ${AAP_DIR}/spectrogram_image.cpp
+    ${AAP_DIR}/text_utils.cpp
+    ${AAP_DIR}/text_renderer.cpp
+)
+
+# ORT 缺失时不编译 asr_decode.cpp：音频/可视化链路仍可用，
+# 依赖推理的三个入口在下方一起跳过。
+if(ORT_FOUND)
+    list(APPEND AAP_SOURCES ${AAP_DIR}/asr_decode.cpp)
 endif()
 
-ort_link_target(test_mic_asr.out)
+add_library(audio_ai_process SHARED ${AAP_SOURCES})
 
-# ---------------------------------------------------------------------
-# 可执行文件：load_onnx_model.out
-#   模型加载自检：打开 encoder / decoder / joiner，打印输入输出与 metadata。
-#   不依赖 OpenCV 和海康 SDK，只依赖 ONNX Runtime。
-# ---------------------------------------------------------------------
-add_executable(load_onnx_model.out
-    load_onnx_model.cpp
-    audio_ai_process/text_utils.cpp
+# Public 头文件使用 opencv2/core.hpp 与 audio_ai_process/xxx.h 写法，
+# 因此把工作区根目录与 OpenCV 头文件路径传给使用方。
+target_include_directories(audio_ai_process PUBLIC
+    ${CMAKE_SOURCE_DIR}
+    ${OpenCV_INCLUDE_DIRS}
 )
 
-# 默认模型目录按工程根拼接，入口从任意工作目录启动都能找到 weight/
-target_compile_definitions(load_onnx_model.out PRIVATE
-    HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
+target_link_libraries(audio_ai_process PUBLIC
+    ${OpenCV_LIBS}
+    Threads::Threads
 )
 
-target_include_directories(load_onnx_model.out PRIVATE ${CMAKE_SOURCE_DIR})
+if(FREETYPE_FOUND)
+    target_compile_definitions(audio_ai_process PRIVATE HK_HAVE_FREETYPE=1)
+    target_include_directories(audio_ai_process PRIVATE ${FREETYPE_INCLUDE_DIRS})
+    target_link_libraries(audio_ai_process PRIVATE ${FREETYPE_LIBRARIES})
+endif()
 
-ort_link_target(load_onnx_model.out)
+if(ORT_FOUND)
+    ort_link_target(audio_ai_process)
+endif()
+
+set_target_properties(audio_ai_process PROPERTIES
+    OUTPUT_NAME "_audio_ai_process"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    INSTALL_RPATH "$ORIGIN"
+)
+
+# =====================================================================
+#  三、可执行入口
+#
+#  入口只做「参数定义 + 数据源 + 装配」，库负责流水线；
+# 每个入口只链接自己需要的库。
+# =====================================================================
+
+# --- 3.1 声明入口 ---
+add_executable(save_audio_wav.out save_audio_wav.cpp)
+add_executable(test_spectrogram_cv_mic.out test_spectrogram_cv_mic.cpp)
+add_executable(test_spectrogram_cv_wav.out test_spectrogram_cv_wav.cpp)
+add_executable(fbank_dump.out tools/fbank_dump.cpp)
+
+# 依赖 ORT 的入口：未安装 ONNX Runtime 时整体跳过
+if(ORT_FOUND)
+    add_executable(test_wav_asr.out test_wav_asr.cpp)
+    add_executable(test_mic_asr.out test_mic_asr.cpp)
+    add_executable(load_onnx_model.out load_onnx_model.cpp)
+endif()
+
+# --- 3.2 按依赖分组，用 foreach 统一设置 ---
+# 每个入口只链接自己需要的库：
+#   仅采集库          save_audio_wav
+#   仅 ASR 库         test_spectrogram_cv_wav / fbank_dump / test_wav_asr / load_onnx_model
+#   两个库都链接      test_spectrogram_cv_mic / test_mic_asr
+set(EXEC_DEMOS
+    save_audio_wav.out
+    test_spectrogram_cv_mic.out
+    test_spectrogram_cv_wav.out
+    fbank_dump.out
+)
+
+set(EXEC_LINK_HK
+    save_audio_wav.out
+    test_spectrogram_cv_mic.out
+)
+
+set(EXEC_LINK_AAP
+    test_spectrogram_cv_mic.out
+    test_spectrogram_cv_wav.out
+    fbank_dump.out
+)
+
+if(ORT_FOUND)
+    list(APPEND EXEC_DEMOS test_wav_asr.out test_mic_asr.out load_onnx_model.out)
+    list(APPEND EXEC_LINK_HK test_mic_asr.out)
+    list(APPEND EXEC_LINK_AAP test_wav_asr.out test_mic_asr.out load_onnx_model.out)
+endif()
+
+foreach(TARGET ${EXEC_DEMOS})
+    # 入口用 HK_PROJECT_DIR 拼 weight/、results/ 的绝对路径
+    target_compile_definitions(${TARGET} PRIVATE
+        HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    if(${TARGET} IN_LIST EXEC_LINK_HK)
+        target_link_libraries(${TARGET} PRIVATE hk_sdk_audio_client)
+        set_target_properties(${TARGET} PROPERTIES
+            BUILD_RPATH   "${HIK_LIB_ROOT}"
+            INSTALL_RPATH "${HIK_LIB_ROOT}"
+        )
+    endif()
+
+    if(${TARGET} IN_LIST EXEC_LINK_AAP)
+        target_link_libraries(${TARGET} PRIVATE audio_ai_process)
+    endif()
+endforeach()
+
+# load_onnx_model 直接调用 ORT 接口，需要额外的头文件与 RPATH
+if(ORT_FOUND)
+    ort_link_target(load_onnx_model.out)
+endif()
+
+# =====================================================================
+#  四、安装：install/<库名>/{include,lib}
+# =====================================================================
+
+# 头文件显式列出，避免 GLOB 把 hk_sdk/include 下的厂商头文件也装进来。
+set(HK_AUDIO_HEADERS
+    ${HK_MIC_DIR}/hk_sdk_audio_client.h
+    ${HK_MIC_DIR}/audio_resampler.h
+)
+
+set(AAP_HEADERS
+    ${AAP_DIR}/audio_preprocess.h
+    ${AAP_DIR}/spectrogram_image.h
+    ${AAP_DIR}/text_utils.h
+    ${AAP_DIR}/text_renderer.h
+)
+if(ORT_FOUND)
+    list(APPEND AAP_HEADERS ${AAP_DIR}/asr_decode.h)
+endif()
+
+# 安装一个模块：头文件 + 自身共享库。
+# HEADER_DEST 为空表示头文件平铺到 include/；否则放到 include/<HEADER_DEST>/。
+function(install_module TARGET_NAME MODULE_INSTALL_ROOT HEADER_FILES HEADER_DEST)
+    if(NOT TARGET ${TARGET_NAME})
+        message(FATAL_ERROR "install_module: target '${TARGET_NAME}' does not exist.")
+    endif()
+
+    if(HEADER_FILES)
+        if(HEADER_DEST)
+            install(FILES ${HEADER_FILES}
+                DESTINATION "${MODULE_INSTALL_ROOT}/include/${HEADER_DEST}")
+        else()
+            install(FILES ${HEADER_FILES}
+                DESTINATION "${MODULE_INSTALL_ROOT}/include")
+        endif()
+    endif()
+
+    install(TARGETS ${TARGET_NAME}
+        LIBRARY DESTINATION "${MODULE_INSTALL_ROOT}/lib"
+        ARCHIVE DESTINATION "${MODULE_INSTALL_ROOT}/lib"
+        RUNTIME DESTINATION "${MODULE_INSTALL_ROOT}/bin"
+    )
+endfunction()
+
+set(INSTALL_ROOT "${CMAKE_SOURCE_DIR}/install")
+
+# 采集库：头文件平铺；SDK 的 .so 与 HCNetSDKCom/ 一并装到 lib，
+# 库自身 INSTALL_RPATH=$ORIGIN，运行时能在同目录找到 libhcnetsdk。
+install_module(hk_sdk_audio_client
+    "${INSTALL_ROOT}/hk_sdk_audio_client"
+    "${HK_AUDIO_HEADERS}"
+    ""
+)
+# 公共头文件 hk_sdk_audio_client.h 直接 include "HCNetSDK.h"，
+# 因此 SDK 头文件也必须随库安装，否则使用方无法编译。
+install(DIRECTORY "${HIK_INCLUDE_DIRS}/"
+    DESTINATION "${INSTALL_ROOT}/hk_sdk_audio_client/include"
+    FILES_MATCHING
+    PATTERN "*.h"
+    PATTERN "*.hpp"
+)
+install(DIRECTORY "${HIK_LIB_ROOT}/"
+    DESTINATION "${INSTALL_ROOT}/hk_sdk_audio_client/lib"
+    FILES_MATCHING
+    PATTERN "*.so*"
+    PATTERN "*.dll"
+)
+
+# ASR 库：头文件保留 audio_ai_process/ 前缀，使用方 include 路径与源码一致。
+# ORT / OpenCV 不复制，属于外部运行期依赖（见 README）。
+install_module(audio_ai_process
+    "${INSTALL_ROOT}/audio_ai_process"
+    "${AAP_HEADERS}"
+    "audio_ai_process"
+)

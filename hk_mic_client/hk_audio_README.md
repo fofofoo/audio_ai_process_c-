@@ -694,3 +694,27 @@ PCM 会话实测（2026-11-03）：
 - 上行：必须继续回发 80 B G.722 静音（裸 PCM 静音会让设备立即停流，详见 1.4.7）；
 - 输出：`input_samples / 2 ≈ pcm_samples`（差值恒为 95 = FIR 启动延迟）；28/45 秒运行都只得到约 21.5 秒音频（见 1.7.2）。
 
+
+## 三、作为独立库使用（安装）
+
+采集库现在构建为 `lib_hk_sdk_audio_client.so`，与 ASR 库 `lib_audio_ai_process.so`
+完全解耦。安装命令：
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+cmake --install build
+```
+
+产物：
+
+```
+install/hk_sdk_audio_client/
+├── include/   hk_sdk_audio_client.h、audio_resampler.h、HCNetSDK 头文件
+└── lib/       lib_hk_sdk_audio_client.so、HCNetSDK 运行库（含 HCNetSDKCom/）
+```
+
+使用方编译时加 `-Iinstall/hk_sdk_audio_client/include`，链接
+`-Linstall/hk_sdk_audio_client/lib -l_hk_sdk_audio_client`；库自身
+`INSTALL_RPATH=$ORIGIN`，运行时能在同目录找到 `libhcnetsdk.so`。
+只需要采集能力时**不需要** OpenCV 或 ONNX Runtime。

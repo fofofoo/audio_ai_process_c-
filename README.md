@@ -48,7 +48,9 @@
 
 | 路径 | 一句话职责 |
 | --- | --- |
-| `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 海康设备音频采集库：登录、语音转发、G.722.1 解码、可选 wav 录制、取流缓冲与统计 |
+| `lib_hk_sdk_audio_client.so` | 麦克风采集库：登录、语音转发、G.722.1 解码、可选降采样与 wav 录制、取流缓冲与统计；不依赖 OpenCV/ORT |
+| `lib_audio_ai_process.so` | ASR 处理库：LogFBank 前端、`AsrDecoder`（ORT 三模型）、语谱图、文本渲染；不依赖 HCNetSDK |
+| `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 采集库源码：设备连接与音频流水线 |
 | `hk_mic_client/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），用于 PCM 32 kHz → 16 kHz；零外部依赖 |
 | `hk_mic_client/hk_sdk/` | 厂商提供的 HCNetSDK 头文件与预编译库（按平台分目录） |
 | `audio_ai_process/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
@@ -141,15 +143,34 @@ FreeType 是 `test_wav_asr.out` 的可选依赖：找到时窗口底部用系统
 ASR 相关目标额外依赖 ONNX Runtime，CMake 按架构选择项目内托管版本：
 x86_64 用 `onnxruntime/install/onnxruntime-1.23.2`，aarch64 用
 `onnxruntime/install/onnxruntime-1.18.0`（需在 Jetson 上源码编译）。
-ORT 缺失时只给 WARNING，不影响音频链路；推理目标通过 `ort_link_target()` 接入。
-CUDA EP 的 cuDNN 9 环境配置见 `onnxruntime/README.md`。
+ORT 缺失时只给 WARNING，音频采集 / 语谱图 / fbank 对拍仍可构建，
+依赖推理的 `asr_decode.cpp` 与三个 ASR 入口自动跳过；推理目标通过
+`ort_link_target()` 接入。CUDA EP 的 cuDNN 9 环境配置见 `onnxruntime/README.md`。
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
+cmake --install build      # 输出到 install/<库名>/{include,lib}
 ```
 
+安装布局：
+
+```
+install/
+├── hk_sdk_audio_client/
+│   ├── include/   hk_sdk_audio_client.h、audio_resampler.h、HCNetSDK 头文件
+│   └── lib/       lib_hk_sdk_audio_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
+└── audio_ai_process/
+    ├── include/audio_ai_process/*.h
+    └── lib/lib_audio_ai_process.so
+```
+
+两个库互不 include 对方头文件，`test_mic_asr.out` / `test_spectrogram_cv_mic.out`
+只作为组合层同时链接两者。ORT 与 OpenCV 不随安装复制，属于外部运行期依赖：
+使用安装库的程序需要自行提供 `libonnxruntime.so`（或设置 `LD_LIBRARY_PATH`）。
+
 已在 Linux x86_64（WSL2）验证；ARM 与 Windows 目录已配置，但未实测。
+Windows 下共享库需要导出宏，当前代码未加 `__declspec(dllexport)`，暂以 Linux 为准。
 
 ### 常用命令
 
@@ -268,14 +289,15 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
 | `test_wav_asr.cpp` | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + `hyp` + `decoder_out`）必须 `reset()` 才能换音频 | 多文件 / 多路复用时要按流隔离实例或串行调用 |
-| 当前阶段 | wav 与设备实时两条链路都已接入 ASR，但仍在同一进程内直接组合 | 后续拆成「ASR 处理库 + 麦克风采集库」两个零耦合库 |
+| 共享库 | 两个库以 SHARED 构建，Linux 下无需导出宏；ORT / OpenCV 不随安装复制 | Windows 构建需补 `__declspec(dllexport)`；部署机需自备 ORT 与 OpenCV 运行库 |
 | `weight/`、`onnxruntime/install/` | 体积大且按模型/平台分发，不入库 | 克隆后需自行放置权重与 ORT 预编译库，否则推理目标无法构建 |
 | `hk_mic_client/hk_sdk/` | 厂商预编译库，体积较大且按平台分目录 | 换平台需确认对应目录与运行期依赖完整 |
 
 ## 后续计划
 
-1. **拆成两个库**：ASR 处理库（初始化 / reset / 喂 PCM / 取文本）与麦克风采集库
-   （打开设备、按块输出 PCM），两库零耦合。
+1. ~~拆成两个库~~：已完成。`lib_hk_sdk_audio_client`（采集）与
+   `lib_audio_ai_process`（ASR 处理）两个 SHARED 库零耦合，
+   `cmake --install build` 安装到 `install/<库名>/`。
 2. **PCM 32 kHz 支持**：已接入采集库输出侧的整数倍抗混叠降采样
    （`output_sample_rate=16000`），实时入口在 PCM 编码下可直接跑 ASR；
    后续可补非整数比（44.1k→16k）的多相重采样。
