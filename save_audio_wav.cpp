@@ -3,7 +3,7 @@
  * @brief 设备端音频录制 demo：启动海康语音转发，录制 10 秒并保存为 wav。
  *
  * 职责边界：
- *   - 只做「配置参数 → 启动客户端 → 等待固定时长 → 停止落盘 → 打印统计」；
+ *   - 只做「配置参数 → init/start → 录制固定时长 → 停止落盘 → deinit → 打印统计」；
  *   - 登录、编码查询、G.722.1 解码、wav 头写入全部由 HkSdkAudioClient 完成；
  *   - 不做重采样、不做语音识别，产出的 wav 供 Python 侧直接读取。
  *
@@ -80,7 +80,7 @@ int main() {
     config.voice_channel = kVoiceChannel;
     config.verbose = true;
     // 可选：启动前主动设置对讲编码（写设备持久配置，默认关闭）。
-    // 打开后 start() 先快照原值再设置并读回复核，stop() 默认写回原配置。
+    // 打开后 init() 先快照原值再设置并读回复核，deinit() 默认写回原配置。
     // 采样率跟随编码自动取：G.722.1 → 16 kHz，PCM → 32 kHz。
     config.set_audio_format = false;
     config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
@@ -95,11 +95,18 @@ int main() {
               << ", duration=" << kRecordSeconds << "s" << std::endl;
 
     // —— 三、启动采集 ——
-    // start() 只建立语音转发，不产生文件；写盘必须显式 start_record()。
+    // init() 只登录 + 查询编码，start() 才建立语音转发；本入口没有模型加载，
+    // 两段紧挨着调用，但仍按同一套生命周期写，与实时 ASR 入口保持一致。
+    // 两者都不产生文件，写盘必须显式 start_record()。
     HkSdkAudioClient client(config);
-    if (!client.start()) {
+    if (!client.init()) {
         // 失败原因已由客户端打印到 stderr，这里只补上下文。
+        std::cerr << "[Record] init failed: " << client.last_error() << std::endl;
+        return -1;
+    }
+    if (!client.start()) {
         std::cerr << "[Record] start failed: " << client.last_error() << std::endl;
+        client.deinit();
         return -1;
     }
 
@@ -108,7 +115,7 @@ int main() {
 
     if (!client.start_record(output_path.string())) {
         std::cerr << "[Record] start_record failed: " << client.last_error() << std::endl;
-        client.stop();
+        client.deinit();
         return -1;
     }
 
@@ -138,9 +145,12 @@ int main() {
 
     // —— 五、结束录制并落盘 ——
     // stop_record() 只收尾文件，语音转发仍在运行；
-    // stop() 再断开转发（内部会兜底调用 stop_record()）。
+    // stop() 再断开转发（内部会兜底调用 stop_record()）；
+    // deinit() 最后释放会话（恢复设备编码、登出、NET_DVR_Cleanup），
+    // 同时结算 wall_seconds —— 下面第六节要打印它，所以必须放在前面。
     client.stop_record();
     client.stop();
+    client.deinit();
 
     // —— 六、打印结果 ——
     const AudioCaptureStats stats = client.get_stats();

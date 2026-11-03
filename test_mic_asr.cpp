@@ -28,8 +28,10 @@
  *     设备实际采样率不是 16 kHz（切到 PCM 编码时会被钉在 32 kHz）时**直接
  *     报错退出**，不静默重采样 —— 与 wav 入口「宁可明确提示，也不悄悄喂错
  *     数据」一致。
- *   - 设备启动提前到建 ONNX 会话之前：先确认数据源与采样率可用，避免加载
- *     完模型才发现设备不能用。
+ *   - 设备会话拆成两段：建 ONNX 会话之前先 init()（登录 + 查询编码 + 采样率
+ *     校验），确认数据源可用；模型装配完成后再 start() 真正开流。这样既能在
+ *     加载前发现设备不可用，又不会让 7~14 s 的模型加载把启动阶段的音频
+ *     （取流缓冲只有 2.56 s）丢光。
  *   - 窗口底部文字优先 FreeType 渲染中文（Python 的 cv2.putText 只支持
  *     ASCII，中文会静默变成 '?'），字体缺失时回退 cv2.putText。
  *   - 新增 --no-window / --cuda / --seconds 三个开关（Python 版配置全写死）。
@@ -39,16 +41,16 @@
  * 调用顺序（对照 main 里的编号）
  * ============================================================
  *   一、参数与命令行         设备地址、模型路径、画布尺寸、字体候选、开关
- *   二、连接设备（Python 1） 2.1 配置  2.2 start  2.3 采样率校验
+ *   二、连接设备（Python 1） 2.1 配置  2.2 init  2.3 采样率校验
  *   三、加载模型与装配（Python 2）
  *       3.1 session 选项    3.2 可选 CUDA EP   3.3 三 session + AsrDecoder
- *       3.4 前端            3.5 语谱图         3.6 中文字体
+ *       3.4 前端            3.5 语谱图         3.6 中文字体   3.7 start 开流
  *   四、打印配置（Python 3）
  *   五、主循环（Python 4）
  *       5.0 退出条件  5.1 取音频  5.2 归一化  5.3 前端  5.4 可视化
  *       5.5 推理    5.6 打印    5.7 画字显示  5.8 按键与节拍
  *   六、收尾与统计（Python 5）
- *       6.1 停流  6.2 残余样本  6.3 补尾解码  6.4 最后一屏
+ *       6.1 停流  6.2 残余样本  6.2.1 deinit  6.3 补尾解码  6.4 最后一屏
  *       6.5 统计  6.6 关窗
  *
  * 结束（Ctrl+C、窗口里按 q/Esc、或 --seconds 到点）后必须走完收尾：把缓冲里
@@ -210,12 +212,12 @@ int main(int argc, char** argv) {
     capture_config.verbose = true;
 
     // 2.1.1 可选：启动前主动设置对讲编码（写设备持久配置，默认关闭）。
-    //       打开后 start() 会先快照原值 → 设置 → 读回复核，不一致直接拒绝
-    //       启动；stop() 默认把原配置写回。采样率跟随编码自动取：
+    //       打开后 init() 会先快照原值 → 设置 → 读回复核，不一致直接拒绝
+    //       初始化；deinit() 默认把原配置写回。采样率跟随编码自动取：
     //       G.722.1 → 16 kHz，PCM → 32 kHz（本机实测 PCM 只能是 32 kHz）。
     capture_config.set_audio_format = false; // false=只读设备当前编码；true=启动前改成本文件的 audio_enc_type，退出时还原
     capture_config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
-    capture_config.restore_audio_format = true; //< stop() 时是否写回设置前的设备配置
+    capture_config.restore_audio_format = true; //< deinit() 时是否写回设置前的设备配置
 
     // 2.1.2 输出采样率钉在 16 kHz：预处理模块与模型只认 16 kHz。
     //       G.722.1 本来就是 16 kHz（直通，无额外开销）；切到 PCM 时设备
@@ -224,10 +226,14 @@ int main(int argc, char** argv) {
     //       0 = 跟随设备；本入口不用 0，否则 PCM 下会因采样率不符拒绝启动。
     capture_config.output_sample_rate = 16000;
 
-    // 2.2 建立语音转发：只登录 + 开流，不写 wav 文件。
+    // 2.2 建立设备会话：只登录 + 查询编码，不开流，也不写 wav 文件。
+    //     开流要等到模型装配完（3.7）再做：Jetson 上 CPU 加载约 7 s、CUDA
+    //     约 14 s，若此时设备已在转发，音频会持续压进取流缓冲（上限
+    //     2.56 s）并在进入主循环前就被丢弃。先 init() 后 start() 能把这段
+    //     空窗完全消掉，代价只是设备连接错误要等模型加载完才报出来。
     HkSdkAudioClient client(capture_config);
-    if (!client.start()) {
-        std::cerr << "[ASR] 设备启动失败：" << client.last_error() << "\n";
+    if (!client.init()) {
+        std::cerr << "[ASR] 设备初始化失败：" << client.last_error() << "\n";
         return 1;
     }
 
@@ -243,7 +249,7 @@ int main(int argc, char** argv) {
                      "（应为 16000）；\n"
                   << "      设备实际采样率 = " << client.device_sample_rate()
                   << " Hz。\n";
-        client.stop();
+        client.deinit();
         return 1;
     }
 
@@ -313,6 +319,17 @@ int main(int argc, char** argv) {
         std::cout << "文字字体: "
                   << (font_ok ? font.path : std::string("未找到，回退 ASCII"))
                   << "\n";
+    }
+
+    // 3.7 模型与界面全部就绪后才真正开流：从这一刻起设备才开始转发音频，
+    //     主循环紧接着就能取到数据，不会出现「模型加载 7~14 s、缓冲只有
+    //     2.56 s」的启动丢块。start() 内部含 StartVoiceCom（同步阻塞约
+    //     1.2 s）与上行保活线程；失败时上一行 init() 建立的会话还在，
+    //     必须 deinit() 收尾，否则设备编码与登录态不会释放。
+    if (!client.start()) {
+        std::cerr << "[ASR] 语音转发启动失败：" << client.last_error() << "\n";
+        client.deinit();
+        return 1;
     }
 
     // 底部白条文字：优先 FreeType 渲染 UTF-8 中文，失败回退 ASCII putText。
@@ -388,12 +405,12 @@ int main(int argc, char** argv) {
     double peak = 0.0;  // 峰值幅度（float 域），用于判断麦克风是否真采到声音
     const auto t_start = std::chrono::steady_clock::now();
 
-    // 空格切换「暂停 / 恢复语音转发」：库内部只停/起对讲线路，
-    // 不重登录、不重建编码器；恢复后设备约 1.2 秒才送首包。
+    // 空格切换「暂停 / 恢复语音转发」：底层就是 client.stop() / client.start()，
+    // 只停/起对讲线路，不重登录、不重建编码器；恢复后设备约 1.2 秒才送首包。
     // 暂停期间没有新数据，窗口不会自然刷新，这里手动重画一次状态。
     auto toggle_pause = [&]() {
         if (!paused) {
-            if (client.pause_audio_forwarding()) {
+            if (client.stop()) {
                 paused = true;
                 std::cout << "\n[ASR] 已暂停语音转发，按空格恢复\n";
             } else {
@@ -401,7 +418,7 @@ int main(int argc, char** argv) {
             }
         } else {
             std::cout << "\n[ASR] 正在恢复语音转发（首包约 1.2 秒后到达）...\n";
-            if (client.resume_audio_forwarding()) {
+            if (client.start()) {
                 paused = false;
             } else {
                 std::cout << "[ASR] 恢复失败：" << client.last_error() << "\n";
@@ -507,7 +524,7 @@ int main(int argc, char** argv) {
     client.stop();
 
     // 6.2 关流后缓冲区里可能还压着几块样本，先取走解完，否则最后一段话
-    //     会因为没进前端而整段丢失。
+    //     会因为没进前端而整段丢失。顺序不能反：deinit() 会清空取流缓冲。
     if (client.get_last_audio(pcm) && !pcm.empty()) {
         chunk.resize(pcm.size());
         for (size_t i = 0; i < pcm.size(); ++i) {
@@ -524,6 +541,11 @@ int main(int argc, char** argv) {
         }
         decoder.accept_features(feats);
     }
+
+    // 6.2.1 残余样本取完后释放设备会话：恢复设备编码（若本入口改过）、
+    //       登出并 NET_DVR_Cleanup。放这里而不是程序末尾，是为了尽早释放
+    //       设备占用；之后的解码、渲染与统计都不再需要设备连接。
+    client.deinit();
 
     // 6.3 补尾解码：input_finished() 补出尾部帧，再在特征尾补 100 帧 0
     //     （log 域能量 1，不是静音值），使最后不满一个 chunk 的尾段也能被

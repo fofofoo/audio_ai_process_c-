@@ -6,18 +6,21 @@
  * 实现层面的东西——线程模型、加锁范围、切帧规则、wav 收尾的边界条件。
  *
  * 线程模型：
- *   - start() / stop() / get_stats() / output_path() 由调用线程（main）执行；
+ *   - init() / start() / stop() / deinit() / get_stats() / output_path()
+ *     由调用线程（main）执行；
  *   - on_voice_data() 运行在 SDK 内部回调线程，会被连续调用，且不保证与
  *     主线程错开。所有对 wav 文件、m_encoded_buf、m_stats、m_data_bytes 的
  *     读写都在 m_mutex 内完成，回调里只做「追加 → 切帧 → 解码 → fwrite」，
  *     不做重活、不等待主线程，避免拖慢 SDK 回调导致丢包。
  *
- * 启动顺序（start()）：
- *   init_sdk → login_device → query_audio_format → InitG722Decoder
- *   → StartVoiceCom_MR_V30
- * start() 只拉起取流，不碰文件；写盘由 start_record(path) 打开 wav、
- * stop_record() 收尾。任意一步失败都直接返回 false，已申请的资源留给析构兜底，
- * 不做中途回滚（重复调用 start() 是幂等的，下次会复用已登录的句柄）。
+ * 会话顺序（init() → start() → stop() → deinit()）：
+ *   init()  ：init_sdk → login_device → query_audio_format → InitG722Decoder
+ *   start() ：InitG722Decoder（重建） → StartVoiceCom_MR_V30 → 上行保活
+ *   stop()  ：停保活 → StopVoiceCom → 收尾 wav → 残包计数
+ *   deinit()：stop → 恢复设备编码 → 登出 → 释放句柄 → NET_DVR_Cleanup
+ * init()/start() 都不碰文件；写盘由 start_record(path) 打开 wav、
+ * stop_record() 收尾。任意一步失败都直接返回 false，已申请的资源留给
+ * deinit() 兜底，不做中途回滚（重复调用 init() / start() 是幂等的）。
  *
  * 约束提醒：本类沿用实例级 NET_DVR_Init/Cleanup，与可见光/热成像客户端
  * 混跑时先析构的一才会把 SDK 清掉，见 .h 文件约束 1。
@@ -48,7 +51,7 @@ constexpr size_t kPcmBufferSize = kPcmBytesPerFrame * 4;
 // close_wav 再回填 RIFF 与 data 两个长度字段。
 constexpr size_t kWavHeaderSize = 44;
 
-// 暂停后恢复的重试节奏：实测 StopVoiceCom 后约 200 ms 内设备会拒绝
+// 停止后再次起流的重试节奏：实测 StopVoiceCom 后约 200 ms 内设备会拒绝
 // 重新起流（error 29 NET_DVR_DVROPRATEFAILED），间隔 200 ms 起流稳定；
 // 5 次最多覆盖约 1 秒，足够吸收设备侧释放会话的抖动。
 constexpr int kResumeRetryCount = 5;
@@ -59,7 +62,7 @@ constexpr int kResumeRetryMs = 200;
 // ==================== 构造与状态访问 ====================
 
 // 构造：只保存配置并预分配解码输出缓冲，不碰 SDK、不连设备。
-// 网络与设备资源一律等到 start() 再申请，方便构造后仍可改配置再启动。
+// 网络与设备资源一律等到 init() 再申请，方便构造后仍可改配置再启动。
 // m_pcm_buf 在这里一次性分配好，回调线程里不再扩容（否则要在锁内分配内存）。
 HkSdkAudioClient::HkSdkAudioClient(const AudioCaptureConfig& config)
     : m_config(config) {
@@ -69,47 +72,23 @@ HkSdkAudioClient::HkSdkAudioClient(const AudioCaptureConfig& config)
 // 默认构造：使用 AudioCaptureConfig 的默认值（演示设备地址/端口）。
 HkSdkAudioClient::HkSdkAudioClient() : HkSdkAudioClient(AudioCaptureConfig{}) {}
 
-// 析构：先 stop() 收尾 wav（回填长度 + 改名），再按反序释放 SDK 资源：
-// 语音转发句柄 → 登出 → G722 解码器 → NET_DVR_Cleanup。
-// stop() 是幂等的，若调用方已经手动停过，这里只剩释放句柄。
-// 注意：析构时回调线程必须已停止，顺序上先 StopVoiceCom 才能安全 fclose。
+// 析构：与 deinit() 完全等价，作为调用方忘记显式释放时的兜底。
+// deinit() 是幂等的，重复调用只剩空操作。
 HkSdkAudioClient::~HkSdkAudioClient() {
-    stop();
-
-    if (m_user_id >= 0) {
-        NET_DVR_Logout(m_user_id);
-        m_user_id = -1;
-    }
-    if (m_decoder != nullptr) {
-        NET_DVR_ReleaseG722Decoder(m_decoder);
-        m_decoder = nullptr;
-    }
-    // 保活用的 G.722 编码器与解码器一样按实例复用，析构时统一释放。
-    if (m_encoder != nullptr) {
-        NET_DVR_ReleaseG722Encoder(m_encoder);
-        m_encoder = nullptr;
-    }
-    if (m_sdk_initialized) {
-        NET_DVR_Cleanup();
-        m_sdk_initialized = false;
-    }
+    deinit();
 }
 
-// 启动采集：登录 → 读实际编码 → 建解码器 → 打开 wav → 发起语音转发。
-// 已处于运行态时直接返回 true，不重复建流（可安全重复调用）。
+// 初始化会话：SDK 初始化 → 登录 → 可选设置编码 → 查询编码 → 建降采样器与
+// 解码器。只确认设备可用，不调用 StartVoiceCom、不产生音频、不打开 wav。
+// 已初始化时直接返回 true（可安全重复调用）。
 // 失败时返回 false，原因写进 last_error；已登录/已初始化的资源不在这里回收，
-// 由析构统一清理，下次 start() 会复用它们。
-bool HkSdkAudioClient::start() {
-    if (m_running.load()) {
+// 由 deinit() 统一清理，下次 init() 会复用它们。
+bool HkSdkAudioClient::init() {
+    if (m_session_ready.load()) {
         return true;
     }
-    // 暂停中再调 start() 视为恢复：不重跑初始化、不清统计，
-    // 与 resume_audio_forwarding() 完全等价。
-    if (m_paused.load()) {
-        return resume_audio_forwarding();
-    }
 
-    // 零、上一轮统计与缓冲清零，避免重复 start() 时统计累加。
+    // 零、上一轮统计与缓冲清零，避免重复 init() 时统计累加。
     m_last_error.clear();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -136,14 +115,14 @@ bool HkSdkAudioClient::start() {
         return false;
     }
     // 2.5 可选：按配置主动设置对讲编码。必须在查询之前，这样第 3 步读到的
-    //     就是设置后实际生效的值；apply 内部会先快照原配置，供停止时恢复。
+    //     就是设置后实际生效的值；apply 内部会先快照原配置，供 deinit() 恢复。
     if (m_config.set_audio_format && !apply_audio_format()) {
         return false;
     }
     // 3. 查询设备音频编码，query_audio_format()
     if (!query_audio_format()) {
         // 设置过编码但后续不可用（例如设备拒绝、查询失败）：先恢复原配置，
-        // 否则下次 start() 会把「已经改过的值」当成原值快照。
+        // 否则下次 init() 会把「已经改过的值」当成原值快照。
         restore_audio_format();
         return false;
     }
@@ -155,7 +134,7 @@ bool HkSdkAudioClient::start() {
     }
 
     // 二、初始化hk_sdk的 G.722.1 解码器
-    // 按实例复用：重复 start() 时不再重建，析构里统一释放。即便当前编码是 PCM，也照样创建——万一运行中设备切换编码，
+    // 按实例复用：重复 init() 时不再重建，deinit() 里统一释放。即便当前编码是 PCM，也照样创建——万一运行中设备切换编码，
     if (m_decoder == nullptr) {
         m_decoder = NET_DVR_InitG722Decoder();
         if (m_decoder == nullptr) {
@@ -170,18 +149,51 @@ bool HkSdkAudioClient::start() {
     // start() 只负责把语音转发拉起来；文件由 start_record(path) 打开，
     // 因此首包到达时若尚未开始录制，回调只会解码后丢弃（见 on_voice_data）。
 
-    // 会话层资源都已就绪：后续 pause/resume 只动对讲线路，不再重跑这些步骤。
+    // 会话层资源都已就绪：后续 start()/stop() 只动对讲线路，不再重跑这些步骤。
     m_session_ready.store(true);
     m_start_time = std::chrono::steady_clock::now();
 
-    // 四、初始化 hk_sdk 的语音对讲功能，并启动上行保活
-    // 起流细节（含上行保活）封装在 start_voice_forward()，pause/resume 共用。
-    if (!start_voice_forward()) {
-        restore_audio_format();
+    // 四、刻意不调用 StartVoiceCom：init() 只确认设备可用，真正拉流由 start()
+    //     在调用方准备好消费音频（例如模型加载完成）之后发起。这样设备不会
+    //     在上层还没就绪时一直推流，把取流缓冲塞满并产生无谓的丢样本。
+    if (m_config.verbose) {
+        std::cout << "[Audio] session ready, channel=" << m_config.voice_channel
+                  << ", codec=" << codec_name() << std::endl;
+    }
+    return true;
+}
+
+// 启动语音转发：重建解码器 → StartVoiceCom（含 200 ms × 5 重试）→ 起保活。
+// 前置条件：init() 已成功（m_session_ready）。
+// 返回 true 只代表设备接受了起流请求；首个音频回调约 1.2 秒后到达。
+bool HkSdkAudioClient::start() {
+    if (m_running.load()) {
+        return true;
+    }
+    if (!m_session_ready.load()) {
+        set_error("start(): init() has not succeeded");
         return false;
     }
 
-    // 五、打印登录、编码格式、错误信息
+    // 停止期间设备可能重新开始编码，旧解码器的自适应预测状态可能与码流对不上；
+    // 重建一次成本很低，换来确定性。此刻没有回调（线路已停），可安全释放。
+    if (m_decoder != nullptr) {
+        NET_DVR_ReleaseG722Decoder(m_decoder);
+        m_decoder = nullptr;
+    }
+    m_decoder = NET_DVR_InitG722Decoder();
+    if (m_decoder == nullptr) {
+        set_error("NET_DVR_InitG722Decoder failed, error=" +
+                  std::to_string(NET_DVR_GetLastError()));
+        return false;
+    }
+
+    // 起流失败（error 29）的重试在 start_voice_forward() 内部完成，
+    // 这里失败说明 5 次都没成功，last_error 已是最后一次的错误码。
+    if (!start_voice_forward()) {
+        return false;
+    }
+
     if (m_config.verbose) {
         std::cout << "[Audio] voice com started, channel=" << m_config.voice_channel
                   << ", recording=off" << std::endl;
@@ -189,7 +201,7 @@ bool HkSdkAudioClient::start() {
     return true;
 }
 
-// 起流并启动上行保活：start() 与 resume_audio_forwarding() 共用。
+// 起流并启动上行保活：由 start() 调用。
 // 前置条件：SDK 已初始化、已登录、编码已确认、解码器已建。
 // 失败时撤销运行标志并写 last_error，句柄保持 -1；成功时开始累计转发时长。
 bool HkSdkAudioClient::start_voice_forward() {
@@ -329,15 +341,16 @@ void HkSdkAudioClient::stop_record() {
     }
 }
 
-// 停止采集：先停语音转发（阻断新回调），再收尾录制与缓冲。
+// 停止语音转发：先停流（阻断新回调），再收尾录制与残包。
 // 顺序不能反——必须先 StopVoiceCom 保证回调线程不再进入写文件路径，
 // 否则 fclose 之后仍可能有回调触发 fwrite（悬垂 FILE*）。
-// 可重复调用；未运行时只做清理和文件收尾。
-void HkSdkAudioClient::stop() {
-    const bool was_running = m_running.exchange(false);
-
-    // stop 之后不再是「暂停」状态：下次 start() 要走完整初始化而不是恢复。
-    m_paused.store(false);
+// 只拆对讲线路，保留 SDK/登录/解码器/取流缓冲，之后可以再次 start()。
+// 可重复调用；未在转发时直接返回 true（幂等）。
+bool HkSdkAudioClient::stop() {
+    // exchange 保证并发调用时只有一方真正执行拆除；已停止则幂等成功。
+    if (!m_running.exchange(false)) {
+        return true;
+    }
 
     // 先停上行保活线程，再关语音转发：反过来会让线程往正在销毁的句柄发数据。
     stop_uplink_keepalive();
@@ -349,116 +362,69 @@ void HkSdkAudioClient::stop() {
     }
     m_voice_handle_atomic.store(-1);
 
-    // 录制中退出时先收尾文件：此时回调已停止，可安全 fclose + 改名。
-    stop_record();
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        // 不足一帧的尾巴不会参与解码，单独计数后丢弃，便于判断是否
-        // 经常出现半帧（一般意味着回调切包或设备异常）。
-        if (!m_encoded_buf.empty()) {
-            m_stats.dropped_partial_bytes += m_encoded_buf.size();
-            m_encoded_buf.clear();
-        }
-        // 墙钟时长只在本次确实运行过时更新，避免重复 stop() 把统计清零。
-        if (was_running) {
-            add_forward_seconds_locked();
-            const auto now = std::chrono::steady_clock::now();
-            m_stats.wall_seconds =
-                std::chrono::duration<double>(now - m_start_time).count();
-        }
-    }
-
-    // 本次 start() 主动改过设备编码时写回原配置；选择「保持新配置」则
-    // 只清快照。stop() 不注销登录，恢复请求仍可在当前会话内发出。
-    if (m_config.restore_audio_format) {
-        restore_audio_format();
-    } else {
-        m_audio_format_saved = false;
-        m_audio_format_changed = false;
-    }
-}
-
-// 暂停语音转发：只拆对讲线路，保留 SDK/登录/解码器，不重跑 start() 初始化。
-// 与 stop() 的区别是「之后还能 resume」：录制文件按约定自动收尾，
-// 取流缓冲保留（调用方可以把暂停前的样本取完）。
-bool HkSdkAudioClient::pause_audio_forwarding() {
-    // exchange 保证并发调用时只有一方真正执行拆除；已在暂停则幂等成功。
-    if (!m_running.exchange(false)) {
-        if (m_paused.load()) {
-            return true;
-        }
-        set_error("pause_audio_forwarding: not started");
-        return false;
-    }
-
-    // 先停上行保活线程，再关语音转发：反过来会让线程往正在销毁的句柄发数据。
-    stop_uplink_keepalive();
-    if (m_voice_handle >= 0) {
-        NET_DVR_StopVoiceCom(m_voice_handle);
-        m_voice_handle = -1;
-    }
-    m_voice_handle_atomic.store(-1);
-
-    // 按约定：暂停即收尾当前 wav，恢复后需要重新 start_record()。
-    // 此时回调已停止，可以安全 fclose + 改名。
+    // 录制中停止时先收尾文件：此时回调已停止，可安全 fclose + 改名。
+    // 再次 start() 后需要重新 start_record()。
     stop_record();
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         add_forward_seconds_locked();
 
-        // 线路断开时缓冲里可能留着半帧，留着会污染恢复后的第一帧。
+        // 线路断开时缓冲里可能留着半帧，留着会污染下次起流后的第一帧。
         if (!m_encoded_buf.empty()) {
             m_stats.dropped_partial_bytes += m_encoded_buf.size();
             m_encoded_buf.clear();
         }
     }
 
-    m_paused.store(true);
     if (m_config.verbose) {
-        std::cout << "[Audio] audio forwarding paused" << std::endl;
+        std::cout << "[Audio] audio forwarding stopped" << std::endl;
     }
     return true;
 }
 
-// 恢复语音转发：重建解码器 → 重新起流 → 起保活。
-// 设备在 StopVoiceCom 后约 200 ms 内会拒绝重新起流（error 29，
-// NET_DVR_DVROPRATEFAILED），因此这里按 200 ms 间隔重试，最多 5 次。
-bool HkSdkAudioClient::resume_audio_forwarding() {
-    if (m_running.load()) {
-        return true;
-    }
-    if (!m_session_ready.load()) {
-        set_error("resume_audio_forwarding: start() has not succeeded");
-        return false;
+// 结束会话：先 stop()，再恢复设备编码、结算墙钟、登出并释放 SDK 资源。
+// 与析构函数等价、幂等；调用方想「先读统计再释放」时显式调用它。
+void HkSdkAudioClient::deinit() {
+    // 一、还在转发就先停：停保活 → 停流 → 收尾 wav → 结算本段转发时长。
+    stop();
+
+    // 二、结算会话墙钟并清空取流缓冲：此时回调已停，可以安全清空。
+    if (m_session_ready.exchange(false)) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        m_stats.wall_seconds =
+            std::chrono::duration<double>(now - m_start_time).count();
+        m_stream_buf.clear();
     }
 
-    // 暂停期间设备重新开始编码，旧解码器的自适应预测状态可能和码流对不上；
-    // 重建一次成本很低，换来确定性。此刻没有回调（线路已停），可安全释放。
+    // 三、恢复设备编码：本次 init() 主动改过才写回。必须在登出之前，
+    //     恢复请求要用当前登录会话发出。
+    if (m_config.restore_audio_format) {
+        restore_audio_format();
+    } else {
+        m_audio_format_saved = false;
+        m_audio_format_changed = false;
+    }
+
+    // 四、按反序释放句柄：登出 → G722 解码器 → G722 编码器 → NET_DVR_Cleanup。
+    if (m_user_id >= 0) {
+        NET_DVR_Logout(m_user_id);
+        m_user_id = -1;
+    }
     if (m_decoder != nullptr) {
         NET_DVR_ReleaseG722Decoder(m_decoder);
         m_decoder = nullptr;
     }
-    m_decoder = NET_DVR_InitG722Decoder();
-    if (m_decoder == nullptr) {
-        set_error("NET_DVR_InitG722Decoder failed, error=" +
-                  std::to_string(NET_DVR_GetLastError()));
-        return false;
+    // 保活用的 G.722 编码器与解码器一样按实例复用，这里统一释放。
+    if (m_encoder != nullptr) {
+        NET_DVR_ReleaseG722Encoder(m_encoder);
+        m_encoder = nullptr;
     }
-
-    // 起流失败（error 29）的重试在 start_voice_forward() 内部完成，
-    // 这里失败说明 5 次都没成功，last_error 已是最后一次的错误码。
-    if (!start_voice_forward()) {
-        return false;
+    if (m_sdk_initialized) {
+        NET_DVR_Cleanup();
+        m_sdk_initialized = false;
     }
-
-    m_paused.store(false);
-    if (m_config.verbose) {
-        std::cout << "[Audio] audio forwarding resumed" << std::endl;
-    }
-    return true;
 }
 
 // ==================== 上行保活 ====================
@@ -563,7 +529,7 @@ bool HkSdkAudioClient::is_recording() const {
 // 取走自上次调用以来的全部解码样本，语义对齐 Python 版 get_last_audio()：
 // 一次性取空缓冲 → 拼成连续一维 int16 波形 → 清空。没有新数据时返回 false。
 // 放在锁内复制，避免与回调线程追加样本交错；stop() 之后仍可取走残余样本，
-// 只有再次 start() 才会清空缓冲。
+// 只有 deinit() 才会清空缓冲。
 bool HkSdkAudioClient::get_last_audio(std::vector<int16_t>& samples) {
     samples.clear();
 
@@ -599,7 +565,7 @@ std::string HkSdkAudioClient::output_path() const {
     return m_final_path;
 }
 
-// 最近一次错误文本；只有 start() 失败或 set_error() 被调用时才会更新，
+// 最近一次错误文本；只有 init()/start() 失败或 set_error() 被调用时才会更新，
 // 运行中的解码/写文件错误只计数 + 首次打印，不会改这里。
 std::string HkSdkAudioClient::last_error() const {
     return m_last_error;
@@ -618,7 +584,7 @@ int HkSdkAudioClient::sample_rate() const {
 }
 
 // 设备原始采样率（降采样前）。日志与「降采样前后样本数对账」用；
-// 未 start() 时是 pcm_sample_rate 兜底值，不代表真实设备配置。
+// 未 init() 时是 pcm_sample_rate 兜底值，不代表真实设备配置。
 int HkSdkAudioClient::device_sample_rate() const {
     return m_device_sample_rate;
 }
@@ -628,7 +594,7 @@ int HkSdkAudioClient::device_sample_rate() const {
 // SDK 初始化：进程级调用一次，但本类按实例记录标志（见 .h 约束 1）。
 // 连接超时 3 s、重试 1 次：设备在局域网内，超时给太长会让 Ctrl+C 收尾变慢。
 // 这里不调用 NET_DVR_SetReconnect——语音转发异常时 SDK 不会自动重建，
-// 需要上层重新 start()（当前 demo 不实现 watchdog）。
+// 需要上层重新 init()/start()（当前 demo 不实现 watchdog）。
 bool HkSdkAudioClient::init_sdk() {
     if (!NET_DVR_Init()) {
         set_error("NET_DVR_Init failed, error=" +
@@ -642,7 +608,7 @@ bool HkSdkAudioClient::init_sdk() {
 
 // 登录设备（HCNetSDK 私有协议，默认 8000 端口），成功后保存 userId。
 // 字符串字段用 strncpy 且保留 1 字节给 '\0'，配置里的 IP/账号超长会被截断，
-// 不会越界。失败时 m_user_id 保持 -1，下次 start() 会重新尝试登录。
+// 不会越界。失败时 m_user_id 保持 -1，下次 init() 会重新尝试登录。
 bool HkSdkAudioClient::login_device() {
     NET_DVR_USER_LOGIN_INFO login_info{};
     NET_DVR_DEVICEINFO_V40 device_info{};
@@ -670,10 +636,10 @@ bool HkSdkAudioClient::login_device() {
 }
 
 // 读取设备当前音频编码（不写配置，避免像热成像那样留下持久改动）。
-// 关键点：编码类型必须在 start() 阶段确定，因为 wav 头的采样率、以及
+// 关键点：编码类型必须在 init() 阶段确定，因为 wav 头的采样率、以及
 // 「走解码器还是裸 PCM 直写」两条路径都由它决定；中途切换编码会导致 wav
 // 内容与头不一致，所以这里只接受 G.722.1 与 PCM 两种，其余直接拒绝启动。
-// 返回 false 时 m_codec / m_device_sample_rate 保持 start() 里的默认值。
+// 返回 false 时 m_codec / m_device_sample_rate 保持 init() 里的默认值。
 bool HkSdkAudioClient::query_audio_format() {
     NET_DVR_COMPRESSION_AUDIO compress{};
     if (!NET_DVR_GetCurrentAudioCompress(m_user_id, &compress)) {
@@ -802,7 +768,7 @@ bool HkSdkAudioClient::setup_output_resampler() {
 }
 
 // 主动设置语音对讲编码：先快照设备原配置，再写目标值并读回复核。
-// 仅在 start() 登录后、StartVoiceCom 前调用；以下情况返回 false 并写 last_error：
+// 仅在 init() 登录后、StartVoiceCom 前调用；以下情况返回 false 并写 last_error：
 // 原配置读不到、SetDVRConfig 失败、或读回值与请求不一致（设备可能拒绝某组合，
 // 例如实测 PCM 16 kHz 被钉在 32 kHz）。失败时尽量写回快照，避免设备停在半改状态。
 bool HkSdkAudioClient::apply_audio_format() {
@@ -1147,7 +1113,7 @@ void HkSdkAudioClient::append_stream_locked(const unsigned char* data, size_t by
 // ==================== wav 写入 ====================
 
 // 打开输出文件并先写 44 字节占位头；返回 false 时调用方不应置位录制标志。
-// 前置条件：start() 已确定 m_output_sample_rate；wav_path 非空（start_record 校验）。
+// 前置条件：init() 已确定 m_output_sample_rate；wav_path 非空（start_record 校验）。
 // 采用「先写 .part、收尾再改名」的策略：录制中途崩溃/强杀不会留下一个
 // 长度字段错误但看起来合法的 wav。
 bool HkSdkAudioClient::open_wav(const std::string& wav_path) {
@@ -1280,7 +1246,7 @@ void HkSdkAudioClient::write_u32(FILE* f, uint32_t value) {
 
 // 记录并打印错误：写 m_last_error（供 last_error() 查询）同时输出到 stderr。
 // 不走 m_config.verbose 开关——错误信息始终要可见，verbose 只控制正常的
-// 登录/编码格式等过程日志（见 start()/login_device()/query_audio_format()）。
+// 登录/编码格式等过程日志（见 init()/login_device()/query_audio_format()）。
 void HkSdkAudioClient::set_error(const std::string& message) {
     m_last_error = message;
     std::cerr << "[Audio] " << message << std::endl;

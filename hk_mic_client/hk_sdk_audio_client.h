@@ -28,7 +28,10 @@
  *   - 其他编码（G.711/AAC/MP2L2 等）会明确报错并拒绝录制，避免写出采样率错误的 wav。
  *
  * 数据流：
- *   start()：登录 → 查编码 → NET_DVR_StartVoiceCom_MR_V30   （只拉流，不写文件）
+ *   init()：SDK 初始化 → 登录 → 查编码（只确认设备可用，不拉流）
+ *   start()：NET_DVR_StartVoiceCom_MR_V30（只拉流，不写文件）
+ *   stop()：停保活 → StopVoiceCom（拆线路，会话保留，可再次 start()）
+ *   deinit()：恢复编码 → 登出 → 释放句柄 → NET_DVR_Cleanup
  *     → voice_callback(byAudioFlag == 1)
  *     ├─ 未录制：G.722.1 仍继续解码（保持解码器状态连续），结果直接丢弃
  *     ├─ G.722.1：编码字节缓冲（按 80 字节切帧）
@@ -47,8 +50,9 @@
  *   2. 设备静音时可能不下发音频包，因此 wav 的音频时长可能小于墙钟时长；
  *      本类不补静音，只统计两者，便于调用方判断。
  *   3. 回调线程里直接解码并写文件，写文件失败只计数，不中断取流。
- *   4. start() 只建立语音转发，不产生文件；真正写盘由 start_record(path) 开启、
- *      stop_record() 结束。两段录制之间（或从未录制时）不落任何文件。
+ *   4. init() 只登录并确认编码，start() 只建立语音转发，两者都不产生文件；
+ *      真正写盘由 start_record(path) 开启、stop_record() 结束。两段录制之间
+ *      （或从未录制时）不落任何文件。
  *   5. 取流缓冲独立于录制：只要语音转发在运行就一直累积（受 max_stream_samples
  *      上限约束），get_last_audio() 取走后清空；录制开关不影响取流内容。
  */
@@ -107,10 +111,10 @@ struct AudioCaptureConfig {
     // 走 NET_DVR_SetDVRConfig(NET_DVR_SET_COMPRESSCFG_AUD, 1059) + NET_DVR_COMPRESSION_AUDIO。
     // 注意：该接口写的是**设备持久配置**，会影响该设备上所有对讲客户端；
     // 默认关闭，保持「只查询、不修改设备」的原有行为。
-    bool set_audio_format = false;        ///< 是否在 start() 登录后主动设置编码
+    bool set_audio_format = false;        ///< 是否在 init() 登录后主动设置编码
     int audio_enc_type = 0;               ///< 目标编码：0=G.722.1（自动 16k），8=PCM（自动 32k）；
                                           ///< 采样率不单独配置，跟随编码取固定值
-    bool restore_audio_format = true;     ///< stop() 时是否写回设置前的设备配置
+    bool restore_audio_format = true;     ///< deinit() 时是否写回设置前的设备配置
 
     int max_stream_samples = 40960;       ///< 取流缓冲上限（样本数）：40960 ≈ 2.56 s @16 kHz，
                                           ///< 与 Python mic 的 256×160 块对齐；满了丢最旧样本；
@@ -138,9 +142,9 @@ struct AudioCaptureStats {
     uint64_t write_errors = 0;        ///< fwrite 失败次数
     uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（固定 80 B G.722/帧）
     uint64_t uplink_send_errors = 0;  ///< 上行保活发送失败次数；持续增长说明会话已失效
-    uint64_t dropped_partial_bytes = 0; ///< stop()/pause 时不足一帧而丢弃的字节数
-    double wall_seconds = 0.0;        ///< 从 start() 到 stop() 的墙钟时长（含暂停时间）
-    double forward_seconds = 0.0;     ///< 累计实际转发时长：暂停/停止时累加，不含暂停时间
+    uint64_t dropped_partial_bytes = 0; ///< stop() 时不足一帧而丢弃的字节数
+    double wall_seconds = 0.0;        ///< 从 init() 到 deinit() 的墙钟时长（含未转发时间）
+    double forward_seconds = 0.0;     ///< 累计实际转发时长：每次 stop() 累加，不含停止时间
 };
 
 /**
@@ -150,11 +154,14 @@ struct AudioCaptureStats {
  *   AudioCaptureConfig cfg;
  *   cfg.ip = "10.168.2.65";
  *   HkSdkAudioClient client(cfg);
- *   client.start();                              // 建立语音转发，不写文件
+ *   client.init();                                 // 登录并确认编码，不拉流
+ *   ...                                            // 可以在这段时间加载模型/初始化上层
+ *   client.start();                                // 建立语音转发，不写文件
  *   client.start_record("/path/to/hk_audio.wav");  // 开始写盘
- *   ...                                          // 录制任意时长
- *   client.stop_record();                        // 收尾写 wav 头并改名
- *   client.stop();                               // 断开语音转发
+ *   ...                                            // 录制任意时长
+ *   client.stop_record();                          // 收尾写 wav 头并改名
+ *   client.stop();                                 // 断开语音转发，保留会话
+ *   client.deinit();                               // 登出并释放 SDK 资源
  */
 class HkSdkAudioClient {
 public:
@@ -166,43 +173,49 @@ public:
     HkSdkAudioClient& operator=(const HkSdkAudioClient&) = delete;
 
     /**
-     * @brief 登录设备、检查编码格式、启动语音转发。
+     * @brief 初始化会话：SDK 初始化、登录设备、确认编码、建降采样器与解码器。
      *
-     * 只建立取流通道，不打开 wav、不写盘；录音由 start_record() 单独开启。
+     * 只确认设备可用，不调用 StartVoiceCom、不产生音频、不打开 wav。
+     * 典型用法是把它放在耗时的上层初始化（例如加载 ASR 模型）之前，
+     * 设备不可用时能尽早报错；等上层就绪后再 start() 拉流，避免设备
+     * 在没人消费的时候一直推流把取流缓冲塞满。
      * @return 成功返回 true；失败时 last_error() 给出原因。
-     * @note 可重复调用；stop() 后可再次 start()。
+     * @note 可重复调用；成功后重复调用直接返回 true。
+     */
+    bool init();
+
+    /**
+     * @brief 启动语音转发：StartVoiceCom + 上行保活。
+     *
+     * 不重新登录、不重查编码；为保证与设备当前编码流匹配，每次都会重建
+     * G.722 解码器。设备在 StopVoiceCom 后约 200 ms 才允许重新起流，
+     * 因此 StartVoiceCom 失败时按 200 ms 间隔重试，最多 5 次。
+     * @return 起流成功或本来就在转发返回 true；未 init() 或重试全部失败返回 false。
+     * @note 调用会同步阻塞约 1.2 秒（StartVoiceCom 本身的开销），之后首个
+     *       音频回调约 1.2 秒后到达，不是丢数据。
      */
     bool start();
 
     /**
-     * @brief 停止语音转发；若正在录制会先自动收尾 wav。
-     * @note 可重复调用；未 start() 时为空操作。
+     * @brief 停止语音转发：只关闭对讲线路，保留 SDK、登录会话与解流缓冲。
+     *
+     * 停保活线程 → StopVoiceCom → 自动 stop_record()（录制中时）→
+     * 残包计数 → 累加实际转发时长。与 deinit() 的区别是「之后还能 start()」。
+     * 取流缓冲里已缓存的样本保留，调用方仍可用 get_last_audio() 取完。
+     * @return 停止成功或本来就没在转发返回 true；写错误原因见 last_error()。
+     * @note stop() 后 is_running() 返回 false；设备编码配置此时不恢复，
+     *       要等 deinit() 才写回原值。
      */
-    void stop();
+    bool stop();
 
     /**
-     * @brief 暂停语音转发：只关闭对讲线路，保留 SDK、登录会话与解码器。
+     * @brief 结束会话：停在转发 → 恢复设备编码 → 释放解码器 → 登出 → 清理 SDK。
      *
-     * 等价于只调用 NET_DVR_StopVoiceCom，不重跑 start() 的初始化。
-     * 若正在录制，会先自动 stop_record() 收尾当前 wav；取流缓冲里已经
-     * 缓存的样本保留，调用方仍可用 get_last_audio() 取完。
-     * @return 暂停成功或本来就处于暂停返回 true；从未 start() 返回 false。
-     * @note 设备侧约 200 ms 内不接受重新起流，恢复由 resume_audio_forwarding()
-     *       内部重试处理；暂停期间 is_running() 返回 false。
+     * 与析构函数做的事相同，显式调用可以把「释放资源」和「打印统计」的
+     * 时机分开：先 stop() 取完残余、读 get_stats()，再 deinit()。
+     * @note 可重复调用；未 init() 时为空操作。析构函数会兜底再调一次。
      */
-    bool pause_audio_forwarding();
-
-    /**
-     * @brief 恢复语音转发：重新调用 StartVoiceCom，起保活线程。
-     *
-     * 不重新登录、不重建编码器；为提高与暂停前编码流的匹配度，会重建
-     * G.722 解码器。设备在 StopVoiceCom 后约 200 ms 才允许重新起流，
-     * 因此 StartVoiceCom 失败时按 200 ms 间隔重试，最多 5 次。
-     * @return 起流成功或本来就在转发返回 true；未 start() 或重试全部失败返回 false。
-     * @note 返回 true 只代表设备接受了起流请求，首个音频回调约 1.2 秒后到达
-     *       （与冷启动 start() 的延迟一致），不是丢数据。
-     */
-    bool resume_audio_forwarding();
+    void deinit();
 
     /**
      * @brief 开启录制：打开 wav 文件并开始追加 PCM 数据。
@@ -222,7 +235,7 @@ public:
      */
     void stop_record();
 
-    /// 当前是否正在转发（暂停后返回 false；不代表一定有音频，设备静音时也可能没数据）
+    /// 当前是否正在转发（stop() 后返回 false；不代表一定有音频，设备静音时也可能没数据）
     bool is_running() const;
 
     /// 当前是否正在写 wav
@@ -263,7 +276,7 @@ public:
      */
     int sample_rate() const;
 
-    /// 设备实际采样率（降采样前的原始率），用于日志与统计；未 start() 时为兜底值
+    /// 设备实际采样率（降采样前的原始率），用于日志与统计；未 init() 时为兜底值
     int device_sample_rate() const;
 
 private:
@@ -283,7 +296,7 @@ private:
     void deliver_pcm_locked(const unsigned char* data, size_t bytes);
     void append_stream_locked(const unsigned char* data, size_t bytes);
 
-    // —— 语音转发起停（start / pause / resume 复用）——
+    // —— 语音转发起停（init 建会话，start / stop 反复开关对讲线路）——
     bool start_voice_forward();
     void add_forward_seconds_locked();
 
@@ -314,9 +327,8 @@ private:
     bool m_sdk_initialized = false;
 
     // 采集状态
-    std::atomic<bool> m_session_ready{false}; ///< SDK/登录/编码/解码器已就绪（start 成功后置位）
-    std::atomic<bool> m_paused{false};        ///< 是否处于「暂停」而非「停止」：start() 据此选择恢复
-    std::atomic<bool> m_running{false};       ///< 是否正在转发（start/resume 置 true，pause/stop 置 false）
+    std::atomic<bool> m_session_ready{false}; ///< SDK/登录/编码/解码器已就绪（init 成功后置位）
+    std::atomic<bool> m_running{false};       ///< 是否正在转发（start 置 true，stop 置 false）
     std::atomic<bool> m_recording{false};   ///< 是否正在写 wav（start_record/stop_record 控制）
     mutable std::mutex m_mutex;
     std::vector<unsigned char> m_encoded_buf;   ///< 编码字节缓冲，按 80 字节切帧
@@ -331,14 +343,14 @@ private:
     // 为空表示直通（G.722.1 路径与未配置降采样的 PCM 路径都走这里）。
     std::unique_ptr<AudioResampler> m_resampler;
 
-    // 主动设置编码时的原值快照：apply 前保存，stop()/启动失败时写回，
+    // 主动设置编码时的原值快照：apply 前保存，deinit()/init 失败时写回，
     // 避免把设备留在「被本进程改过」的持久状态。
     bool m_audio_format_saved = false;          ///< 是否已成功读到原配置
     bool m_audio_format_changed = false;        ///< 是否已成功写入目标配置
     NET_DVR_COMPRESSION_AUDIO m_saved_audio_format{}; ///< apply 前的配置快照
 
     // 上行保活：句柄用原子量给保活线程读；stop() 先停线程再关语音转发
-    void* m_encoder = nullptr;                   ///< G.722 编码器（只在 init 时用）
+    void* m_encoder = nullptr;                   ///< G.722 编码器（start 里建静音帧用）
     std::vector<unsigned char> m_silence_frame;  ///< 80 B G.722 静音帧，线程只读
     std::atomic<LONG> m_voice_handle_atomic{-1}; ///< 保活线程看到的语音转发句柄
     std::atomic<bool> m_keepalive_running{false};
@@ -351,8 +363,8 @@ private:
     uint64_t m_data_bytes = 0;    ///< 已写入的 PCM 字节数
 
     // 计时
-    std::chrono::steady_clock::time_point m_start_time;   ///< 本次 start() 的墙钟起点
-    std::chrono::steady_clock::time_point m_forward_start; ///< 本段转发的起点，pause/stop 时结算
+    std::chrono::steady_clock::time_point m_start_time;   ///< 本次 init() 的墙钟起点
+    std::chrono::steady_clock::time_point m_forward_start; ///< 本段转发的起点，stop() 时结算
 
     std::string m_last_error;
 };

@@ -78,10 +78,18 @@ int main(int argc, char** argv) {
     capture_config.voice_channel = kVoiceChannel;
     capture_config.verbose = true;
 
+    // init() 只登录 + 查询编码；start() 才开流。本入口没有模型加载，
+    // 两段紧挨着调用，但生命周期与实时 ASR 入口保持一致（exit 走 deinit）。
     HkSdkAudioClient client(capture_config);
+    if (!client.init()) {
+        std::cerr << "[Spectrogram] init failed: " << client.last_error()
+                  << std::endl;
+        return -1;
+    }
     if (!client.start()) {
         std::cerr << "[Spectrogram] start failed: " << client.last_error()
                   << std::endl;
+        client.deinit();
         return -1;
     }
 
@@ -186,7 +194,7 @@ int main(int argc, char** argv) {
         quit = !handle_key(cv::waitKey(1) & 0xFF);
     }
 
-    // —— 六、收尾：停流 → 取残余样本 → 补尾帧 → 停住最后一屏 ——
+    // —— 六、收尾：停流 → 取残余样本 → 释放会话 → 补尾帧 → 停住最后一屏 ——
     client.stop();
 
     // stop() 之后缓冲区里可能还有没被取走的样本，先取完再收尾。
@@ -197,6 +205,9 @@ int main(int argc, char** argv) {
         }
         canvas = view.accept_features(front.accept_waveform(chunk));
     }
+
+    // 残余样本取完后释放设备会话；deinit() 会清空取流缓冲，所以顺序不能反。
+    client.deinit();
 
     // tail_pad_frames=0，这里只补最后不足一帧的样本，不会多出假数据。
     canvas = view.accept_features(front.input_finished());
