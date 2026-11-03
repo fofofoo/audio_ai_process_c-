@@ -71,6 +71,22 @@ public:
     void draw(cv::Mat& canvas, const std::string& text, const cv::Point& org,
               int pixel_height) const;
 
+    /**
+     * @brief 从尾部按像素宽度截断后绘制（用于累积文本的滑动显示）。
+     *
+     * 从 text 末尾往前累加字形的 advance，超过 max_width 就停，只画能放下
+     * 的那段尾巴。按字形推进宽度而不是码点数计算，中英混排同样准确；
+     * 截断点落在码点边界上，不会切碎中文。
+     *
+     * @param max_width 可用像素宽度（应为画布宽减去左右边距）
+     *
+     * 字体不可用、text 为空或 max_width <= 0 时不做任何事；
+     * 末尾单个字形比 max_width 还宽时同样不画，避免画出界。
+     */
+    void draw_tail(cv::Mat& canvas, const std::string& text,
+                   const cv::Point& org, int pixel_height,
+                   int max_width) const;
+
 private:
     struct Impl;  // 定义在 .cpp，FreeType 类型不进入头文件
     Impl* impl_ = nullptr;

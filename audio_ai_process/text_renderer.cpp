@@ -132,6 +132,25 @@ void blit_gray(cv::Mat& canvas, const FT_Bitmap& bitmap, int x0, int y0) {
     }
 }
 
+// 逐码点渲染到画布：调用方已设置字号。
+// 参数：face 已加载的字面；canvas BGR 画布；cps 码点序列；org 基线左端点。
+// 前置条件：face 非空、字号已用 FT_Set_Pixel_Sizes 设好。
+// 返回值：无。越界部分由 blit_gray 裁掉，pen_x 按 advance（26.6 定点）前进。
+void render_codepoints(FT_Face face, cv::Mat& canvas,
+                       const std::vector<uint32_t>& cps,
+                       const cv::Point& org) {
+    int pen_x = org.x;
+    for (uint32_t cp : cps) {
+        if (FT_Load_Char(face, cp, FT_LOAD_RENDER) != 0) {
+            continue;
+        }
+        const FT_GlyphSlot slot = face->glyph;
+        blit_gray(canvas, slot->bitmap, pen_x + slot->bitmap_left,
+                  org.y - slot->bitmap_top);
+        pen_x += static_cast<int>(slot->advance.x >> 6);
+    }
+}
+
 }  // namespace
 #endif
 
@@ -148,22 +167,60 @@ void Utf8TextRenderer::draw(cv::Mat& canvas, const std::string& text,
         return;
     }
 
-    int pen_x = org.x;
-    for (uint32_t cp : utf8_decode(text)) {
-        if (FT_Load_Char(impl_->face, cp, FT_LOAD_RENDER) != 0) {
-            continue;
-        }
-        const FT_GlyphSlot slot = impl_->face->glyph;
-        blit_gray(canvas, slot->bitmap, pen_x + slot->bitmap_left,
-                  org.y - slot->bitmap_top);
-        // advance 是 26.6 定点数，右移 6 位得到像素。
-        pen_x += static_cast<int>(slot->advance.x >> 6);
-    }
+    render_codepoints(impl_->face, canvas, utf8_decode(text), org);
 #else
     (void)canvas;
     (void)text;
     (void)org;
     (void)pixel_height;
+#endif
+}
+
+// 按像素宽度从尾部截断后绘制：从最后一个码点往前累加 advance，
+// 直到再加一个就超过 max_width；截断点天然落在码点边界上。
+// 这样累积的识别文本始终显示最新的一段，且不会被画布右边缘裁掉。
+void Utf8TextRenderer::draw_tail(cv::Mat& canvas, const std::string& text,
+                                 const cv::Point& org, int pixel_height,
+                                 int max_width) const {
+#ifdef HK_HAVE_FREETYPE
+    if (impl_->face == nullptr || text.empty() || max_width <= 0) {
+        return;
+    }
+    if (FT_Set_Pixel_Sizes(impl_->face, 0,
+                           static_cast<FT_UInt>(pixel_height)) != 0) {
+        return;
+    }
+
+    const std::vector<uint32_t> cps = utf8_decode(text);
+    size_t begin = cps.size();
+    int width = 0;
+    while (begin > 0) {
+        // FT_LOAD_DEFAULT 只取 advance，不生成位图，比 FT_LOAD_RENDER 便宜。
+        if (FT_Load_Char(impl_->face, cps[begin - 1], FT_LOAD_DEFAULT) != 0) {
+            --begin;
+            continue;
+        }
+        const int advance =
+            static_cast<int>(impl_->face->glyph->advance.x >> 6);
+        if (width + advance > max_width) {
+            break;
+        }
+        width += advance;
+        --begin;
+    }
+    // begin == cps.size() 表示一个字都放不下（窗口过窄），整段不画。
+    if (begin >= cps.size()) {
+        return;
+    }
+    render_codepoints(impl_->face, canvas,
+                      std::vector<uint32_t>(cps.begin() + begin, cps.end()),
+                      org);
+#else
+    (void)canvas;
+    (void)text;
+    (void)org;
+    (void)pixel_height;
+    (void)max_width;
 #endif
 }
 

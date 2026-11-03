@@ -167,6 +167,7 @@ wav 文件 --tools/wav_reader.h（RIFF 解析）------------------+             
 | | `text()` / `token_ids()` | 当前文本 / 已确认 token（供对拍） |
 | | `reset()` / `info()` | 清空全部跨块状态 / 模型契约与计数 |
 | `audio_ai::Utf8TextRenderer` | `init(path, face_index)` / `draw(...)` | 加载字体 / 把 UTF-8 文本画到 BGR 画布；不可用时回退 `cv::putText` |
+| | `draw_tail(..., max_width)` | 从尾部按像素宽度截断后绘制（累积文本滑动显示，中英混排同样准确） |
 
 ### 模型契约
 

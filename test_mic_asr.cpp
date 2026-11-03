@@ -154,9 +154,12 @@ int main(int argc, char** argv) {
         {"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0},
     };
     const int kCjkFontHeight = 24;  // 像素字高；底部白条高 56 px
-    const size_t kMaxStatusChars = 50;  // 底部只显示最近 50 个字：
-                                        // 50 个汉字 ≈ 50 × 24 = 1200 px，
-                                        // 正好占满画布宽度，再多会画出界
+    // 底部文字的左右边距（px）：可用宽度 = 画布宽 − 2 × 边距。
+    // FreeType 路径按这个像素宽度从尾部截断，不再按字数估算。
+    const int kStatusMargin = 8;
+    // ASCII 回退路径的上限：cv::putText 只支持 ASCII，字宽约 12 px，
+    // 50 个字符 ≈ 600 px 远小于画布宽度；FreeType 不可用时用它兜底。
+    const size_t kMaxStatusChars = 50;
 
     // 1.5 数据与节奏常量。
     //     int16 → float 的归一化系数。直接拿 int16 当浮点喂前端会让 log
@@ -335,15 +338,18 @@ int main(int argc, char** argv) {
     // 底部白条文字：优先 FreeType 渲染 UTF-8 中文，失败回退 ASCII putText。
     // Python 版这里用 cv2.putText（只支持 ASCII），C++ 补上中文渲染，
     // 位置与字号保持 (8, rows - 20) / 24 px 的观感。
-    // 识别结果是累积假设，会越积越长；这里只取最近 kMaxStatusChars 个字
-    // 当滑动窗口（按码点截断，不会切碎中文），完整文本仍写在 stdout。
+    // 识别结果是累积假设，会越积越长；FreeType 路径按 frame.cols 算出的
+    // 可用像素宽度从尾部截断（中英混排也准确），完整文本仍写在 stdout。
     auto draw_status_text = [&](cv::Mat& frame, const std::string& text) {
-        const std::string shown = utf8_tail(text, kMaxStatusChars);
-        const cv::Point org(8, frame.rows - 20);
+        const cv::Point org(kStatusMargin, frame.rows - 20);
         if (text_renderer.ready()) {
-            text_renderer.draw(frame, shown, org, kCjkFontHeight);
+            // 画布宽度可能随窗口缩放变化，每帧按实际列数现算可用宽度。
+            text_renderer.draw_tail(frame, text, org, kCjkFontHeight,
+                                    frame.cols - 2 * kStatusMargin);
             return;
         }
+        // 没有 FreeType 时只能回退 putText（中文变 '?'），按字数上限截。
+        const std::string shown = utf8_tail(text, kMaxStatusChars);
         cv::putText(frame, shown, org, cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     };
