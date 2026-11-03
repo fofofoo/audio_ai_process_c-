@@ -126,6 +126,7 @@ message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 add_executable(save_audio_wav.out
     save_audio_wav.cpp
     ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
+    ${HK_MIC_DIR}/audio_resampler.cpp
 )
 
 # 注入工程根目录：main 用它把 wav 默认写到 <工程根>/results/
@@ -158,6 +159,7 @@ add_executable(test_spectrogram_cv_mic.out
     audio_ai_process/audio_preprocess.cpp
     audio_ai_process/spectrogram_image.cpp
     ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
+    ${HK_MIC_DIR}/audio_resampler.cpp
 )
 
 target_include_directories(test_spectrogram_cv_mic.out PRIVATE
@@ -276,6 +278,7 @@ add_executable(test_mic_asr.out
     audio_ai_process/text_renderer.cpp
     audio_ai_process/spectrogram_image.cpp
     ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
+    ${HK_MIC_DIR}/audio_resampler.cpp
 )
 
 target_compile_definitions(test_mic_asr.out PRIVATE

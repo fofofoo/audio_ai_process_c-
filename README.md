@@ -15,6 +15,9 @@
    暂停会自动收尾当前 wav，恢复时按 200 ms 间隔重试以避开设备侧的操作节流。
    可选 `set_audio_format` 在启动前主动设置对讲编码（G.722.1 自动 16 kHz / PCM 自动 32 kHz），
    写前快照、写后读回复核，不一致拒绝启动，`stop()` 默认写回原配置。
+   可选 `output_sample_rate=16000` 把输出钉在 16 kHz：PCM 32 kHz 下走整数倍抗混叠
+   降采样（Kaiser 窗 FIR，7.2 kHz 截止、8 kHz 以上 ≥60 dB），wav、取流缓冲、
+   统计三处一致；两个开关独立，默认都关闭。
 2. **实时取流接口**：`get_last_audio()` 一次取走自上次调用以来的全部 PCM16 样本，
    与是否正在录制无关；接口线程安全，可直接供前端、可视化与 ASR 消费。
 3. **流式 LogFBank 前端**：按 kaldi `snip_edges=False` 口径实现分帧、povey 窗、
@@ -36,7 +39,8 @@
    边说话边出字；窗口同时滚动显示语谱图与中文识别结果（底部只显示最近 50 个字），
    `--no-window` 只打印文本。
    无新数据时 10 ms 让出 CPU，Ctrl+C / `q` / `Esc` 退出都会补完尾帧再打印统计；
-   `--seconds N` 可限时自检。设备采样率不是 16 kHz 时直接报错退出，不静默重采样。
+   `--seconds N` 可限时自检。入口把 `output_sample_rate` 钉在 16 kHz：G.722.1 直通，
+   PCM 32 kHz 由采集库降采样，预处理模块始终只看到 16 kHz。
 
 **一句话亮点：从设备取流、流式前端到中文 ASR 与实时可视化全链路 C++，且与 Python 参考实现逐位、逐 token 对齐。**
 
@@ -45,6 +49,7 @@
 | 路径 | 一句话职责 |
 | --- | --- |
 | `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 海康设备音频采集库：登录、语音转发、G.722.1 解码、可选 wav 录制、取流缓冲与统计 |
+| `hk_mic_client/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），用于 PCM 32 kHz → 16 kHz；零外部依赖 |
 | `hk_mic_client/hk_sdk/` | 厂商提供的 HCNetSDK 头文件与预编译库（按平台分目录） |
 | `audio_ai_process/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
 | `audio_ai_process/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
@@ -89,8 +94,12 @@ wav 文件 --tools/wav_reader.h（RIFF 解析）-------------------+            
 
 - **设备链路**：G.722.1，16 kHz、单声道、PCM16；设备地址、端口、账号、语音通道
   写在各入口 `main` 顶部，默认 `10.168.2.65:8000`、`channel=1`。
-- **PCM 链路**：本机实测只能 32 kHz（请求 16 kHz 不生效），
-  实际采样率以 `sample_rate()` 为准。
+- **PCM 链路**：本机实测只能 32 kHz（请求 16 kHz 不生效）。`output_sample_rate`
+  为 `0` 时按设备原始率输出（`device_sample_rate()`）；设为 `16000` 时降采样后
+  输出，`sample_rate()` 恒为 16000。只支持整数倍降采样，44.1k 等比例拒绝启动。
+- **推荐格式**：实时 ASR 默认用 **G.722.1**（16 kbps、样本连续、无需降采样）。
+  PCM 在运行期切换、未重启设备的实测中，下行约 21.5 秒后停止交付；PCM 只建议用于
+  短会话或无损采集调试，详见 [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) 1.7.2。
 - **wav 文件**：支持 PCM16 与 float32，多声道只取第一声道；不做重采样，
   非 16 kHz 的 wav 可以画图，但喂 ASR 前必须自行重采样。
 
@@ -246,15 +255,17 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | --- | --- | --- |
 | 各入口 `main` | 设备 IP、账号、通道、录制时长写死 | 换设备需改代码重新编译 |
 | `HkSdkAudioClient` | 每个实例都会 `NET_DVR_Init/Cleanup` | 同一进程不要同时创建音频与视频/热成像客户端 |
-| `HkSdkAudioClient` | PCM 路径采样率被设备固定为 32 kHz（本机实测请求 16 kHz 无效） | 喂 16 kHz ASR 前必须重采样 |
+| `HkSdkAudioClient` | PCM 路径采样率被设备固定为 32 kHz（本机实测请求 16 kHz 无效） | 需要 16 kHz 时必须显式设 `output_sample_rate=16000`，由客户端降采样 |
+| `HkSdkAudioClient` | 降采样只支持整数倍（32k/48k→16k） | 44.1k 等非整数比会拒绝启动 |
+| `HkSdkAudioClient` | 运行期切到 PCM（未重启设备）后，下行约 21.5 秒停止交付；45 秒运行也只收到 21.55 秒音频 | PCM 单次实时 ASR 有效音频上限约 21.5 秒；实时场景推荐 G.722.1，详见包 README 1.7.2 |
 | `HkSdkAudioClient` | 主动设置编码写的是设备持久配置，且设备可能「成功但没生效」 | 默认关闭；开启后以读回复核为准，`stop()` 写回原配置 |
-| `HkSdkAudioClient` | 上行保活只在 G.722.1 下启用，PCM 路径未实测 | 设备切到 PCM 后若同样 10 秒断流，需按 PCM 帧长补发 |
+| `HkSdkAudioClient` | PCM 下行时上行仍须回发 G.722 静音（裸 PCM 静音会让设备立即停流） | 若设备重启后上行也变成 PCM，保活需按编码分支调整或关闭 |
 | `HkSdkAudioClient` | 暂停会关闭当前 wav；`StartVoiceCom` 同步调用约阻塞 1.2 秒 | 连续录音不能跨暂停；在 UI 线程调用 start/resume 会卡顿，应放后台 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |
 | `tools/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
-| `test_mic_asr.cpp` | 设备采样率不是 16 kHz（PCM 编码下为 32 kHz）时直接报错退出 | 需把设备音频编码切回 G.722.1 才能识别 |
+| `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
 | `test_wav_asr.cpp` | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + `hyp` + `decoder_out`）必须 `reset()` 才能换音频 | 多文件 / 多路复用时要按流隔离实例或串行调用 |
 | 当前阶段 | wav 与设备实时两条链路都已接入 ASR，但仍在同一进程内直接组合 | 后续拆成「ASR 处理库 + 麦克风采集库」两个零耦合库 |
@@ -265,5 +276,8 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 
 1. **拆成两个库**：ASR 处理库（初始化 / reset / 喂 PCM / 取文本）与麦克风采集库
    （打开设备、按块输出 PCM），两库零耦合。
-2. **PCM 32 kHz 支持**：设备切到 PCM 编码时采样率被钉在 32 kHz，实时入口当前
-   直接报错退出；需要补一条带抗混叠低通的重采样路径后再接 ASR。
+2. **PCM 32 kHz 支持**：已接入采集库输出侧的整数倍抗混叠降采样
+   （`output_sample_rate=16000`），实时入口在 PCM 编码下可直接跑 ASR；
+   后续可补非整数比（44.1k→16k）的多相重采样。
+3. **PCM 长时稳定性**：运行期切换 PCM 后下行约 21.5 秒停止，需重启设备后复测，
+   确认是配置未完全生效还是 SDK / 设备限制，再决定是否需要分段重开语音转发。

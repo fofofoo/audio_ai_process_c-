@@ -217,6 +217,13 @@ int main(int argc, char** argv) {
     capture_config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
     capture_config.restore_audio_format = true; //< stop() 时是否写回设置前的设备配置
 
+    // 2.1.2 输出采样率钉在 16 kHz：预处理模块与模型只认 16 kHz。
+    //       G.722.1 本来就是 16 kHz（直通，无额外开销）；切到 PCM 时设备
+    //       被钉在 32 kHz，客户端内部做 32→16 抗混叠降采样（FIR 低通 +
+    //       2 倍抽取），wav、取流缓冲、统计都按 16 kHz 输出。
+    //       0 = 跟随设备；本入口不用 0，否则 PCM 下会因采样率不符拒绝启动。
+    capture_config.output_sample_rate = 16000;
+
     // 2.2 建立语音转发：只登录 + 开流，不写 wav 文件。
     HkSdkAudioClient client(capture_config);
     if (!client.start()) {
@@ -225,15 +232,17 @@ int main(int argc, char** argv) {
     }
 
     // 2.3 采样率校验：模型按 16 kHz 训练，喂别的采样率不会报错、只会识别出
-    //     乱七八糟的字。这里直接拒绝启动，而不是偷偷重采样 —— 入口没有做
-    //     抗混叠低通，静默喂错数据比明确失败更难排查。
-    //     （设备默认 G.722.1 恒为 16 kHz；切到 PCM 编码时会被钉在 32 kHz。）
-    const int device_sample_rate = client.sample_rate();
-    if (device_sample_rate != 16000) {
-        std::cerr << "[ASR] 设备采样率是 " << device_sample_rate
+    //     乱七八糟的字。2.1.2 已要求把输出钉在 16 kHz：G.722.1 直通，
+    //     PCM 由客户端做抗混叠降采样。这里再校验一次，防止配置被误改；
+    //     不满足说明 output_sample_rate 与设备率无法匹配，直接拒绝启动。
+    const int sample_rate = client.sample_rate();
+    if (sample_rate != 16000) {
+        std::cerr << "[ASR] 输出采样率是 " << sample_rate
                   << " Hz，而模型固定 16 kHz。\n"
-                  << "      本入口不做重采样：请把设备音频编码切回 G.722.1"
-                     "（16 kHz）后重试。\n";
+                  << "      请检查 capture_config.output_sample_rate "
+                     "（应为 16000）；\n"
+                  << "      设备实际采样率 = " << client.device_sample_rate()
+                  << " Hz。\n";
         client.stop();
         return 1;
     }
@@ -324,8 +333,12 @@ int main(int argc, char** argv) {
               << std::string(74, '=') << "\n"
               << "设备  : " << kDeviceIp << ":" << kSdkPort
               << "  channel=" << kVoiceChannel << "\n"
-              << "编码  : " << client.codec_name() << "  " << device_sample_rate
-              << " Hz\n"
+              << "编码  : " << client.codec_name() << "  "
+              << client.device_sample_rate() << " Hz"
+              << (client.device_sample_rate() == sample_rate
+                      ? std::string()
+                      : " -> 降采样 " + std::to_string(sample_rate) + " Hz")
+              << "\n"
               << "权重  : " << asr_dir << "\n"
               << "执行器: " << (use_cuda ? "CUDA -> CPU 回退" : "CPU") << "\n"
               << "模型  : T=" << info.T
@@ -543,7 +556,7 @@ int main(int argc, char** argv) {
                      stats.uplink_sent_frames)
               << " 帧 / 失败 " << static_cast<unsigned long long>(
                      stats.uplink_send_errors)
-              << " 次（G.722.1 下每 40 ms 一帧静音，维持设备持续回调）\n";
+              << " 次（每 40 ms 回发一帧 G.722 静音，PCM 下行同样适用）\n";
 
     // 与 Python 5.4 相同的两条提示：丢块说明主循环跟不上取流速度；
     // 峰值为 0 说明设备根本没采到声音。

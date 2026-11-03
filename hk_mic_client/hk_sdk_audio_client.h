@@ -6,8 +6,11 @@
  *
  * 职责边界：
  *   - 只负责「设备端拾音器 → 编码音频 → PCM → wav」这一条链路：
- *     登录设备、发起语音转发、接收回调、G.722.1 解码、写 wav、统计。
- *   - 不做语音识别、不做重采样、不做静音检测；识别由 Python 侧读取 wav 完成。
+ *     登录设备、发起语音转发、接收回调、G.722.1 解码、可选降采样、写 wav、统计。
+ *   - 不做语音识别、不做升采样/非整数比重采样、不做静音检测；
+ *     识别由上层 ASR 模块完成。
+ *   - 降采样默认关闭（output_sample_rate = 0）：只有调用方明确要求把
+ *     输出钉到 16 kHz 时才启用，避免悄悄改变录音内容。
  *
  * 为什么用 NET_DVR_StartVoiceCom_MR_V30：
  *   - 该接口的回调 byAudioFlag == 1 时给的是**设备编码后的音频**，
@@ -19,19 +22,21 @@
  *   - G.722.1（byAudioEncType == 0）：16 kHz、单声道、80 字节/40 ms，
  *     用 SDK 的 G722 解码器还原成 PCM16。
  *   - PCM（byAudioEncType == 8）：设备直接下发 PCM16 裸数据，按设备实际返回的
- *     采样率写 wav。本机实测切到 PCM 后运行态被固定为 32 kHz（请求 16 kHz
- *     不生效），交给 16 kHz ASR 前需要重采样。
+ *     采样率处理。本机实测切到 PCM 后运行态被固定为 32 kHz（请求 16 kHz
+ *     不生效）；把 output_sample_rate 设为 16000 时，客户端内部用带抗混叠
+ *     低通的 2 倍抽取降到 16 kHz，wav、取流缓冲、统计三者都是降采样后的数据。
  *   - 其他编码（G.711/AAC/MP2L2 等）会明确报错并拒绝录制，避免写出采样率错误的 wav。
  *
  * 数据流：
  *   start()：登录 → 查编码 → NET_DVR_StartVoiceCom_MR_V30   （只拉流，不写文件）
  *     → voice_callback(byAudioFlag == 1)
  *     ├─ 未录制：G.722.1 仍继续解码（保持解码器状态连续），结果直接丢弃
- *     ├─ 录制中 G.722.1：编码字节缓冲（按 80 字节切帧）
+ *     ├─ G.722.1：编码字节缓冲（按 80 字节切帧）
  *     │            → NET_DVR_DecodeG722Frame
  *     │            → PCM16 16 kHz 单声道
- *     └─ 录制中 PCM：PCM16 裸数据直接使用（采样率取设备返回）
- *     → <wav_path>.wav.part 追加写
+ *     └─ PCM：PCM16 裸数据（设备实测 32 kHz）
+ *     → 可选降采样：output_sample_rate 非 0 时降到目标率
+ *     → <wav_path>.wav.part 追加写（录制中）
  *     → 同时追加进取流缓冲（无论是否在录制），供 get_last_audio() 取走
  *   stop_record() 时回填 RIFF/data 长度并改名为 .wav，语音转发继续保持运行
  *
@@ -53,12 +58,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "HCNetSDK.h"
+#include "audio_resampler.h"
 
 namespace hk_isapi {
 
@@ -88,6 +95,14 @@ struct AudioCaptureConfig {
     int pcm_sample_rate = 16000;          ///< rateEnum=0(默认) 时的兜底采样率；G.722.1 固定 16 kHz
     int encoded_frame_bytes = 80;         ///< G.722.1 单帧编码字节数：80 B / 40 ms
 
+    // —— 可选输出采样率（降采样）——
+    // 0 = 跟随设备（默认，行为与旧版完全一致）；16000 = 把输出钉在 16 kHz。
+    // 只在设备率高于目标率且能整除时启用（本机 PCM 32k→16k）；升采样、
+    // 非整数比（如 44.1k→16k）直接拒绝启动，不做近似。
+    // 降采样带 Kaiser 窗低通（7.2 kHz 截止、8 kHz 以上 ≥60 dB），
+    // 避免高频折叠进语音频带；wav 头、取流缓冲、统计都用输出采样率。
+    int output_sample_rate = 0;
+
     // —— 启动前主动设置语音对讲编码（可选）——
     // 走 NET_DVR_SetDVRConfig(NET_DVR_SET_COMPRESSCFG_AUD, 1059) + NET_DVR_COMPRESSION_AUDIO。
     // 注意：该接口写的是**设备持久配置**，会影响该设备上所有对讲客户端；
@@ -100,7 +115,8 @@ struct AudioCaptureConfig {
     int max_stream_samples = 40960;       ///< 取流缓冲上限（样本数）：40960 ≈ 2.56 s @16 kHz，
                                           ///< 与 Python mic 的 256×160 块对齐；满了丢最旧样本；
                                           ///< <=0 表示关闭取流缓存（get_last_audio 恒返回 false）
-    bool uplink_keepalive = true;         ///< G.722.1 下每 40 ms 回发一帧静音。
+    bool uplink_keepalive = true;         ///< 每 40 ms 回发一帧 80 B G.722 静音
+                                          ///< （PCM 下行也用 G.722 上行，见 .cpp 实测说明）。
                                           ///< 手册要求语音转发双向；实测只收不发时设备
                                           ///< 约 10 秒后停掉回调，置 false 会复现该断流
     bool verbose = true;                  ///< 是否打印登录、编码格式、错误信息
@@ -113,13 +129,14 @@ struct AudioCaptureStats {
     uint64_t packets = 0;             ///< 收到的语音回调包数
     uint64_t encoded_bytes = 0;       ///< 收到的编码字节数
     uint64_t decoded_frames = 0;      ///< 成功解码的 80 字节帧数
-    uint64_t pcm_samples = 0;         ///< 解码出的 PCM 采样点数（单声道，未录制时也累计）
+    uint64_t input_samples = 0;       ///< 设备原始采样点数（降采样前；G.722.1 与 pcm_samples 相同）
+    uint64_t pcm_samples = 0;         ///< 输出 PCM 采样点数（降采样后；未录制时也累计）
     uint64_t recorded_bytes = 0;      ///< 最近一次录制实际写入的 PCM 字节数，start_record() 时清零
     uint64_t stream_dropped_samples = 0; ///< 取流缓冲满被淘汰的样本数；持续增长说明取流太慢
     uint64_t stream_samples_taken = 0;   ///< 已被 get_last_audio() 取走的累计样本数
     uint64_t decode_errors = 0;       ///< DecodeG722Frame 失败次数
     uint64_t write_errors = 0;        ///< fwrite 失败次数
-    uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（G.722 80 B/帧）
+    uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（固定 80 B G.722/帧）
     uint64_t uplink_send_errors = 0;  ///< 上行保活发送失败次数；持续增长说明会话已失效
     uint64_t dropped_partial_bytes = 0; ///< stop()/pause 时不足一帧而丢弃的字节数
     double wall_seconds = 0.0;        ///< 从 start() 到 stop() 的墙钟时长（含暂停时间）
@@ -238,14 +255,23 @@ public:
     /// 当前设备编码的可读名称（G.722.1 / PCM）
     std::string codec_name() const;
 
-    /// 实际写入 wav 头的采样率（G.722.1 固定 16000，PCM 取自设备配置）
+    /**
+     * @brief 输出采样率（wav 头、get_last_audio()、统计都按它）。
+     *
+     * output_sample_rate 为 0 时等于设备采样率；配置了降采样时是目标率
+     * （例如设备 32 kHz、配置 16000 → 返回 16000）。
+     */
     int sample_rate() const;
+
+    /// 设备实际采样率（降采样前的原始率），用于日志与统计；未 start() 时为兜底值
+    int device_sample_rate() const;
 
 private:
     // —— SDK 生命周期 ——
     bool init_sdk();
     bool login_device();
     bool query_audio_format();
+    bool setup_output_resampler();
     bool open_wav(const std::string& wav_path);
     void close_wav();
 
@@ -254,6 +280,7 @@ private:
                                         DWORD dwBufSize, BYTE byAudioFlag, void* pUser);
     void on_voice_data(const char* buf, DWORD size, BYTE flag);
     void decode_pending_locked();
+    void deliver_pcm_locked(const unsigned char* data, size_t bytes);
     void append_stream_locked(const unsigned char* data, size_t bytes);
 
     // —— 语音转发起停（start / pause / resume 复用）——
@@ -264,7 +291,7 @@ private:
     bool apply_audio_format();
     void restore_audio_format();
 
-    // —— 上行保活（G.722.1）——
+    // —— 上行保活（两种下行编码都回发 G.722 80 B 静音）——
     bool init_uplink_keepalive();
     void start_uplink_keepalive();
     void stop_uplink_keepalive();
@@ -298,7 +325,11 @@ private:
     AudioCaptureStats m_stats;
 
     AudioCodec m_codec = AudioCodec::kG7221;    ///< 设备当前编码
-    int m_output_sample_rate = 16000;           ///< 实际写进 wav 头的采样率
+    int m_device_sample_rate = 16000;           ///< 设备实际采样率（降采样前）
+    int m_output_sample_rate = 16000;           ///< 输出采样率：wav 头 / 取流 / 统计
+    // 整数倍降采样器：仅当 output_sample_rate 非 0 且低于设备率时创建；
+    // 为空表示直通（G.722.1 路径与未配置降采样的 PCM 路径都走这里）。
+    std::unique_ptr<AudioResampler> m_resampler;
 
     // 主动设置编码时的原值快照：apply 前保存，stop()/启动失败时写回，
     // 避免把设备留在「被本进程改过」的持久状态。

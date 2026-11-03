@@ -118,7 +118,9 @@ bool HkSdkAudioClient::start() {
         m_stream_buf.clear();                              // 清空取流缓冲，避免上一会话的样本混进新流
         m_data_bytes = 0;                                  // 已写入的 PCM 字节数，用于回填 wav 头长度
         m_codec = AudioCodec::kG7221;                      // 设备编码默认值，稍后由设备实际值覆盖
-        m_output_sample_rate = m_config.pcm_sample_rate;   // wav 头采样率，同样以设备实际值为准
+        m_device_sample_rate = m_config.pcm_sample_rate;   // 设备采样率兜底，稍后以设备实际值为准
+        m_output_sample_rate = m_config.pcm_sample_rate;   // 输出采样率，setup_output_resampler 再校正
+        m_resampler.reset();                               // 新会话不继承上一段的重采样历史
         m_recording = false;                               // 新会话从「不录制」开始，需显式 start_record()
     }
 
@@ -142,6 +144,12 @@ bool HkSdkAudioClient::start() {
     if (!query_audio_format()) {
         // 设置过编码但后续不可用（例如设备拒绝、查询失败）：先恢复原配置，
         // 否则下次 start() 会把「已经改过的值」当成原值快照。
+        restore_audio_format();
+        return false;
+    }
+    // 3.5 可选：按配置建立降采样器。必须在解码器/起流之前完成，
+    //     否则首包到达时 wav 头与输出采样率还没确定，会写出错头。
+    if (!setup_output_resampler()) {
         restore_audio_format();
         return false;
     }
@@ -230,14 +238,17 @@ bool HkSdkAudioClient::start_voice_forward() {
     m_forward_start = std::chrono::steady_clock::now();
 
     // 上行保活：手册要求语音转发双向（除了收设备音频，也要用
-    // NET_DVR_VoiceComSendData 发编码数据回去）。实测只收不发时，设备
-    // 在约 10 秒后停止回调，窗口和识别随之冻结；每 40 ms 回发一帧
-    // 80 字节 G.722 静音即可长期维持。PCM 路径未实测，暂不启用。
-    if (m_config.uplink_keepalive && m_codec == AudioCodec::kG7221) {
+    // NET_DVR_VoiceComSendData 发数据回去）。实测只收不发时，设备在约
+    // 10.5 秒后停止回调，窗口和识别随之冻结。两种下行编码都回发
+    // 80 B G.722 静音——PCM 下裸 PCM 静音会让设备直接停流，原因见
+    // init_uplink_keepalive() 的说明。
+    if (m_config.uplink_keepalive) {
         if (init_uplink_keepalive()) {
             start_uplink_keepalive();
             if (m_config.verbose) {
-                std::cout << "[Audio] uplink keepalive: 每 40 ms 回发一帧 G.722 静音"
+                std::cout << "[Audio] uplink keepalive: 每 40 ms 回发一帧 "
+                             "G.722 静音（"
+                          << m_silence_frame.size() << " B，PCM 下行同样适用）"
                           << std::endl;
             }
         } else if (m_config.verbose) {
@@ -245,11 +256,6 @@ bool HkSdkAudioClient::start_voice_forward() {
                          "秒后停止语音转发"
                       << std::endl;
         }
-    } else if (m_config.verbose && m_config.uplink_keepalive &&
-               m_codec == AudioCodec::kPcm) {
-        std::cout << "[Audio] PCM 路径暂未启用上行保活；若音频在约 10 秒后中断，"
-                     "需要按 PCM 帧长补发"
-                  << std::endl;
     }
     return true;
 }
@@ -457,10 +463,20 @@ bool HkSdkAudioClient::resume_audio_forwarding() {
 
 // ==================== 上行保活 ====================
 
-// 建 G.722 编码器并预编码一帧静音。
-// 前置条件：设备编码已确定为 G.722.1，调用时语音转发已启动。
-// 编码器按实例复用（重复 start 不重建）；静音帧只在这里写一次，
-// 保活线程只读，因此两者不需要额外加锁。
+// 准备上行保活帧：用 SDK 的 G.722 编码器把 640 点静音编成 80 B。
+//
+// 为什么 PCM 下行也用 G.722 静音（实测结论，不是想当然）：
+//   - 下行切到 PCM 后，回发裸 PCM 静音（20 ms 1280 B 和 40 ms 2560 B 都试过）
+//     会让设备在收到第一帧后立即停止回调，packets 停在 0~3；
+//   - 同一次会话里改回 G.722 80 B 静音，PCM 下行持续正常（25 秒实测
+//     471 个回调包、约 21.7 秒音频），说明上行对讲编码没有跟着下行切换。
+//   - 手册《NET_DVR_COMPRESSION_AUDIO》明确写「配置后需要重启设备才生效」，
+//     而本客户端是运行期 SetDVRConfig、不重启设备，所以上行仍是 G.722.1。
+//   如果以后设备重启后真把上行也切成 PCM，可关掉 uplink_keepalive 或在此
+//   按 m_codec 分支回发裸 PCM；在此之前固定 G.722 是唯一验证通过的做法。
+//
+// 前置条件：语音转发已启动。编码器按实例复用（重复 start 不重建）；
+// 静音帧只在这里写一次，保活线程只读，因此两者不需要额外加锁。
 bool HkSdkAudioClient::init_uplink_keepalive() {
     if (m_encoder == nullptr) {
         NET_DVR_AUDIOENC_INFO enc_info{};
@@ -507,7 +523,8 @@ void HkSdkAudioClient::stop_uplink_keepalive() {
     m_voice_handle_atomic.store(-1);
 }
 
-// 保活线程主体：每 40 ms 发一帧 G.722 静音（一帧正好 640 点 = 40 ms）。
+// 保活线程主体：每 40 ms 发一帧静音（G.722.1 为 80 B 编码帧，
+// PCM 为 40 ms 裸 PCM；两者时长一致，线程只负责按节奏发送）。
 // 发送失败只计数，不打印、不退出：偶发网络抖动不应该把线程打死，
 // 持续失败可以从 stats.uplink_send_errors 看出来。
 void HkSdkAudioClient::uplink_keepalive_loop() {
@@ -593,10 +610,17 @@ std::string HkSdkAudioClient::codec_name() const {
     return m_codec == AudioCodec::kPcm ? "PCM" : "G.722.1";
 }
 
-// 实际写进 wav 头的采样率：G.722.1 固定 16000；PCM 取设备配置
-// （本机实测恒为 32000），调用方据此决定是否重采样。
+// 输出采样率：wav 头、get_last_audio()、统计统一按它。
+// 未配置降采样时等于设备率（G.722.1 16000 / PCM 本机实测 32000）；
+// 配置 output_sample_rate=16000 后这里返回 16000，调用方无需再判断。
 int HkSdkAudioClient::sample_rate() const {
     return m_output_sample_rate;
+}
+
+// 设备原始采样率（降采样前）。日志与「降采样前后样本数对账」用；
+// 未 start() 时是 pcm_sample_rate 兜底值，不代表真实设备配置。
+int HkSdkAudioClient::device_sample_rate() const {
+    return m_device_sample_rate;
 }
 
 // ==================== SDK 生命周期 ====================
@@ -649,7 +673,7 @@ bool HkSdkAudioClient::login_device() {
 // 关键点：编码类型必须在 start() 阶段确定，因为 wav 头的采样率、以及
 // 「走解码器还是裸 PCM 直写」两条路径都由它决定；中途切换编码会导致 wav
 // 内容与头不一致，所以这里只接受 G.722.1 与 PCM 两种，其余直接拒绝启动。
-// 返回 false 时 m_codec / m_output_sample_rate 保持 start() 里的默认值。
+// 返回 false 时 m_codec / m_device_sample_rate 保持 start() 里的默认值。
 bool HkSdkAudioClient::query_audio_format() {
     NET_DVR_COMPRESSION_AUDIO compress{};
     if (!NET_DVR_GetCurrentAudioCompress(m_user_id, &compress)) {
@@ -685,6 +709,7 @@ bool HkSdkAudioClient::query_audio_format() {
             return false;
         }
         m_codec = AudioCodec::kG7221;
+        m_device_sample_rate = 16000;
         m_output_sample_rate = 16000;
     } else if (type == 8) {
         // PCM 是裸 PCM16，不需要解码；采样率按设备配置写进 wav 头。
@@ -696,6 +721,7 @@ bool HkSdkAudioClient::query_audio_format() {
             return false;
         }
         m_codec = AudioCodec::kPcm;
+        m_device_sample_rate = rate;
         m_output_sample_rate = rate;
     } else {
         set_error("unsupported audio encoding type=" + std::to_string(type) +
@@ -706,9 +732,71 @@ bool HkSdkAudioClient::query_audio_format() {
     if (m_config.verbose) {
         std::cout << "[Audio] codec: " << codec_name()
                   << " (type=" << type << "), sampleRateEnum=" << rate_enum
-                  << " -> " << m_output_sample_rate << " Hz"
+                  << " -> device " << m_device_sample_rate << " Hz"
                   << ", bitRateEnum=" << static_cast<unsigned>(compress.byAudioBitRate)
                   << std::endl;
+    }
+    return true;
+}
+
+// 按配置决定输出采样率，必要时建立降采样器。
+// 前置条件：query_audio_format() 已确定 m_device_sample_rate。
+// 规则：0 → 直通；等于设备率 → 直通；高于设备率或不能整除 → 拒绝启动
+// （只做整数倍降采样，不偷偷近似）。成功后 m_output_sample_rate 是
+// wav 头、取流缓冲、统计统一使用的值。
+bool HkSdkAudioClient::setup_output_resampler() {
+    const int target = m_config.output_sample_rate;
+
+    // 0 = 跟随设备：保持旧行为，G.722.1 输出 16k、PCM 输出设备实际的 32k。
+    if (target <= 0) {
+        m_output_sample_rate = m_device_sample_rate;
+        m_resampler.reset();
+        return true;
+    }
+
+    // 目标与设备一致：不需要滤波，直接直通（仍视作显式配置成功）。
+    if (target == m_device_sample_rate) {
+        m_output_sample_rate = target;
+        m_resampler.reset();
+        return true;
+    }
+
+    // 只做降采样：升采样会让语音变「糊」，且本工程没有对应需求。
+    if (target > m_device_sample_rate) {
+        set_error("output_sample_rate=" + std::to_string(target) +
+                  " is higher than device rate " +
+                  std::to_string(m_device_sample_rate) +
+                  " Hz; upsampling is not supported");
+        return false;
+    }
+
+    // 非整数比（如 44.1k→16k）需要多相/有理重采样，本类不实现；
+    // 直接拒绝比悄悄用一个近似比例更安全。
+    if (m_device_sample_rate % target != 0) {
+        set_error("output_sample_rate=" + std::to_string(target) +
+                  " cannot divide device rate " +
+                  std::to_string(m_device_sample_rate) +
+                  " Hz; only integer-ratio downsampling is supported");
+        return false;
+    }
+
+    m_resampler =
+        std::make_unique<AudioResampler>(m_device_sample_rate, target);
+    if (!m_resampler->valid()) {
+        m_resampler.reset();
+        set_error("create resampler failed: " +
+                  std::to_string(m_device_sample_rate) + " -> " +
+                  std::to_string(target) + " Hz");
+        return false;
+    }
+    m_output_sample_rate = target;
+
+    if (m_config.verbose) {
+        std::cout << "[Audio] resample: " << m_device_sample_rate << " -> "
+                  << m_output_sample_rate << " Hz, ratio="
+                  << m_resampler->ratio()
+                  << " (anti-alias FIR, cutoff="
+                  << m_output_sample_rate * 0.45 << " Hz)" << std::endl;
     }
     return true;
 }
@@ -861,16 +949,13 @@ void HkSdkAudioClient::on_voice_data(const char* buf, DWORD size, BYTE flag) {
     ++m_stats.packets;
     m_stats.encoded_bytes += size;
 
-    // 1.hk设备是pcm编码格式，直接写入音频文件
+    // 1.hk设备是pcm编码格式：原始 PCM16 直接交付（必要时先降采样）
     if (m_codec == AudioCodec::kPcm) {
-        // PCM 已经是目标格式，录制中时回调数据直接追加到 wav；
+        // 设备给的是 PCM16 裸数据；配置了 output_sample_rate 时在这里
+        // 统一降采样，wav / 取流缓冲 / 统计都拿到同一份输出样本。
         // 未录制时 write_pcm_locked 因 m_wav == nullptr 自动变成空操作。
-        // 按 16 bit 单声道记账：size 若不整除 2（异常半样本），
-        // 实际写入字节仍以 size 为准，统计只做向下取整。
-        m_stats.pcm_samples += size / 2;
-        write_pcm_locked(reinterpret_cast<const unsigned char*>(buf), size);
-        // 取流缓冲与录制无关：无论是否在写 wav，都把样本交给 get_last_audio()。
-        append_stream_locked(reinterpret_cast<const unsigned char*>(buf), size);
+        m_stats.input_samples += size / 2;
+        deliver_pcm_locked(reinterpret_cast<const unsigned char*>(buf), size);
         return;
     }
 
@@ -935,19 +1020,67 @@ void HkSdkAudioClient::decode_pending_locked() {
         }
         // 3.2 将解码结果写入输出缓存 m_pcm_buf
         if (param.out_frame_size > 0) {
-            // 解码统计与是否录制无关：未录制时也累计，便于判断链路是否在出音频；
-            // 是否落盘由 write_pcm_locked 依据 m_wav 判断。
+            // 解码统计与是否录制无关：未录制时也累计，便于判断链路是否在出音频。
             // out_frame_size 是字节数，PCM16 单声道下 /2 才是采样点数。
-            m_stats.pcm_samples += param.out_frame_size / 2;
-            write_pcm_locked(m_pcm_buf.data(), param.out_frame_size);
-            // 取流缓冲与是否录制无关，解码出的 PCM 一律进缓冲供上层拉取。
-            append_stream_locked(m_pcm_buf.data(), param.out_frame_size);
+            // 交付统一走 deliver_pcm_locked：G.722.1 输出本来就是 16 kHz，
+            // 没有降采样器时直通，不产生额外拷贝以外的开销。
+            m_stats.input_samples += param.out_frame_size / 2;
+            deliver_pcm_locked(m_pcm_buf.data(), param.out_frame_size);
         }
         ++m_stats.decoded_frames;
 
         // 3.3 从 输入缓存 m_encoded_buf 头部，移除已消费部分；
         m_encoded_buf.erase(m_encoded_buf.begin(), m_encoded_buf.begin() + consumed);
     }
+}
+
+// 把一段 PCM16 字节交付给「wav + 取流缓冲 + 统计」，必要时先降采样。
+// 前置条件：调用方持有 m_mutex。无降采样器时按原始字节直通，不做任何转换，
+// 保持旧路径行为；有降采样器时转 int16 → FIR 抽取 → 再按小端写回字节，
+// 让 wav、get_last_audio() 与统计看到完全相同的输出样本。
+// input_samples 由调用方在进来前累加（设备原始点数），这里只累加输出点数。
+void HkSdkAudioClient::deliver_pcm_locked(const unsigned char* data,
+                                          size_t bytes) {
+    if (data == nullptr || bytes < 2) {
+        return;
+    }
+
+    // 1) 无降采样器：直通。奇数字节按原样写盘，取流侧丢弃尾字节。
+    if (!m_resampler) {
+        m_stats.pcm_samples += bytes / 2;
+        write_pcm_locked(data, bytes);
+        append_stream_locked(data, bytes);
+        return;
+    }
+
+    // 2) 小端字节 → int16 样本（与 append_stream_locked 的解码口径一致）。
+    const size_t count = bytes / 2;
+    std::vector<int16_t> input(count);
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t raw = static_cast<uint16_t>(data[2 * i]) |
+                             (static_cast<uint16_t>(data[2 * i + 1]) << 8);
+        std::memcpy(&input[i], &raw, sizeof(int16_t));
+    }
+
+    // 3) 滤波抽取。历史未填满或不足一个输出周期时返回空，
+    //    此时不写文件、不进缓冲、不计统计，样本留在重采样器内部状态里。
+    const std::vector<int16_t> output =
+        m_resampler->process(input.data(), input.size());
+    if (output.empty()) {
+        return;
+    }
+
+    // 4) 输出样本 → 小端字节，复用同一套写盘/缓冲路径。
+    //    负数转 uint16 是模 2^16 的位模式转换，正好是补码表示。
+    std::vector<unsigned char> out_bytes(output.size() * 2);
+    for (size_t i = 0; i < output.size(); ++i) {
+        const uint16_t raw = static_cast<uint16_t>(output[i]);
+        out_bytes[2 * i] = static_cast<unsigned char>(raw & 0xFF);
+        out_bytes[2 * i + 1] = static_cast<unsigned char>((raw >> 8) & 0xFF);
+    }
+    m_stats.pcm_samples += output.size();
+    write_pcm_locked(out_bytes.data(), out_bytes.size());
+    append_stream_locked(out_bytes.data(), out_bytes.size());
 }
 
 // 4. 回调中最后处理解码完成数据的方法，写入wav文件或丢弃

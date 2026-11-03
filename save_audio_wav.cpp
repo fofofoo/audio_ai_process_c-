@@ -85,6 +85,9 @@ int main() {
     config.set_audio_format = false;
     config.audio_enc_type = 0; // 0=G.722.1(16k)，8=PCM(32k)
     config.restore_audio_format = true;
+    // 输出采样率：0=跟随设备（默认，PCM 下仍是 32 kHz）；16000=降采样到 16 kHz。
+    // 录制 demo 保持设备原始采样率；需要 16 kHz wav 时改成 16000。
+    config.output_sample_rate = 0;
 
     std::cout << "[Record] target: " << output_path.string() << "\n"
               << "[Record] device: " << kDeviceIp << ":" << kSdkPort
