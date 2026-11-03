@@ -83,6 +83,7 @@ C++ 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐�
 | 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
 | 工具 | `tools/compare_fbank.py` | C++ 与 Python 前端逐点比较 |
 | 工具 | `tools/compare_asr.py` | C++ 与 Python ASR 逐 token 比较 |
+| 工具 | `tools/bench_perf.sh` | 性能基准：离线 RTF / 实时处理率与丢块，CPU 与 CUDA 对比 |
 | 资源 | `onnxruntime/` | 项目内托管的 ONNX Runtime；`install/` 不入库，接入方式见 `onnxruntime/README.md` |
 | 资源 | `weight/` | ASR 模型权重与词表（fp32 / int8 两套），本地放置，不入库 |
 | 资源 | `python_ref/` | Python 参考实现（只读基准，不参与 C++ 编译） |
@@ -311,6 +312,67 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 全部一致；出现差异时会指出第几个 token、两侧 id。对拍脚本依赖 numpy，
 `compare_asr.py` 另需带 onnxruntime 的 Python 环境。
 
+性能基准：
+
+```bash
+# 离线：默认权重目录 4 条 wav，只测前端 + 三模型推理的纯吞吐
+./tools/bench_perf.sh
+
+# 离线：CPU 与 CUDA 对比（CUDA 注册失败时脚本会明确提示「实际仍跑 CPU」）
+./tools/bench_perf.sh --cuda --wav weight/<权重包>/test_wavs
+
+# 实时：设备在线，各跑 20 秒无窗识别，看主循环能否跟上 16 kHz 实时流
+./tools/bench_perf.sh --realtime 20
+
+# 实时：加 --window 测渲染开销，加 --cuda 做执行器对比
+./tools/bench_perf.sh --realtime 20 --window
+```
+
+脚本只解析入口自己打印的统计行，不重新计时，口径与入口一致：
+
+- **RTF** = 解码耗时 / 音频时长（离线，< 1 快于实时，越小越好）；
+- **主循环吞吐** = 喂入样本 / 16000 / 墙钟秒数（稳态 ≈ 1，> 1 表示正在消化积压）；
+- **丢块时长** = 取流丢弃样本 / 16000 秒（> 0 说明取流缓冲已溢出）；
+- **启动积压** = 实际转发秒数 − 墙钟秒数。入口先 `start()` 再加载模型，这段
+  时间设备已经在转发、主循环还没开始取；缓冲上限 2.56 s，超出部分会丢，
+  归因丢块时不能直接当成「主循环慢」。
+
+### Jetson 实测结论
+
+环境：Jetson（`nvidia-desktop`），设备 10.168.2.65 / G.722.1 / 16 kHz，
+int8 权重包，2026-11-03 实测。
+
+**离线（4 条 wav，共 28.67 s 音频）**
+
+| 执行器 | 解码耗时 | RTF | 相对实时 |
+| --- | --- | --- | --- |
+| CPU | 7.78 s | 0.2713 | 3.69 倍 |
+| CUDA | 14.75 s | 0.5145 | 1.94 倍 |
+
+CPU 比 CUDA 快 1.90 倍：每块只编码 61 帧、joiner / decoder 逐帧调用、116 个
+状态张量每次进出一遍，kernel launch 与显存搬运的开销盖过了 GPU 收益。
+
+**实时（`--realtime 20`）**
+
+| 运行 | 墙钟 | 转发 | 处理音频 | 吞吐 | 丢块 | 启动积压 |
+| --- | --- | --- | --- | --- | --- | --- |
+| CPU 无窗 | 20.32 s | 27.02 s | 22.60 s | 1.11 | 4.52 s | 6.70 s |
+| CPU 有窗 | 20.29 s | 26.95 s | 22.56 s | 1.11 | 4.96 s | 6.65 s |
+| CUDA 无窗 | 20.50 s | 34.69 s | 20.52 s | 1.00 | 14.24 s | 14.18 s |
+
+结论：
+
+- **Jetson 用默认 CPU，不加 `--cuda`**：离线慢 1.9 倍，实时还会额外持续丢块。
+- **主循环跟得上**：实时吞吐 1.11（正在消化启动积压），离线 RTF 有 3.7 倍余量。
+- **渲染不是瓶颈**：有窗 / 无窗吞吐都是 1.11，丢块差异在噪声范围内。
+- **丢块主要来自启动阶段**：入口先 `start()` 再加载模型，这段时间（CPU ≈ 6.7 s、
+  CUDA ≈ 14.2 s）设备已经在转发，取流缓冲上限 2.56 s，超出的部分直接丢。
+  CPU 的丢块几乎全部落在这里；CUDA 在启动阶段丢 11.62 s 之外，还在主循环期间
+  持续丢了 2.62 s。
+
+判断口径：不要用「喂入 ÷ 实际转发」估主循环速度，它等价于「1 − 丢块比例」；
+看 **吞吐**（喂入 ÷ 墙钟）和 **启动积压**（实际转发 − 墙钟）。
+
 ### 断线与恢复
 
 采集层是回调驱动，当前**不做自动重连**，行为如下：
@@ -370,6 +432,8 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 | `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
 | 两个 ASR 入口 | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + `hyp` + `decoder_out`）必须 `reset()` 才能换音频 | 多文件 / 多路复用时要按流隔离实例或串行调用 |
+| 两个 ASR 入口 | Jetson 实测 CUDA EP 反而更慢：每块只编码 61 帧，joiner/decoder 逐帧调用，116 个状态张量每次进出一遍 | 实时场景默认用 CPU；开 `--cuda` 前先用 `tools/bench_perf.sh --cuda` 实测 |
+| 两个 ASR 入口 | `start()` 早于模型加载，加载期间设备已在转发，音频持续进入取流缓冲，超过 2.56 s 即丢 | 启动阶段会丢一段音频（Jetson CPU ≈ 4.5 s、CUDA ≈ 14 s），计入「取流丢弃」，不代表主循环慢 |
 | 共享库 | 两个库以 SHARED 构建，Linux 下无需导出宏；ORT / OpenCV 不随安装复制 | Windows 构建需补 `__declspec(dllexport)`；部署机需自备 ORT 与 OpenCV 运行库 |
 | `weight/`、`onnxruntime/install/` | 体积大且按模型/平台分发，不入库 | 克隆后需自行放置权重与 ORT 预编译库，否则推理目标无法构建 |
 | `hk_mic_client/hk_sdk/` | 厂商预编译库，体积较大且按平台分目录 | 换平台需确认对应目录与运行期依赖完整 |

@@ -280,7 +280,10 @@ int main(int argc, char** argv) {
     std::printf("============================================================\n");
     std::printf("ORT 版本     : %s\n", Ort::GetVersionString().c_str());
     std::printf("模型目录     : %s\n", model_dir.c_str());
-    std::printf("执行提供者   : %s\n", use_cuda ? "CUDA（失败回退 CPU）" : "CPU");
+    // 这一行在注册之前打印，所以只能写「尝试」；真正的结果看下面
+    // 「CUDA EP 已注册 / 注册失败，回退 CPU」那一行，避免误读成已经回退。
+    std::printf("执行提供者   : %s\n",
+                use_cuda ? "CUDA（尝试注册，失败回退 CPU）" : "CPU");
 
     // 可用 provider 列表反映的是「库编译进来了哪些」，不等于「本次会话真正用上」；
     // CUDA 能否创建还要看 cuDNN 9 是否可加载，所以下面逐模型加载时以异常为准。

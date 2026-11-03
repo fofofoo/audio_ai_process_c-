@@ -213,11 +213,15 @@ int main(int argc, char** argv) {
     // 3.2 可选 CUDA EP：注册失败只打印并回退 CPU，不中断识别。
     //     必须用 AppendExecutionProvider_CUDA；通用 AppendExecutionProvider
     //     只支持 QNN / SNPE / XNNPACK。
+    // cuda_active 记录「真的注册成功」，banner 据此打印实际执行器，
+    // 避免把注册失败后的 CPU 回退误显示成在用 GPU。
+    bool cuda_active = false;
     if (use_cuda) {
         try {
             OrtCUDAProviderOptions cuda_options{};
             cuda_options.device_id = 0;
             session_options.AppendExecutionProvider_CUDA(cuda_options);
+            cuda_active = true;
             std::cout << "CUDA EP 已注册（device_id=0）\n";
         } catch (const std::exception& e) {
             std::cout << "CUDA EP 注册失败，回退 CPU：" << e.what() << "\n";
@@ -230,7 +234,9 @@ int main(int argc, char** argv) {
               << "权重  : " << asr_dir << "\n"
               << "输入  : " << wav_paths.size() << " 个 wav\n"
               << "执行器: "
-              << (use_cuda ? "CUDA -> CPU 回退" : "CPU")
+              << (use_cuda
+                      ? (cuda_active ? "CUDA" : "CPU（CUDA 注册失败，已回退）")
+                      : "CPU")
               << "\n\n";
 
     // 3.3 建三个 session 并装配 AsrDecoder。

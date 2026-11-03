@@ -261,11 +261,15 @@ int main(int argc, char** argv) {
     // 3.2 可选 CUDA EP：注册失败只打印并回退 CPU，不中断识别。
     //     必须用 AppendExecutionProvider_CUDA；通用 AppendExecutionProvider
     //     只支持 QNN / SNPE / XNNPACK。
+    //     cuda_active 记录「真的注册成功」，而不是「用户想要 CUDA」——
+    //     banner 据此按实际状态打印，避免把回退误报成在用 GPU。
+    bool cuda_active = false;
     if (use_cuda) {
         try {
             OrtCUDAProviderOptions cuda_options{};
             cuda_options.device_id = 0;
             session_options.AppendExecutionProvider_CUDA(cuda_options);
+            cuda_active = true;
             std::cout << "CUDA EP 已注册（device_id=0）\n";
         } catch (const std::exception& e) {
             std::cout << "CUDA EP 注册失败，回退 CPU：" << e.what() << "\n";
@@ -340,7 +344,11 @@ int main(int argc, char** argv) {
                       : " -> 降采样 " + std::to_string(sample_rate) + " Hz")
               << "\n"
               << "权重  : " << asr_dir << "\n"
-              << "执行器: " << (use_cuda ? "CUDA -> CPU 回退" : "CPU") << "\n"
+              << "执行器: "
+              << (use_cuda
+                      ? (cuda_active ? "CUDA" : "CPU（CUDA 注册失败，已回退）")
+                      : "CPU")
+              << "\n"
               << "模型  : T=" << info.T
               << "  decode_chunk_len=" << info.decode_chunk_len
               << "  context_size=" << info.context_size
