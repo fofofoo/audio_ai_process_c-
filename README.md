@@ -144,8 +144,9 @@ ASR 相关目标额外依赖 ONNX Runtime，CMake 按架构选择项目内托管
 x86_64 用 `onnxruntime/install/onnxruntime-1.23.2`，aarch64 用
 `onnxruntime/install/onnxruntime-1.18.0`（需在 Jetson 上源码编译）。
 ORT 缺失时只给 WARNING，音频采集 / 语谱图 / fbank 对拍仍可构建，
-依赖推理的 `asr_decode.cpp` 与三个 ASR 入口自动跳过；推理目标通过
-`ort_link_target()` 接入。CUDA EP 的 cuDNN 9 环境配置见 `onnxruntime/README.md`。
+依赖推理的 `asr_decode.cpp` 与三个 ASR 入口自动跳过。两个动态库与各入口都在
+`foreach` 中显式链接 OpenCV / Threads / ORT / HCNetSDK，并分别设置 `BUILD_RPATH`；
+CUDA EP 的 cuDNN 9 环境配置见 `onnxruntime/README.md`。
 
 ```bash
 cmake -S . -B build
