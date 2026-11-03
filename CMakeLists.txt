@@ -122,19 +122,58 @@ else()
 endif()
 
 # =====================================================================
-#  一、动态库
+#  一、麦克风采集库（不依赖 OpenCV / ORT）
 #
-#  两个库零耦合：采集库不依赖 OpenCV / ORT，处理库不依赖 HCNetSDK。
-#  ORT 缺失时 asr_decode.cpp 与三个推理入口一起跳过，
-#  音频采集、语谱图与 fbank 对拍仍可构建。
+#  登录、语音转发、G.722.1 解码、可选降采样、wav 录制、取流缓冲与统计。
 # =====================================================================
-set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
-
-# 每个库的源文件分开列，foreach 里按 <目标名>_SOURCES 取用
 set(hk_sdk_audio_client_SOURCES
     ${HK_MIC_DIR}/hk_sdk_audio_client.cpp
     ${HK_MIC_DIR}/audio_resampler.cpp
 )
+
+# LIB_DEMOS 每组只放一个库：生成与链接各自独立，不靠分支区分。
+set(LIB_DEMOS
+    hk_sdk_audio_client
+)
+
+# 为每一个动态库链接库文件
+foreach(TARGET ${LIB_DEMOS})
+    add_library(${TARGET} SHARED ${${TARGET}_SOURCES})
+
+    # 统一输出 build/lib/lib_xxx.so；安装后靠 $ORIGIN 找同目录依赖
+    set_target_properties(${TARGET} PROPERTIES
+        OUTPUT_NAME "_${TARGET}"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+        INSTALL_RPATH "$ORIGIN"
+    )
+
+    # 公共头文件直接 include "HCNetSDK.h"，
+    # 因此 SDK 头文件路径必须对使用方可见；SDK 库本身只在本库内部链接。
+    target_include_directories(${TARGET} PUBLIC
+        ${HK_MIC_DIR}
+        ${HIK_INCLUDE_DIRS}
+    )
+
+    # ${TARGET}链接到 HCNetSDK 的库
+    target_link_libraries(${TARGET} PRIVATE ${HIK_LIBS})
+
+    # 链接 Threads 库（头文件依赖）
+    target_link_libraries(${TARGET} PRIVATE Threads::Threads)
+
+    set_target_properties(${TARGET} PROPERTIES
+        BUILD_RPATH "${HIK_LIB_ROOT}"
+    )
+endforeach()
+
+# =====================================================================
+#  二、ASR 处理库（不依赖 HCNetSDK / 采集库）
+#
+#  LogFBank 前端、AsrDecoder（ORT）、语谱图与文本渲染。
+#  ORT 缺失时跳过 asr_decode.cpp 与三个推理入口，
+#  音频采集、语谱图与 fbank 对拍仍可构建。
+# =====================================================================
+set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
 
 set(audio_ai_process_SOURCES
     ${AAP_DIR}/audio_preprocess.cpp
@@ -147,7 +186,6 @@ if(ORT_FOUND)
 endif()
 
 set(LIB_DEMOS
-    hk_sdk_audio_client
     audio_ai_process
 )
 
@@ -163,62 +201,41 @@ foreach(TARGET ${LIB_DEMOS})
         INSTALL_RPATH "$ORIGIN"
     )
 
-    if("${TARGET}" STREQUAL "hk_sdk_audio_client")
-        # 公共头文件直接 include "HCNetSDK.h"，
-        # 因此 SDK 头文件路径必须对使用方可见；SDK 库本身只在本库内部链接。
-        target_include_directories(${TARGET} PUBLIC
-            ${HK_MIC_DIR}
-            ${HIK_INCLUDE_DIRS}
-        )
+    # 公共头文件使用 audio_ai_process/xxx.h 与 opencv2/... 写法，
+    # 因此把工作区根目录与 OpenCV 头文件路径传给使用方。
+    target_include_directories(${TARGET} PUBLIC
+        ${CMAKE_SOURCE_DIR}
+        ${OpenCV_INCLUDE_DIRS}
+    )
 
-        # ${TARGET}链接到 HCNetSDK 的库
-        target_link_libraries(${TARGET} PRIVATE ${HIK_LIBS})
+    # ${TARGET}链接到 OpenCV 的库
+    target_link_libraries(${TARGET} PUBLIC ${OpenCV_LIBS})
 
-        # 链接 Threads 库（头文件依赖）
-        target_link_libraries(${TARGET} PRIVATE Threads::Threads)
+    # 链接 Threads 库（头文件依赖）
+    target_link_libraries(${TARGET} PUBLIC Threads::Threads)
 
-        set_target_properties(${TARGET} PROPERTIES
-            BUILD_RPATH "${HIK_LIB_ROOT}"
-        )
+    if(FREETYPE_FOUND)
+        # ${TARGET}链接到 FreeType 的库（中文文本渲染）
+        target_compile_definitions(${TARGET} PRIVATE HK_HAVE_FREETYPE=1)
+        target_include_directories(${TARGET} PRIVATE ${FREETYPE_INCLUDE_DIRS})
+        target_link_libraries(${TARGET} PRIVATE ${FREETYPE_LIBRARIES})
     endif()
 
-    if("${TARGET}" STREQUAL "audio_ai_process")
-        # 公共头文件使用 audio_ai_process/xxx.h 与 opencv2/... 写法，
-        # 因此把工作区根目录与 OpenCV 头文件路径传给使用方。
-        target_include_directories(${TARGET} PUBLIC
-            ${CMAKE_SOURCE_DIR}
-            ${OpenCV_INCLUDE_DIRS}
+    if(ORT_FOUND)
+        # ${TARGET}链接到 ONNX Runtime 的库
+        # providers_cuda.so 由 ORT 运行时 dlopen，必须与
+        # libonnxruntime.so 同目录，因此 BUILD_RPATH 指向 ORT_LIB_DIR。
+        target_include_directories(${TARGET} PUBLIC ${ORT_INCLUDE_DIR})
+        target_link_libraries(${TARGET} PUBLIC ${ORT_LIBRARY})
+
+        set_target_properties(${TARGET} PROPERTIES
+            BUILD_RPATH "${ORT_LIB_DIR}"
         )
-
-        # ${TARGET}链接到 OpenCV 的库
-        target_link_libraries(${TARGET} PUBLIC ${OpenCV_LIBS})
-
-        # 链接 Threads 库（头文件依赖）
-        target_link_libraries(${TARGET} PUBLIC Threads::Threads)
-
-        if(FREETYPE_FOUND)
-            # ${TARGET}链接到 FreeType 的库（中文文本渲染）
-            target_compile_definitions(${TARGET} PRIVATE HK_HAVE_FREETYPE=1)
-            target_include_directories(${TARGET} PRIVATE ${FREETYPE_INCLUDE_DIRS})
-            target_link_libraries(${TARGET} PRIVATE ${FREETYPE_LIBRARIES})
-        endif()
-
-        if(ORT_FOUND)
-            # ${TARGET}链接到 ONNX Runtime 的库
-            # providers_cuda.so 由 ORT 运行时 dlopen，必须与
-            # libonnxruntime.so 同目录，因此 BUILD_RPATH 指向 ORT_LIB_DIR。
-            target_include_directories(${TARGET} PUBLIC ${ORT_INCLUDE_DIR})
-            target_link_libraries(${TARGET} PUBLIC ${ORT_LIBRARY})
-
-            set_target_properties(${TARGET} PROPERTIES
-                BUILD_RPATH "${ORT_LIB_DIR}"
-            )
-        endif()
     endif()
 endforeach()
 
 # =====================================================================
-#  二、可执行入口
+#  三、可执行入口
 #
 #  入口只做「参数定义 + 数据源 + 装配」，库负责流水线；
 # 每个入口只链接自己需要的库。
@@ -320,7 +337,7 @@ foreach(TARGET ${EXEC_DEMOS})
 endforeach()
 
 # =====================================================================
-#  三、安装：install/<库名>/{include,lib}
+#  四、安装：install/<库名>/{include,lib}
 # =====================================================================
 
 # 头文件显式列出，避免 GLOB 把 hk_sdk/include 下的厂商头文件也装进来。
