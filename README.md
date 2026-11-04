@@ -81,7 +81,7 @@ C++ 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐�
 | 入口 | `test_spectrogram_cv_mic.cpp` | 设备实时语谱图入口 |
 | 入口 | `test_spectrogram_cv_wav.cpp` | wav 文件语谱图入口 |
 | 入口 | `test_wav_asr.cpp` | wav 语音识别入口：文本 +（可选）语谱图与中文识别条 |
-| 入口 | `test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 文本 + 滚动语谱图 |
+| 入口 | `test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 后台解码 → 文本 + 滚动语谱图（其他入口的线程模型参照此文件） |
 | 入口 | `load_onnx_model.cpp` | ASR 三模型加载自检入口 |
 | 工具 | `tools/wav_reader.h` | 最小 RIFF 解析，wav 类入口共用 |
 | 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
@@ -408,6 +408,16 @@ CPU 比 CUDA 快 1.90 倍：每块只编码 61 帧、joiner / decoder 逐帧调�
 超出的部分直接丢。入口现在拆成 `init()` → 模型加载 → `start()`，开流时主循环已就绪；
 Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−0.34 s**。
 
+**解码已挪到后台线程（示范脚本）**：`test_mic_asr.cpp` 在主循环外创建
+`AsrWorker`，特征块经 `std::deque` 有界队列投递（上限 50 块，满时丢最旧），
+主线程只做取流、前端、渲染与显示。理由：Jetson CPU 上推理、渲染、取流同线程时
+吞吐约 0.99，恰在实时线上，加渲染就可能丢块。代价是底部文字比语谱图滞后若干块，
+且推理真的跟不上时会丢弃最早的音频块（统计行「解码丢弃 N 块」）；尾块走
+`push_final()` 阻塞等空位，绝不丢弃。`AsrDecoder` 明确非线程安全，全程只有解码
+线程访问它，主线程在 `join` 之后才读 `n_chunks` / `token_ids` 等统计。
+其他入口仍是主循环同步解码，需要时参照此脚本改造，不要在多线程间共享同一个
+`AsrDecoder`。
+
 ### 断线与恢复
 
 采集层是回调驱动，当前**不做自动重连**，行为如下：
@@ -466,7 +476,9 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
 | `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
 | 两个 ASR 入口 | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
+| 两个带识别文字的入口 | `draw_tail` 底层是 alpha 混合（`dst = dst * (1 - alpha/255)`），同一串字画在已经画过字的像素上会让边缘逐次变深 | `test_mic_asr.cpp` / `test_wav_asr.cpp` 都在画字前先刷白底条（保留首行黑线）；新增入口若复用「缓存画布 + 每轮重画」必须照做，否则文字会一深一浅地闪 |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + `hyp` + `decoder_out`）必须 `reset()` 才能换音频 | 多文件 / 多路复用时要按流隔离实例或串行调用 |
+| `test_mic_asr.cpp` | 解码在后台线程（有界队列 50 块，满时丢最旧，尾块 `push_final()` 永不丢弃）；`AsrDecoder` 只被该线程访问，主线程仅在 `join` 后读统计 | 其他入口仍是主循环同步解码；要改就参照本文件的 `AsrWorker`，不要在多线程里共享同一个 `AsrDecoder` |
 | 两个 ASR 入口 | Jetson 实测 CUDA EP 反而更慢：每块只编码 61 帧，joiner/decoder 逐帧调用，116 个状态张量每次进出一遍 | 实时场景默认用 CPU；开 `--cuda` 前先用 `tools/bench_perf.sh --cuda` 实测 |
 | 两个 ASR 入口 | 已改为 `init()` → 模型加载 → `start()`：开流时主循环已就绪，启动阶段不再丢音频 | Jetson 实测丢块 0；若再出现启动积压，先确认 `start()` 是否被提前调用 |
 | 共享库 | 两个库以 SHARED 构建，Linux 下无需导出宏；ORT / OpenCV 不随安装复制 | Windows 构建需补 `__declspec(dllexport)`；部署机需自备 ORT 与 OpenCV 运行库 |
@@ -480,8 +492,7 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 
 | 优先级 | 问题 | 现状 | 候选方案 |
 | --- | --- | --- | --- |
-| 高 | 实时主循环余量偏小 | 推理、渲染、取流全在同一线程；Jetson CPU 吞吐 0.99，刚好跟上，加渲染或其他负载就可能丢块 | 解码挪到后台线程 + 有界队列，主循环只取结果与渲染；改造后需要重新确认 `AsrDecoder` 状态只被单线程访问 |
-| 高 | 改造后只复测了 CPU 无窗 | `--realtime 20 --window` 与 `--cuda` 的改造后数据缺失 | 补跑三组，确认渲染开销与 CUDA 仍不是更优选择 |
+| 高 | 改造后只复测了 CPU 无窗与短时带窗 | `tools/bench_perf.sh --realtime 20 --window` 与 `--cuda` 的改造后数据缺失 | 补跑三组，确认渲染开销与 CUDA 仍不是更优选择 |
 | 中 | CUDA EP 在 Jetson 上比 CPU 慢 1.9 倍 | 离线 RTF 0.5145 vs 0.2713；原因是每块 61 帧、joiner/decoder 逐帧、116 个状态张量反复搬运 | 试 fp16、TensorRT EP、增大编码块或合并小块推理；每次都用 `bench_perf.sh --cuda` 对比 |
 | 中 | PCM 运行期切换后约 21.5 秒停止交付 | 原因未定位；上行保活仍正常发送 | 重启设备后用 PCM 复测，确认重启后上行是否也变 PCM；若是，保活按编码分支回发裸 PCM |
 | 中 | 不做自动重连 | 断流后需上层 `stop()` → `start()`，登录会话未失效时不必 `init()` | 加 watchdog：`packets` 一段时间不增长即重连；必须抑制「设备静音不发包」的误判，阈值取设备最长静音间隔 |

@@ -405,6 +405,16 @@ int main(int argc, char** argv) {
                 //       文字变化时刷新 —— 这样语谱图和文字始终是同一帧。
                 //       Python 用 cv2.putText（只支持 ASCII），这里优先用
                 //       FreeType 画中文，缺少字体时回退同一套 putText。
+                //       画字前先刷白底条：draw_tail 底层是 alpha 混合
+                //       （dst = dst * (1 - alpha/255)），同一串字画在已经画过
+                //       字的像素上会让边缘逐次变深。本入口每块都通过
+                //       accept_features() 重建画布，当前不会叠加；保留这行是
+                //       与 test_mic_asr.cpp 口径一致，也防止将来改成「只在有
+                //       新帧时重建」后出现文字逐次变深 / 闪烁。
+                //       从白条第 2 行开始刷，保留首行黑分隔线。
+                canvas(cv::Rect(0, canvas.rows - kFooterH + 1, canvas.cols,
+                                kFooterH - 1))
+                    .setTo(cv::Scalar(255, 255, 255));
                 draw_status_text(canvas, text);
                 cv::imshow(kWindow, canvas);
                 const int key = cv::waitKey(1) & 0xFF;
@@ -427,7 +437,11 @@ int main(int argc, char** argv) {
         if (!no_window) {
             // 4.5.1 最后一屏按当前缓存重画（不喂补 0 特征），避免多出假亮尾；
             //       完整识别结果写到底部白条（中文字体缺失时回退 ASCII）。
+            //       view.frame() 已是全新画布，刷白条属于防御性一致做法。
             canvas = view.frame();
+            canvas(cv::Rect(0, canvas.rows - kFooterH + 1, canvas.cols,
+                            kFooterH - 1))
+                .setTo(cv::Scalar(255, 255, 255));
             draw_status_text(canvas, final_text);
             cv::imshow(kWindow, canvas);
         }

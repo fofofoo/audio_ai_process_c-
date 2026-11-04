@@ -12,13 +12,16 @@
  *              → int16 / 32768.0（转 [-1,1]）
  *              → AudioPreprocess（波形 → (n, 80) LogFBank）
  *              → 同一份特征分两路：
- *                   AsrDecoder（三 ONNX 会话 + 贪心搜索）→ 文本
- *                   SpectrogramImage（滚动语谱图）→ BGR 画布
- *              → 文本写 stdout + 画在窗口底部白条 → imshow
+ *                   AsrWorker（后台线程里的 AsrDecoder，三 ONNX 会话 +
+ *                   贪心搜索）→ 最新文本
+ *                   SpectrogramImage（滚动语谱图，主线程）→ BGR 画布
+ *              → 主线程读后台最新文本 → 写 stdout + 画在窗口底部白条 → imshow
  *
  * 三个类只靠特征矩阵相连：入口只做「参数 + 数据源 + 装配」，流水线细节
- * 不写在这里。数据本来按真实时间到达，不需要像 wav 入口那样模拟节奏；
- * 主循环拿不到新数据时只等 10 ms，把 CPU 让出来。
+ * 不写在这里。解码放在独立线程（AsrWorker），主循环只做取流、前端、渲染和
+ * 显示，不再被推理卡住；代价是底部文字会比语谱图滞后若干块。数据本来按真实
+ * 时间到达，不需要像 wav 入口那样模拟节奏；主循环拿不到新数据时只等 10 ms，
+ * 把 CPU 让出来。
  *
  * ============================================================
  * 与 Python 版的差异
@@ -32,6 +35,13 @@
  *     校验），确认数据源可用；模型装配完成后再 start() 真正开流。这样既能在
  *     加载前发现设备不可用，又不会让 7~14 s 的模型加载把启动阶段的音频
  *     （取流缓冲只有 2.56 s）丢光。
+ *   - 解码线程：Python 版在主循环里同步解码（推理、渲染、取流同一线程）；
+ *     这里把 encoder / decoder / joiner 放进后台线程，特征块经有界队列投递，
+ *     队列满时丢最旧。理由是 Jetson CPU 上主循环吞吐约 0.99，恰好在实时线上，
+ *     再加渲染或其它负载就会让取流缓冲（2.56 s）溢出丢块。拆开后主线程不被
+ *     推理阻塞，但底部文字会滞后于语谱图，且过载时会丢弃最旧的音频块。
+ *     AsrDecoder 明确非线程安全：全程只有解码线程访问它，main 只在 join
+ *     之后读 n_chunks / token_ids 等统计。
  *   - 窗口底部文字优先 FreeType 渲染中文（Python 的 cv2.putText 只支持
  *     ASCII，中文会静默变成 '?'），字体缺失时回退 cv2.putText。
  *   - 新增 --no-window / --cuda / --seconds 三个开关（Python 版配置全写死）。
@@ -45,13 +55,15 @@
  *   三、加载模型与装配（Python 2）
  *       3.1 session 选项    3.2 可选 CUDA EP   3.3 三 session + AsrDecoder
  *       3.4 前端            3.5 语谱图         3.6 中文字体   3.7 start 开流
+ *       3.8 启动后台解码线程（AsrWorker）
  *   四、打印配置（Python 3）
  *   五、主循环（Python 4）
- *       5.0 退出条件  5.1 取音频  5.2 归一化  5.3 前端  5.4 可视化
- *       5.5 推理    5.6 打印    5.7 画字显示  5.8 按键与节拍
+ *       5.0 退出条件  5.1 取音频  5.2 归一化  5.3 前端
+ *       5.4 可视化（有新帧才重建画布）
+ *       5.5 投递解码  5.6 读最新文本  5.7 画字显示  5.8 按键与节拍
  *   六、收尾与统计（Python 5）
- *       6.1 停流  6.2 残余样本  6.2.1 deinit  6.3 补尾解码  6.4 最后一屏
- *       6.5 统计  6.6 关窗
+ *       6.1 停流  6.2 残余样本  6.2.1 deinit  6.3 补尾解码 + join
+ *       6.4 最后一屏  6.5 统计  6.6 关窗
  *
  * 结束（Ctrl+C、窗口里按 q/Esc、或 --seconds 到点）后必须走完收尾：把缓冲里
  * 残余的 PCM 解完，再让前端补出尾部帧、并在特征尾补 100 帧 0 一起解掉 ——
@@ -81,10 +93,13 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -107,6 +122,210 @@ volatile std::sig_atomic_t g_interrupted = 0;
 void on_sigint(int) {
     g_interrupted = 1;
 }
+
+// ==================== 解码后台工作器 ====================
+// 这份代码是干什么的：
+//   把「特征块 → AsrDecoder」整段搬进独立线程，主线程只做取流、前端、语谱图
+//   渲染和文字展示。改造前推理、渲染、取流挤在同一个循环里，Jetson CPU 上
+//   主循环吞吐只有 0.99（刚好擦着实时），再加渲染或其它负载就会让取流缓冲
+//   （2.56 s）溢出丢块；拆开后主循环不再被 encoder / decoder / joiner 卡住。
+//
+// 线程模型：
+//   - 主线程：push() 投递特征块副本、latest_text() 读文本快照；
+//   - 解码线程：唯一调用 AsrDecoder 的地方（该类明确写了非线程安全），
+//     除了 join 之后读统计，main 绝不直接碰它；
+//   - 三个 Ort::Session 由主线程创建，创建完成后才启动本线程；本对象声明在
+//     session 之后，析构反序保证「先 join 线程、后销毁 session」。
+//
+// 背压策略：队列有界，满了丢最旧（kMaxPendingChunks）。
+//   解码吞吐低于实时时，继续囤只会让文字越来越滞后；丢最旧能让显示始终贴近
+//   当前音频，丢弃块数进统计行。收尾的 input_finished() 尾块走 push_final()，
+//   阻塞等空位、绝不被丢 —— 丢了最后几个字就整段没了。
+class AsrWorker {
+public:
+    /// 队列上限 50 块：设备每块约 40 ms，合计约 2 秒音频、65 KB 内存。
+    /// 超过它说明解码已经落后采集 2 秒以上，再囤只会让显示更滞后。
+    static constexpr size_t kMaxPendingChunks = 50;
+
+    /// 绑定解码器并启动后台线程；线程起来后先阻塞在空队列上，等第一次 push。
+    explicit AsrWorker(AsrDecoder& decoder) : decoder_(decoder) {
+        thread_ = std::thread([this] { run(); });
+    }
+
+    /// 析构兜底：保证线程一定被 join，否则 std::thread 析构会直接 terminate。
+    ~AsrWorker() { finish_and_join(); }
+
+    AsrWorker(const AsrWorker&) = delete;
+    AsrWorker& operator=(const AsrWorker&) = delete;
+
+    /// 投递一块特征（按值拷贝）；队列满时丢最旧并计数。
+    ///
+    /// 五个步骤的行为，按代码里的编号：
+    ///   1. 纯空块（n_frames == 0，本次一块新帧都没产出）直接返回。
+    ///      注意它不是「没凑满一帧的部分数据」：那些样本仍留在 AudioPreprocess 内部缓存里，下一块 PCM 会接着把它们凑成完整帧，
+    ///      所以跳过空块不会丢音频。
+    ///   2. 结束判断：已收尾（或解码线程因异常退出）后的投递没有任何消费者，
+    ///      直接丢弃，避免队列在 push_final 之后继续增长。
+    ///   3. 丢最旧腾位：kMaxPendingChunks 是「可容忍的显示延迟」上限，不是
+    ///      内存上限（50 块总计才约 65 KB）。队列满说明解码吞吐低于采集速率，
+    ///      继续囤只会让窗口里的字越来越滞后；丢最早一块能让显示贴近当前音频，
+    ///      dropped_ 进统计，收尾时据此打印提示。
+    ///      注意这**不是**在叫醒消费者：每块下面都会 notify，队列满时消费者
+    ///      多半正在解码，唤醒改变不了它的处理速度，只能靠丢来给延迟封顶。
+    ///   4. 深拷贝入队：feats 是主线程循环体里的局部对象，本函数返回后随时可能
+    ///      被下一次 accept_waveform 覆盖；每块约 40 ms ≈ 4 帧 × 80 float ≈ 1.3 KB。
+    ///   5. 唤醒一个等待中的消费者：它如果正在解码，这次的 notify 只会让下一次
+    ///      wait 立刻通过，不会打断当前推理。
+    void push(const LogFbankFeatures& feats) {
+        // 1. 纯空块（本次 0 帧）直接返回：它不含任何新特征，未凑满一帧的样本
+        //    还在 AudioPreprocess 缓存里，后续会以完整帧补上，这里丢的只是
+        //    一次空投递，不会丢音频。
+        if (feats.n_frames <= 0 || feats.data.empty()) {
+            return;
+        }
+
+        // 2. 收尾（或后台线程异常退出）之后再投递，没人会消费，直接丢弃。
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (finished_) {
+            return;
+        }
+
+        // 3. 背压：队列满时丢最旧。容量代表延迟上限而非内存上限；满说明生产
+        //    快于消费，丢最早的块让文字始终贴近当前音频，丢弃块数进统计。
+        while (pending_.size() >= kMaxPendingChunks) {
+            pending_.pop_front();
+            ++dropped_;
+        }
+
+        // 4. 按值深拷贝入队：feats 的生命周期只到本轮循环结束。
+        pending_.push_back(feats);
+
+        // 5. 叫醒等待中的消费者；它正在解码时这次通知不会打断推理。
+        cv_.notify_one();
+    }
+
+    /// 投递收尾块（input_finished 补出的尾帧 + 100 帧特征 0）。
+    /// 与 push() 的唯一区别：满了不丢，而是等消费者腾出空位再入队。
+    /// 这是最后几个字唯一的一次解码机会，丢了就永远补不回来；此时主循环
+    /// 已经退出、不再需要保实时，所以在这里等是安全的。
+    void push_final(const LogFbankFeatures& feats) {
+        if (feats.n_frames <= 0 || feats.data.empty()) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] {
+            return finished_ || pending_.size() < kMaxPendingChunks;
+        });
+        if (finished_) {
+            return;
+        }
+        pending_.push_back(feats);
+        cv_.notify_one();
+    }
+
+    /// 最新识别文本快照（完整累积假设，不是增量）。主线程每轮都读，
+    /// 变化时才刷新显示；在锁内拷贝，读的时候不必等解码线程解完一块。
+    std::string latest_text() {
+        std::lock_guard<std::mutex> lock(text_mutex_);
+        return text_;
+    }
+
+    /// 解码线程记录的第一条异常（空串 = 一直正常）；收尾打印用。
+    std::string error() {
+        std::lock_guard<std::mutex> lock(text_mutex_);
+        return error_;
+    }
+
+    /// 因队列满而丢弃的特征块数（统计口径：1 块 ≈ 设备回调的一块音频）。
+    size_t dropped_chunks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return dropped_;
+    }
+
+    /// 置结束标志、唤醒线程并等它把队列解空后退出。幂等。
+    /// 返回后 AsrDecoder 不再被并发访问，主线程才能安全读文本与统计。
+    void finish_and_join() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            finished_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    /// 解码线程主循环：等数据 → 取一块 → 解码 → 写文本快照；finished_ 置位
+    /// 且队列排空后退出。异常必须在这里兜住，漏出去会让整个进程 terminate。
+    ///
+    /// 一轮的步骤（对照函数里的编号）：
+    ///   1. 加锁后等队列非空。空队列时 cv_.wait **原子地释放 mutex 并睡眠**，
+    ///      不占 CPU；主线程 push / finish_and_join 的 notify 把它叫醒后，
+    ///      重新拿锁、重新判谓词，被误唤醒也不会取到空块。
+    ///   2. 醒来但队列仍空 → 只可能是 finished_ 为真且已排空，线程退出。
+    ///   3. 取走队首并 pop，随即放锁：解码期间主线程照样能入队。
+    ///   4. 腾出空位后 notify_all，唤醒可能正等空位的 push_final。
+    ///   5. 锁外解码，结果覆盖文本快照；异常记录后退出循环。
+    void run() {
+        for (;;) {
+            // 1. 等一块数据（或结束标志）。空队列时阻塞在这里，不轮询、不耗 CPU。
+            LogFbankFeatures feats;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                // wait 内部三步：先判谓词 → 不满足就释放锁并继续阻塞循环睡眠 → 被唤醒后重新拿锁再判一次。
+                cv_.wait(lock, [this] { return finished_ || !pending_.empty(); });
+
+                // 2. 谓词为真但队列空，只有 finished_ 这一种可能：收尾信号已到
+                //    且积压已解完（含 push_final 投递的尾块），线程到此结束。
+                if (pending_.empty()) {
+                    return;
+                }
+
+                // 3. 取走队首再解锁：feats 被 move 出来，队列项立即销毁；
+                //    锁一放，解码期间主线程的 push 不会被推理拖住。
+                feats = std::move(pending_.front());
+                pending_.pop_front();
+
+                // 4. 队列刚腾出空位，叫醒可能正阻塞在 push_final 里的主线程。
+                cv_.notify_all();
+            }
+            // 5. 锁外解码：这里是唯一访问 AsrDecoder 的地方；返回值是完整累积
+            //    文本，直接覆盖快照，主线程通过 latest_text() 随时能读。
+            try {
+                const std::string text = decoder_.accept_features(feats);
+                std::lock_guard<std::mutex> lock(text_mutex_);
+                text_ = text;
+            } catch (const std::exception& e) {
+                // 推理失败（内存、EP 故障等）：记录原因并停止消费，
+                // 主线程照常走收尾，统计与提示里会看到这条错误。
+                {
+                    std::lock_guard<std::mutex> lock(text_mutex_);
+                    error_ = e.what();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    finished_ = true;
+                    pending_.clear();
+                }
+                cv_.notify_all();
+                return;
+            }
+        }
+    }
+
+private:
+    AsrDecoder& decoder_;             ///< 解码器：生命周期由 main 保证
+    std::mutex mutex_;                ///< 保护 pending_ / finished_ / dropped_
+    std::condition_variable cv_;      ///< 队列非空或结束状态变化时唤醒
+    std::deque<LogFbankFeatures> pending_;  ///< 待解码特征块（按到达顺序）
+    bool finished_ = false;           ///< 收尾或异常后置位，线程据此退出
+    size_t dropped_ = 0;              ///< 队列满时丢最旧的累计块数
+    std::mutex text_mutex_;           ///< 保护 text_ / error_，与队列锁分开
+    std::string text_;                ///< 后台解出的最新完整文本
+    std::string error_;               ///< 解码线程抛出的第一条异常
+    std::thread thread_;              ///< 最后声明：构造时启动、析构时 join
+};
 
 }  // namespace
 
@@ -354,6 +573,12 @@ int main(int argc, char** argv) {
                     cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     };
 
+    // 3.8 启动后台解码线程：从这里开始 encoder / decoder / joiner 只在解码
+    //     线程里跑，主循环只负责取流、前端、渲染与文字展示。worker 声明在
+    //     三个 session 之后，析构反序保证「先 join 线程、再销毁 session」；
+    //     早退路径（start 失败等）在它之前 return，构造未完成也无悬挂线程。
+    AsrWorker worker(decoder);
+
     // —— 四、打印配置（对应 Python 第 3 节）——
     std::cout << std::string(74, '=') << "\n"
               << "mini 实时 ASR —— 设备麦克风 -> 特征 -> 文字 + 语谱图\n"
@@ -399,7 +624,9 @@ int main(int argc, char** argv) {
     }
 
     // —— 五、主循环（对应 Python 第 4 节）——
-    // 取一块音频 → 算特征 → 喂解码器 → 画字 → 显示，如此往复。
+    // 取一块音频 → 算特征 → 投给后台解码线程 → 读最新文字 → 画字 → 显示。
+    // 解码不再阻塞主循环：即使一次 encoder 耗时超过一块音频，取流与渲染也
+    // 照常进行（代价是底部文字比语谱图滞后，积压策略见 AsrWorker）。
     bool quit = false;
     bool quit_by_key = false;  // 区分「按键退出」和「Ctrl+C / 到点退出」
     bool auto_exit = false;    // --seconds 到点
@@ -407,13 +634,13 @@ int main(int argc, char** argv) {
     cv::Mat canvas;
     std::vector<int16_t> pcm;
     std::vector<float> chunk;
-    std::string shown;
+    std::string shown;         // 已打印到 stdout 的文本
     double peak = 0.0;  // 峰值幅度（float 域），用于判断麦克风是否真采到声音
     const auto t_start = std::chrono::steady_clock::now();
 
     // 空格切换「暂停 / 恢复语音转发」：底层就是 client.stop() / client.start()，
     // 只停/起对讲线路，不重登录、不重建编码器；恢复后设备约 1.2 秒才送首包。
-    // 暂停期间没有新数据，窗口不会自然刷新，这里手动重画一次状态。
+    // 界面不在这里重画：5.7 每轮都会重绘，下一轮自然显示新状态（最多晚 10 ms）。
     auto toggle_pause = [&]() {
         if (!paused) {
             if (client.stop()) {
@@ -429,10 +656,6 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "[ASR] 恢复失败：" << client.last_error() << "\n";
             }
-        }
-        if (!no_window && !canvas.empty()) {
-            draw_status_text(canvas, paused ? shown + "  [已暂停]" : shown);
-            cv::imshow(kWindow, canvas);
         }
     };
 
@@ -457,26 +680,11 @@ int main(int argc, char** argv) {
 
         // 5.1 取音频：一次性取走自上次调用以来累积的全部 PCM16，与是否
         //     录制无关；没有新数据时返回 false（此时缓冲已被清空）。
-        if (!client.get_last_audio(pcm) || pcm.empty()) {
-            // 没数据也要泵一次事件，否则窗口在静音时会假死；--no-window
-            // 时没有窗口可泵，直接睡 10 ms 让出 CPU（对应 Python 的 sleep）。
-            if (!no_window) {
-                const int key = cv::waitKey(kIdleWaitMs) & 0xFF;
-                if (key == 27 || key == 'q') {
-                    quit = true;
-                    quit_by_key = true;
-                } else if (key == ' ') {
-                    toggle_pause();
-                }
-            } else {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(kIdleWaitMs));
-            }
-            continue;
-        }
-
-        // 5.2 int16 → float [-1,1]，与 Python mic/wav 的量纲对齐；顺手统计
-        //     峰值幅度，收尾时用来提示「是不是根本没采到声音」。
+        //     没有数据不等于这一轮什么都不做：后台线程可能刚好解完上一块，
+        //     文字仍要照常刷新，所以下面 5.6 / 5.7 放在 if 外面。
+        const bool has_audio = client.get_last_audio(pcm) && !pcm.empty();
+        // 5.2 int16 → float [-1,1]，与 Python mic/wav 的量纲对齐；顺手
+        //     统计峰值幅度，收尾时用来提示「是不是根本没采到声音」。
         chunk.resize(pcm.size());
         for (size_t i = 0; i < pcm.size(); ++i) {
             const float value = static_cast<float>(pcm[i] * kPcmScale);
@@ -486,42 +694,69 @@ int main(int argc, char** argv) {
                 peak = amplitude;
             }
         }
-
         // 5.3 预处理：波形 → (n, 80) LogFBank。块长由设备回调节奏决定，
         //     不固定；前端按绝对样本索引凑帧，出帧结果与块长无关。
         const LogFbankFeatures feats = front.accept_waveform(chunk);
-
-        // 5.4 可视化：返回整幅伪彩画布；--no-window 时跳过，省渲染。
-        if (!no_window) {
+        // 5.4 可视化：有新帧才重建画布。设备约 40 ms 一批（通常 4 帧），
+        //     所以画面按数据到达节奏前进 4 列，没有新帧时保持上一屏不动。
+        //     不做「每轮都用 0 帧重画」：那只是把同一幅内容重复渲染，白烧 CPU。
+        //     --no-window 时整段跳过。
+        if (!no_window && has_audio && feats.n_frames > 0) {
             canvas = view.accept_features(feats);
         }
+        if (has_audio) {
+            // 5.5 投递解码：只把特征副本交给后台线程，主线程不等推理。
+            //     本次 0 帧的纯空块由 push() 内部丢掉，不占队列、不唤醒线程。
+            worker.push(feats);
+        }
+        
 
-        // 5.5 推理 + 后处理：贪心搜索和跨块状态都在 AsrDecoder 内部。
-        const std::string text = decoder.accept_features(feats);
+        // 5.6 读后台最新文本（完整累积假设）：只有文字变化时才刷新 stdout，
+        //     补 8 个空格擦掉上一行多出来的尾巴。异步解码下文字会比语谱图
+        //     滞后若干块，这是把推理挪出主线程的必然代价。
+        const std::string text = worker.latest_text();
 
-        // 5.6 打印：只在文字变化时刷新 stdout（窗口每帧都重画）；
-        //     补 8 个空格擦掉上一行多出来的尾巴。
         if (text != shown) {
             shown = text;
-            std::cout << "\r" << text << std::string(8, ' ') << std::flush;
+            std::cout << "\r" << shown << std::string(8, ' ') << std::flush;
         }
 
         if (!no_window) {
-            // 5.7 识别结果画到底部白条，再显示：与 Python 版一致，每个块都
-            //     重画、都 imshow，这样语谱图和文字始终是同一帧。
-            // 暂停时在底部追加状态，避免用户以为窗口卡住。
-            draw_status_text(canvas, paused ? text + "  [已暂停]" : text);
-            cv::imshow(kWindow, canvas);
+            // 5.7 识别结果画到底部白条，再显示：每轮都画、都 imshow。
+            //     不按「画布或文字变过」跳过：部分窗口环境（WSLg / 远程 X）
+            //     不保证自动重绘，跳过会表现为老字停在窗口里不动。暂停期间
+            //     没有新帧，也靠这里每轮重画才有 [已暂停] 提示。
+            //     画字前必须先清空底部白条：draw_tail 底层是 alpha 混合
+            //     （dst = dst * (1 - alpha/255)），同一串字画在已经画过字的
+            //     像素上会让边缘逐次变深，画布又不一定每轮重建，表现为文字
+            //     一深一浅地闪。刷白 1200x55 区域约 200 KB，远比全量重建便宜。
+            //     从白条第 2 行开始刷，保留首行那条黑分隔线（否则语谱图与
+            //     白条会糊成一片）。
+            //     画布还没生成（第一轮尚无音频）时跳过。
+            if (!canvas.empty()) {
+                canvas(cv::Rect(0, canvas.rows - kFooterH + 1, canvas.cols,
+                                kFooterH - 1))
+                    .setTo(cv::Scalar(255, 255, 255));
+                draw_status_text(canvas, paused ? text + "  [已暂停]" : text);
+                cv::imshow(kWindow, canvas);
+            }
         }
 
-        // 5.8 按键：有数据时按 1 ms 的节拍泵事件，保证 q/Esc 及时响应；
+        // 5.8 按键与节拍：有数据时按 1 ms 的节拍泵事件，保证 q/Esc 及时响应；
+        //     没有数据时用 10 ms 节拍，窗口不假死；--no-window 下没有窗口可
+        //     泵，直接 sleep 10 ms 让出 CPU（对应 Python 的 sleep）。
         //     空格暂停/恢复语音转发（暂停期间不再有新数据进来）。
-        const int key = no_window ? -1 : (cv::waitKey(1) & 0xFF);
-        if (key == 27 || key == 'q') {
-            quit = true;
-            quit_by_key = true;
-        } else if (key == ' ') {
-            toggle_pause();
+        if (!no_window) {
+            const int key = cv::waitKey(has_audio ? 1 : kIdleWaitMs) & 0xFF;
+            if (key == 27 || key == 'q') {
+                quit = true;
+                quit_by_key = true;
+            } else if (key == ' ') {
+                toggle_pause();
+            }
+        } else if (!has_audio) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kIdleWaitMs));
         }
     }
 
@@ -542,10 +777,12 @@ int main(int argc, char** argv) {
             }
         }
         const LogFbankFeatures feats = front.accept_waveform(chunk);
-        if (!no_window) {
-            view.accept_features(feats);
+        if (!no_window && feats.n_frames > 0) {
+            // 与主循环一致：有新帧就贴一次整块。
+            canvas = view.accept_features(feats);
         }
-        decoder.accept_features(feats);
+        // 与前文一致：只投递给后台线程，不在收尾阶段同步解码。
+        worker.push(feats);
     }
 
     // 6.2.1 残余样本取完后释放设备会话：恢复设备编码（若本入口改过）、
@@ -557,22 +794,34 @@ int main(int argc, char** argv) {
     //     （log 域能量 1，不是静音值），使最后不满一个 chunk 的尾段也能被
     //     解码 —— 少了这一步最后几个字会被整段丢掉。返回值只喂解码器；
     //     喂可视化会多出一块比静音还亮的假色块。
-    const std::string final_text =
-        decoder.accept_features(front.input_finished());
+    //     尾块走 push_final()（阻塞等空位、绝不丢弃），随后置结束标志并
+    //     join：返回时队列已解空，AsrDecoder 不再被并发访问，主线程才能
+    //     安全读最终文本与 n_chunks / token_ids 等统计。
+    worker.push_final(front.input_finished());
+    worker.finish_and_join();
+    const std::string final_text = worker.latest_text();
     const auto end = std::chrono::steady_clock::now();
     const double wall_seconds =
         std::chrono::duration<double>(end - t_start).count();
 
     if (!no_window) {
-        // 6.4 最后一屏按当前缓存重画（不喂补 0 特征），避免多出假亮尾；
-        //     完整识别结果写到底部白条（中文字体缺失时回退 ASCII）。
-        canvas = view.frame();
+        // 6.4 最后一屏：画布已随 5.4 / 6.2 更新到最新；一轮都没贴过时
+        //     （极短会话）才用 view.frame() 按现有缓存补一张。
+        //     不喂补 0 特征，避免多出假亮尾；完整识别结果写到底部白条
+        //     （中文字体缺失时回退 ASCII）。这里也先刷白底条再画。
+        if (canvas.empty()) {
+            canvas = view.frame();
+        }
+        canvas(cv::Rect(0, canvas.rows - kFooterH + 1, canvas.cols,
+                        kFooterH - 1))
+            .setTo(cv::Scalar(255, 255, 255));
         draw_status_text(canvas, final_text);
         cv::imshow(kWindow, canvas);
     }
 
     // 6.5 统计：口径与 Python 5.3 一致 —— 墙钟时长、喂入样本 / 产出帧、
     //     encoder 调用次数与帧数、token 数、取流丢弃、峰值幅度。
+    //     decoder 的统计现在由后台线程写；6.3 已 join，这里读没有并发。
     const AudioCaptureStats stats = client.get_stats();
     const std::vector<int64_t> ids = decoder.token_ids();
 
@@ -587,7 +836,9 @@ int main(int argc, char** argv) {
               << " 个\n"
               << "取流丢弃 " << static_cast<unsigned long long>(
                      stats.stream_dropped_samples)
-              << "   峰值幅度 " << peak << "\n"
+              << "   解码丢弃 " << worker.dropped_chunks() << " 块（队列上限 "
+              << AsrWorker::kMaxPendingChunks << "）   峰值幅度 " << peak
+              << "\n"
               << "上行保活 发送 " << static_cast<unsigned long long>(
                      stats.uplink_sent_frames)
               << " 帧 / 失败 " << static_cast<unsigned long long>(
@@ -595,10 +846,21 @@ int main(int argc, char** argv) {
               << " 次（每 40 ms 回发一帧 G.722 静音，PCM 下行同样适用）\n";
 
     // 与 Python 5.4 相同的两条提示：丢块说明主循环跟不上取流速度；
-    // 峰值为 0 说明设备根本没采到声音。
+    // 峰值为 0 说明设备根本没采到声音。后两条是本入口独有的：
+    // 解码队列丢弃说明推理吞吐低于实时，异常说明后台线程已经停了。
     if (stats.stream_dropped_samples > 0) {
         std::cout << "提示：出现丢块，说明主循环跟不上采集速度（取流缓冲上限 "
                      "40960 样本 ≈ 2.56 s）。\n";
+    }
+    if (worker.dropped_chunks() > 0) {
+        std::cout << "提示：后台解码跟不上采集，已丢弃最早的 "
+                  << worker.dropped_chunks()
+                  << " 块特征（显示文字会跳）；可改用 --cuda 或减少其它负载。\n";
+    }
+    const std::string decode_error = worker.error();
+    if (!decode_error.empty()) {
+        std::cout << "警告：后台解码线程异常退出：" << decode_error
+                  << "（其后的音频未参与识别）\n";
     }
     if (peak == 0.0) {
         std::cout << "提示：峰值幅度为 0，设备可能没采到声音，"
