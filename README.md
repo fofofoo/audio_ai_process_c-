@@ -137,8 +137,10 @@ wav 文件 --tools/wav_reader.h（RIFF 解析）------------------+             
   为 `0` 时按设备原始率输出（`device_sample_rate()`）；设为 `16000` 时降采样后输出，
   `sample_rate()` 恒为 16000。只支持整数倍降采样，44.1k 等比例拒绝启动。
 - **推荐格式**：实时 ASR 默认用 **G.722.1**（16 kbps、样本连续、无需降采样）。
-  PCM 在运行期切换、未重启设备的实测中，下行约 21.5 秒后停止交付；PCM 只建议用于
-  短会话或无损采集调试，详见 [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) 1.7.2。
+  PCM 存在**单次 `StartVoiceCom` 会话上限**：约 21.5 秒后停止交付，把 PCM 写成持久
+  配置并重启设备后复测结果不变；`stop()` → `start()` 重开语音转发可恢复（2026-11-04
+  实测）。PCM 只建议用于短会话或无损采集调试，详见
+  [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) 1.7.2。
 - **wav 文件**：支持 PCM16 与 float32，多声道只取第一声道；不做重采样，
   非 16 kHz 的 wav 可以画图，但喂 ASR 前必须自行重采样。
 
@@ -432,7 +434,10 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 - **暂停恢复**：就是 `stop()` / `start()`；`start()` 对 error 29 按 200 ms 间隔重试最多
   5 次，其它错误直接失败；`StartVoiceCom` 本身同步阻塞约 1.2 秒。
 - **保活失败**：只累加 `uplink_send_errors`，不触发重连；会话真失效后回调会再次停流。
-- **断线期间输出**：客户端不补静音，wav 音频时长可能小于墙钟时长。
+- **断线期间输出**：默认开启静音补零（`pad_silence_gaps`）：按回调到达时刻检测
+  停顿，在下一次回调前补等长 PCM16 0，让 wav 与 ASR 时间轴对齐墙钟。判定阈值
+  200 ms，单次最多补 10 s；只补「确认丢失」的停顿，SDK 事后补发的积压音频不会
+  重复补 0。统计见 `gap_padded_samples` / `gap_events`，正常连续推流应为 0。
 
 ## 频率与数据量
 
@@ -461,16 +466,16 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 | 位置 | 问题 | 影响 |
 | --- | --- | --- |
 | 各入口 `main` | 设备 IP、账号、通道、录制时长写死 | 换设备需改代码重新编译 |
-| `HkSdkAudioClient` | 不做自动重连；未启用 `NET_DVR_SetReconnect` | 会话断开后需上层 `stop()` + `start()`；断流期间不补静音 |
+| `HkSdkAudioClient` | 不做自动重连；未启用 `NET_DVR_SetReconnect` | 会话断开后需上层 `stop()` + `start()`；断流期间按到达时刻补 0 对齐墙钟 |
 | `HkSdkAudioClient` | 每个实例都会 `NET_DVR_Init/Cleanup` | 同一进程不要同时创建音频与视频/热成像客户端 |
 | `HkSdkAudioClient` | PCM 路径采样率被设备固定为 32 kHz（本机实测请求 16 kHz 无效） | 需要 16 kHz 时必须显式设 `output_sample_rate=16000`，由客户端降采样 |
 | `HkSdkAudioClient` | 降采样只支持整数倍（32k/48k→16k） | 44.1k 等非整数比会拒绝启动 |
-| `HkSdkAudioClient` | 运行期切到 PCM（未重启设备）后，下行约 21.5 秒停止交付；45 秒运行也只收到 21.55 秒音频 | PCM 单次实时 ASR 有效音频上限约 21.5 秒；实时场景推荐 G.722.1，详见包 README 1.7.2 |
+| `HkSdkAudioClient` | PCM 下行约 21.5 秒停止交付（单次 `StartVoiceCom` 会话上限）；持久配置 + 重启设备后复测仍停在 21.52 秒 / 471 包，45 秒运行只收到约 21.5 秒音频；重开语音转发可恢复 | PCM 单次实时 ASR 有效音频上限约 21.5 秒；长会话需每约 20 秒 `stop()` → `start()`；实时场景推荐 G.722.1，详见包 README 1.7.2 |
 | `HkSdkAudioClient` | 主动设置编码写的是设备持久配置，且设备可能「成功但没生效」 | 默认关闭；开启后以读回复核为准，`deinit()` 写回原配置 |
-| `HkSdkAudioClient` | PCM 下行时上行仍须回发 G.722 静音（裸 PCM 静音会让设备立即停流） | 若设备重启后上行也变成 PCM，保活需按编码分支调整或关闭 |
+| `HkSdkAudioClient` | PCM 下行时上行仍须回发 G.722 静音；持久 PCM + 重启设备后上行仍是 G.722.1（裸 PCM 保活 2560 B 第一秒即 0 包） | 不要按下行编码切换保活 payload；裸 PCM 上行不可用 |
 | `HkSdkAudioClient` | `stop()` 会关闭当前 wav；`StartVoiceCom` 同步调用约阻塞 1.2 秒 | 连续录音不能跨暂停；在 UI 线程调用 `start()` 会卡顿，应放后台 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |
-| `HkSdkAudioClient` | 设备静音时可能不下发音频包，客户端不补静音 | wav 音频时长可能小于墙钟时长 |
+| `HkSdkAudioClient` | 静音补零依赖回调到达时刻（SDK 无设备时间戳），阈值 200 ms、单次上限 10 s；更长的断线只补前 10 s | 小于阈值的抖动不补；超过 10 s 的断线仍会让 wav 短于墙钟，超出部分丢弃后时间轴重新对齐 |
 | `tools/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
@@ -494,9 +499,8 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 | --- | --- | --- | --- |
 | 高 | 改造后只复测了 CPU 无窗与短时带窗 | `tools/bench_perf.sh --realtime 20 --window` 与 `--cuda` 的改造后数据缺失 | 补跑三组，确认渲染开销与 CUDA 仍不是更优选择 |
 | 中 | CUDA EP 在 Jetson 上比 CPU 慢 1.9 倍 | 离线 RTF 0.5145 vs 0.2713；原因是每块 61 帧、joiner/decoder 逐帧、116 个状态张量反复搬运 | 试 fp16、TensorRT EP、增大编码块或合并小块推理；每次都用 `bench_perf.sh --cuda` 对比 |
-| 中 | PCM 运行期切换后约 21.5 秒停止交付 | 原因未定位；上行保活仍正常发送 | 重启设备后用 PCM 复测，确认重启后上行是否也变 PCM；若是，保活按编码分支回发裸 PCM |
+| 中 | PCM 长会话没有自动分段重开 | 已确认 21.5 秒是单次 `StartVoiceCom` 会话上限（重启设备、持久配置后一致）；实测 25 秒 `stop()` → `start()` 后包数与取流恢复，但客户端未自动做 | 在 `HkSdkAudioClient` 内对 PCM 下行每约 20 秒自动重开语音转发；注意与录制收尾、暂停状态和 `StartVoiceCom` 约 1.2 秒阻塞协调 |
 | 中 | 不做自动重连 | 断流后需上层 `stop()` → `start()`，登录会话未失效时不必 `init()` | 加 watchdog：`packets` 一段时间不增长即重连；必须抑制「设备静音不发包」的误判，阈值取设备最长静音间隔 |
-| 低 | 断线/静音期间不补静音 | wav 与 ASR 时间轴被压缩，音频时长小于墙钟 | 可选开关：按回调时间戳在取流缓冲补 0 样本 |
 | 低 | 启动失败报错时机 | `init()` 的登录/编码错误能立即报；`StartVoiceCom` 失败要等模型加载完才报 | 若现场更在意早报错，可在 `init()` 后追加一次「起流 → 立即停流」探测，代价是约 1.2 秒 |
 | 低 | 没有单元测试框架 | 全靠对拍脚本与自检入口，依赖人工执行 | 把 `compare_fbank.py`、`compare_asr.py` 与三个自检入口接入 CI |
 | 低 | Windows 未实机验证 | 目录与链接路径已配置，共享库缺导出宏 | 补 `__declspec(dllexport)` 后在 Windows 上走一遍构建与冒烟 |

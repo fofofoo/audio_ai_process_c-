@@ -123,6 +123,17 @@ struct AudioCaptureConfig {
                                           ///< （PCM 下行也用 G.722 上行，见 .cpp 实测说明）。
                                           ///< 手册要求语音转发双向；实测只收不发时设备
                                           ///< 约 10 秒后停掉回调，置 false 会复现该断流
+
+    // —— 静音 / 断线补零（默认开启）——
+    // 设备静音、网络抖动或会话停流时回调会暂停。若把前后音频直接拼接，
+    // wav 与 ASR 的时间轴会比墙钟短。打开后按回调到达时刻维护一条虚拟时间轴：
+    // 停顿后的下一个回调到来时，先补等长 PCM16 0，再交付真实音频。
+    // SDK 回调没有时间戳字段，只能用到达时刻（steady_clock）近似。
+    bool pad_silence_gaps = true;         ///< false 时完全不补，行为与旧版一致
+    double silence_gap_threshold_seconds = 0.2; ///< 小于该值视为网络抖动，不补零
+    double silence_gap_max_seconds = 10.0;      ///< 单次停顿最多补这么久；超出的
+                                                ///< 部分直接丢弃并把时间轴重新对齐；
+                                                ///< <=0 表示不设上限（慎用）
     bool verbose = true;                  ///< 是否打印登录、编码格式、错误信息
 };
 
@@ -142,6 +153,8 @@ struct AudioCaptureStats {
     uint64_t write_errors = 0;        ///< fwrite 失败次数
     uint64_t uplink_sent_frames = 0;  ///< 上行保活成功发送的静音帧数（固定 80 B G.722/帧）
     uint64_t uplink_send_errors = 0;  ///< 上行保活发送失败次数；持续增长说明会话已失效
+    uint64_t gap_padded_samples = 0;  ///< 静音补零的采样点数（设备原始采样率、降采样前）
+    uint64_t gap_events = 0;          ///< 触发补零的停顿次数；正常连续推流应保持 0
     uint64_t dropped_partial_bytes = 0; ///< stop() 时不足一帧而丢弃的字节数
     double wall_seconds = 0.0;        ///< 从 init() 到 deinit() 的墙钟时长（含未转发时间）
     double forward_seconds = 0.0;     ///< 累计实际转发时长：每次 stop() 累加，不含停止时间
@@ -296,6 +309,10 @@ private:
     void deliver_pcm_locked(const unsigned char* data, size_t bytes);
     void append_stream_locked(const unsigned char* data, size_t bytes);
 
+    // —— 静音/断线补零（按回调到达时刻维护虚拟时间轴）——
+    void update_silence_gap_locked(const std::chrono::steady_clock::time_point& now);
+    void reset_silence_gap();
+
     // —— 语音转发起停（init 建会话，start / stop 反复开关对讲线路）——
     bool start_voice_forward();
     void add_forward_seconds_locked();
@@ -361,6 +378,18 @@ private:
     std::string m_part_path;      ///< 正在写的 .wav.part
     std::string m_final_path;     ///< 收尾后改名为 .wav
     uint64_t m_data_bytes = 0;    ///< 已写入的 PCM 字节数
+
+    // 静音补零的时间轴（设备采样率域，全部在 m_mutex 内访问）：
+    // timeline 是按墙钟「应到」的样本数，fed 是实际交付的真实音频样本数。
+    // 每次回调先推进 timeline，再决定补多少 0；首次回调只起表、不补。
+    bool m_gap_clock_started = false;
+    std::chrono::steady_clock::time_point m_last_voice_time;
+    int64_t m_gap_timeline_samples = 0;
+    int64_t m_gap_fed_samples = 0;
+    int64_t m_gap_fed_at_check = 0;  ///< 上次检查时的 fed 快照，算「单次交付量」
+    int64_t m_gap_last = 0;          ///< 上次检查的差值，用于判断是否在缩小
+    bool m_gap_pending = false;      ///< 已发现空档、等待下一次确认再补
+    std::vector<unsigned char> m_gap_zero_buf; ///< 补零用的全 0 PCM 块（按需分配一次）
 
     // 计时
     std::chrono::steady_clock::time_point m_start_time;   ///< 本次 init() 的墙钟起点

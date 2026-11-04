@@ -3,7 +3,7 @@
  * @brief 设备端音频录制 demo：启动海康语音转发，录制 10 秒并保存为 wav。
  *
  * 职责边界：
- *   - 只做「配置参数 → init/start → 录制固定时长 → 停止落盘 → deinit → 打印统计」；
+ *   - 只做「配置参数 → 启动客户端 → 等待固定时长 → 停止落盘 → 打印统计」；
  *   - 登录、编码查询、G.722.1 解码、wav 头写入全部由 HkSdkAudioClient 完成；
  *   - 不做重采样、不做语音识别，产出的 wav 供 Python 侧直接读取。
  *
@@ -174,6 +174,8 @@ int main() {
               << "[Record] stream_taken: " << stats.stream_samples_taken << " smp\n"
               << "[Record] stream_drop : " << stats.stream_dropped_samples << " smp\n"
               << "[Record] decode_err  : " << stats.decode_errors << "\n"
+              << "[Record] gap_padded  : " << stats.gap_padded_samples
+              << " smp (" << stats.gap_events << " 次)\n"
               << "[Record] write_err   : " << stats.write_errors << "\n"
               << "[Record] dropped     : " << stats.dropped_partial_bytes << " B"
               << std::endl;

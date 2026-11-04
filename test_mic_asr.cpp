@@ -843,7 +843,11 @@ int main(int argc, char** argv) {
                      stats.uplink_sent_frames)
               << " 帧 / 失败 " << static_cast<unsigned long long>(
                      stats.uplink_send_errors)
-              << " 次（每 40 ms 回发一帧 G.722 静音，PCM 下行同样适用）\n";
+              << " 次（每 40 ms 回发一帧 G.722 静音，PCM 下行同样适用）\n"
+              << "静音补零 " << static_cast<unsigned long long>(
+                     stats.gap_padded_samples)
+              << " 样本 / " << stats.gap_events
+              << " 次（设备停顿按回调到达时刻补 0，对齐墙钟）\n";
 
     // 与 Python 5.4 相同的两条提示：丢块说明主循环跟不上取流速度；
     // 峰值为 0 说明设备根本没采到声音。后两条是本入口独有的：

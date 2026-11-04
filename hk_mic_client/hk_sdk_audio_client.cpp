@@ -205,6 +205,14 @@ bool HkSdkAudioClient::start() {
 // 前置条件：SDK 已初始化、已登录、编码已确认、解码器已建。
 // 失败时撤销运行标志并写 last_error，句柄保持 -1；成功时开始累计转发时长。
 bool HkSdkAudioClient::start_voice_forward() {
+    // 新会话重置静音补零时间轴：暂停/重开之间的空档是调用方主动造成的，
+    // 不是设备静音，不能补成 0（否则恢复后的 wav 会被灌入一大段静音）。
+    // 必须早于 StartVoiceCom：SDK 可能在本函数返回前就触发第一个回调。
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        reset_silence_gap();
+    }
+
     // 启动设备端语音对讲（MR = Multi-Route 多路语音，V30 为版本号）。
     // 它向固件申请开一条语音对讲会话：已登录用户 X 请求在通道 1 上做语音对讲，
     // 让设备把一直在采集、编码的音频推给本客户端；它既不启动采集，也不修改
@@ -375,6 +383,9 @@ bool HkSdkAudioClient::stop() {
             m_stats.dropped_partial_bytes += m_encoded_buf.size();
             m_encoded_buf.clear();
         }
+
+        // 本段转发结束，清掉时间轴状态；下次 start() 会从首个回调重新起表。
+        reset_silence_gap();
     }
 
     if (m_config.verbose) {
@@ -915,12 +926,19 @@ void HkSdkAudioClient::on_voice_data(const char* buf, DWORD size, BYTE flag) {
     ++m_stats.packets;
     m_stats.encoded_bytes += size;
 
+    // 0.静音/断线补零：先按到达时刻把虚拟时间轴推进到 now，若期间设备没有
+    //   推音频，就在这里补等长 PCM16 0。必须放在交付本包音频之前——静音属于
+    //   本包音频之前的空档，补在后面会让 ASR 的时间顺序颠倒。
+    //   本函数其余部分会累加 m_gap_fed_samples，供下一次比较。
+    update_silence_gap_locked(std::chrono::steady_clock::now());
+
     // 1.hk设备是pcm编码格式：原始 PCM16 直接交付（必要时先降采样）
     if (m_codec == AudioCodec::kPcm) {
         // 设备给的是 PCM16 裸数据；配置了 output_sample_rate 时在这里
         // 统一降采样，wav / 取流缓冲 / 统计都拿到同一份输出样本。
         // 未录制时 write_pcm_locked 因 m_wav == nullptr 自动变成空操作。
         m_stats.input_samples += size / 2;
+        m_gap_fed_samples += static_cast<int64_t>(size / 2);
         deliver_pcm_locked(reinterpret_cast<const unsigned char*>(buf), size);
         return;
     }
@@ -991,6 +1009,7 @@ void HkSdkAudioClient::decode_pending_locked() {
             // 交付统一走 deliver_pcm_locked：G.722.1 输出本来就是 16 kHz，
             // 没有降采样器时直通，不产生额外拷贝以外的开销。
             m_stats.input_samples += param.out_frame_size / 2;
+            m_gap_fed_samples += static_cast<int64_t>(param.out_frame_size / 2);
             deliver_pcm_locked(m_pcm_buf.data(), param.out_frame_size);
         }
         ++m_stats.decoded_frames;
@@ -998,6 +1017,135 @@ void HkSdkAudioClient::decode_pending_locked() {
         // 3.3 从 输入缓存 m_encoded_buf 头部，移除已消费部分；
         m_encoded_buf.erase(m_encoded_buf.begin(), m_encoded_buf.begin() + consumed);
     }
+}
+
+// ==================== 静音 / 断线补零 ====================
+
+// 重置虚拟时间轴：下一次音频回调到达时重新起表（首次回调不补零）。
+// 调用方必须持有 m_mutex；start_voice_forward() 与 stop() 都已在锁内调用。
+void HkSdkAudioClient::reset_silence_gap() {
+    m_gap_clock_started = false;
+    m_gap_timeline_samples = 0;
+    m_gap_fed_samples = 0;
+    m_gap_fed_at_check = 0;
+    m_gap_last = 0;
+    m_gap_pending = false;
+}
+
+// 每次音频回调进来先调用：按墙钟推进「应到样本」，差值超过阈值就补 PCM16 0。
+//
+// 为什么需要补：设备静音时可能完全不回调，链路短暂停流时也会断包。若把前后
+// 音频直接拼接，wav 与 ASR 的时间轴会比墙钟短，且越安静短得越多。这里维护
+// 两条计数器（都在设备采样率域）：
+//   m_gap_timeline_samples —— 从首次回调起，按墙钟「应到」的样本数；
+//   m_gap_fed_samples      —— 实际交付的真实音频样本数（不含本函数补的 0）。
+// 每次回调把 timeline 推进 dt × 设备率，差值超过阈值就说明中间有设备没推的
+// 空档，补等长 0；补完把 timeline 对齐到 fed，避免同一段空档被重复补。
+//
+// 为什么不能「一超阈值就补」：网络或进程卡顿后，SDK 会把积压音频晚一些补发。
+// 这些音频只是晚了、并没有丢，若按墙钟差补 0 再叠加补发音频，wav 会比墙钟
+// 还长（实测冻结进程 2 秒，简单补零多出约 1.5 秒）。因此补零要过三道确认：
+//   1) 差值首次超阈值只挂起，不立即补；
+//   2) 上一次检查以来单次交付超过 200 ms（正常 G.722.1 约 84 ms、PCM 约 47 ms）
+//      视为积压回放，继续等；
+//   3) 差值比上次检查时小，说明还在追赶，也继续等。
+// 只有差值稳定在一个较大值时才补，补的是「确认丢失」的那部分。
+//
+// 为什么用到达时刻：SDK 回调签名只有缓冲区和标志，没有设备时间戳。
+// 为什么首次回调不补：StartVoiceCom 本身阻塞约 1.2 秒，设备起流前的等待
+// 不是「丢掉的音频」，补了会在 wav 开头凭空造出一段静音。
+// 阈值的作用：正常回调间隔约 40~90 ms，网络抖动会让 dt 个别偏大；小于
+// threshold 的差值视为抖动，宁可少补也不要在语音中间插入碎静音。
+void HkSdkAudioClient::update_silence_gap_locked(
+    const std::chrono::steady_clock::time_point& now) {
+    if (!m_config.pad_silence_gaps || m_device_sample_rate <= 0) {
+        return;
+    }
+
+    if (!m_gap_clock_started) {
+        m_gap_clock_started = true;
+        m_last_voice_time = now;
+        m_gap_timeline_samples = 0;
+        m_gap_fed_samples = 0;
+        m_gap_fed_at_check = m_gap_fed_samples;
+        m_gap_last = 0;
+        m_gap_pending = false;
+        return;
+    }
+
+    const double dt =
+        std::chrono::duration<double>(now - m_last_voice_time).count();
+    m_last_voice_time = now;
+    if (dt <= 0.0) {
+        return;
+    }
+    m_gap_timeline_samples += static_cast<int64_t>(
+        dt * static_cast<double>(m_device_sample_rate) + 0.5);
+
+    // 上一次检查到现在，本次回调之外实际交付了多少音频（设备原始采样率）。
+    // 单次超过 200 ms 说明 SDK 在补发积压（正常回调 G.722.1 约 84 ms、
+    // PCM 约 47 ms），这时时间轴上的差值会随积压回放很快缩小，不能当成静音。
+    const int64_t actual_prev = m_gap_fed_samples - m_gap_fed_at_check;
+    m_gap_fed_at_check = m_gap_fed_samples;
+
+    const int64_t gap = m_gap_timeline_samples - m_gap_fed_samples;
+    const int64_t threshold = static_cast<int64_t>(
+        m_config.silence_gap_threshold_seconds *
+        static_cast<double>(m_device_sample_rate));
+    if (gap <= threshold) {
+        m_gap_last = 0;
+        m_gap_pending = false;
+        return;
+    }
+
+    // 1) 本回调之前刚发生过积压回放：先让它把缓冲追完，追完再判断残留。
+    // 2) 差值比上次小：同样说明正在追赶，继续观察。
+    // 3) 第一次发现空档：挂起，等下一次确认不是一次性抖动或回放。
+    // 三个条件都排除后才补零，避免把「晚到的音频」再补一份 0（会把 wav
+    // 拉得比墙钟还长，实测冻结进程 2 秒可多补约 1.5 秒）。
+    const bool catchup_burst = actual_prev >
+        static_cast<int64_t>(0.2 * static_cast<double>(m_device_sample_rate));
+    const bool shrinking = m_gap_last > gap;
+    m_gap_last = gap;
+    if (catchup_burst || shrinking || !m_gap_pending) {
+        m_gap_pending = true;
+        return;
+    }
+    m_gap_pending = false;
+    m_gap_last = 0;
+
+    // 单次停顿封顶：设备断线几分钟后恢复时，一次性补几分钟静音会撑大 wav、
+    // 也会让 ASR 长时间无输出；超过上限的部分丢弃，时间轴直接对齐到实际位置。
+    int64_t pad = gap;
+    if (m_config.silence_gap_max_seconds > 0.0) {
+        const int64_t max_pad = static_cast<int64_t>(
+            m_config.silence_gap_max_seconds *
+            static_cast<double>(m_device_sample_rate));
+        if (pad > max_pad) {
+            pad = max_pad;
+        }
+    }
+
+    // 分块补 0：与解码单元同量级（640 点 = 40 ms @16 kHz / 20 ms @32 kHz），
+    // 避免为一次长停顿分配整段大缓冲；走 deliver_pcm_locked 意味着降采样、
+    // wav 与取流缓冲看到的 0 和真实音频完全同一条路径。
+    constexpr size_t kGapChunkSamples = 640;
+    if (m_gap_zero_buf.size() < kGapChunkSamples * 2) {
+        m_gap_zero_buf.assign(kGapChunkSamples * 2, 0);
+    }
+    int64_t remaining = pad;
+    while (remaining > 0) {
+        const size_t chunk = static_cast<size_t>(std::min<int64_t>(
+            remaining, static_cast<int64_t>(kGapChunkSamples)));
+        deliver_pcm_locked(m_gap_zero_buf.data(), chunk * 2);
+        remaining -= static_cast<int64_t>(chunk);
+    }
+    m_gap_fed_samples += pad;
+    m_stats.gap_padded_samples += static_cast<uint64_t>(pad);
+    ++m_stats.gap_events;
+
+    // 补完（或截断）后把时间轴对齐，避免剩余差值在后续回调里继续补 0。
+    m_gap_timeline_samples = m_gap_fed_samples;
 }
 
 // 把一段 PCM16 字节交付给「wav + 取流缓冲 + 统计」，必要时先降采样。
