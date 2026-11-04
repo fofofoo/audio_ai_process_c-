@@ -35,6 +35,10 @@
 #   RTF        = 解码耗时 / 音频时长（< 1 快于实时，越小越好）
 #   主循环吞吐 = 喂入样本 / 16000 / 墙钟秒数（稳态应 ≈ 1；> 1 表示在消化积压）
 #   丢块时长   = 取流丢弃样本 / 16000 秒（> 0 说明取流缓冲已经溢出）
+#   解码丢弃   = 后台解码队列因满而丢弃的块数（上限 50 块，每块约 480 ms 音频）。
+#                取流没丢但这项 > 0，说明推理/渲染慢于实时、丢的是识别内容；
+#                它衡量「后台解码跟不上」，与取流丢块衡量的「主循环/采集跟不上」
+#                是两种不同的落后，不能互相替代。
 #   启动积压   = 实际转发秒数 − 墙钟秒数。入口现在先 init() 登录、模型加载
 #                完才 start() 开流，这项应接近 0；若明显大于 0，说明开流早于
 #                主循环，取流缓冲只有 2.56 s，超出的部分会丢——丢块要按这个
@@ -184,22 +188,29 @@ run_realtime() {
         return 1
     fi
 
-    # 收尾统计三行（格式见 test_mic_asr.cpp 6.5）：
+    # 收尾统计数行（格式见 test_mic_asr.cpp 6.5）：
     #   时长 31.24s   实际转发 38.18s   喂入样本 536320   产出帧 3352
     #   encoder 调用 71 次 / 共 852 帧   token 53 个
-    #   取流丢弃 73600   峰值幅度 1
+    #   取流丢弃 73600   解码丢弃 3 块（队列上限 50）   峰值幅度 1
+    # 解码丢弃与取流丢弃打印在同一行、字段位置随版本可能变化，按字段名取，
+    # 不按固定列号；缺失时按 0 处理（旧日志没有这段）。
     local stats
     stats="$(awk '
+        BEGIN { dropped = 0; decdrop = 0 }
         /^时长 / {
             wall = $2; sub(/s.*$/, "", wall)
             fwd = $4; sub(/s.*$/, "", fwd)
             fed = $6
         }
         /^encoder 调用 / { chunks = $3 }
-        /^取流丢弃 /     { dropped = $2 }
+        /^取流丢弃 / {
+            dropped = $2
+            for (i = 1; i <= NF; ++i)
+                if ($i == "解码丢弃") decdrop = $(i + 1)
+        }
         END {
             if (fwd != "")
-                printf "%.4f %.4f %d %d %d", wall, fwd, fed, dropped, chunks
+                printf "%.4f %.4f %d %d %d %d", wall, fwd, fed, dropped, chunks, decdrop
         }
     ' "$log")"
 
@@ -208,9 +219,9 @@ run_realtime() {
         return 1
     fi
 
-    local wall fwd fed dropped chunks
-    read -r wall fwd fed dropped chunks <<<"$stats"
-    ROWS+=("$label|$(parse_executor "$log")|$wall|$fwd|$fed|$dropped|$chunks")
+    local wall fwd fed dropped chunks decdrop
+    read -r wall fwd fed dropped chunks decdrop <<<"$stats"
+    ROWS+=("$label|$(parse_executor "$log")|$wall|$fwd|$fed|$dropped|$chunks|$decdrop")
     rm -f "$log"
     return 0
 }
@@ -279,21 +290,21 @@ if [[ "$MODE" == "offline" ]]; then
             }'
     fi
 else
-    printf '%-10s %-26s %8s %8s %10s %7s %9s %11s %8s\n' \
+    printf '%-10s %-26s %8s %8s %10s %7s %9s %11s %8s %10s\n' \
         "运行" "执行器" "墙钟(s)" "转发(s)" "处理音频(s)" "吞吐" \
-        "丢块(s)" "启动积压(s)" "encoder"
+        "丢块(s)" "启动积压(s)" "encoder" "解码丢弃"
     for row in "${ROWS[@]}"; do
-        IFS='|' read -r label exec wall fwd fed dropped chunks <<<"$row"
+        IFS='|' read -r label exec wall fwd fed dropped chunks decdrop <<<"$row"
         awk -v label="$label" -v exec="$exec" -v wall="$wall" -v fwd="$fwd" \
             -v fed="$fed" -v dropped="$dropped" -v chunks="$chunks" \
-            -v sr="$SAMPLE_RATE" '
+            -v decdrop="$decdrop" -v sr="$SAMPLE_RATE" '
             BEGIN {
                 processed = fed / sr
                 rate = (wall > 0) ? processed / wall : 0
                 lost = dropped / sr
                 gap = fwd - wall
-                printf "%-10s %-26s %8.2f %8.2f %10.2f %7.2f %9.2f %11.2f %8d\n",
-                       label, exec, wall, fwd, processed, rate, lost, gap, chunks
+                printf "%-10s %-26s %8.2f %8.2f %10.2f %7.2f %9.2f %11.2f %8d %10d\n",
+                       label, exec, wall, fwd, processed, rate, lost, gap, chunks, decdrop
             }'
     done
 
@@ -305,20 +316,24 @@ else
     #   2) 丢块明显多于启动阶段的预期值 → 启动丢一部分，之后还在持续丢；
     #   3) 丢块 ≈ 启动阶段的预期值 → 主循环跟得上，丢块只发生在启动阶段；
     #   4) 其余 → 未出现积压。
+    # 解码已挪到后台线程，取流不丢不代表识别完整：后台队列（上限 50 块）
+    # 满时会丢最旧的块，单独提示，不能混进取流丢块的口径里。
     for row in "${ROWS[@]}"; do
-        IFS='|' read -r label exec wall fwd fed dropped chunks <<<"$row"
+        IFS='|' read -r label exec wall fwd fed dropped chunks decdrop <<<"$row"
         # 格式串写成一行：Jetson 自带的 mawk 对跨行相邻字符串拼接解析不稳，
         # 会报 "syntax error at or near ,"（gawk 则能过），这里不依赖该用法。
         awk -v label="$label" -v wall="$wall" -v fwd="$fwd" -v fed="$fed" \
-            -v dropped="$dropped" -v sr="$SAMPLE_RATE" \
+            -v dropped="$dropped" -v decdrop="$decdrop" -v sr="$SAMPLE_RATE" \
             -v cap="$STREAM_BUFFER_SECONDS" '
             BEGIN {
                 rate = (wall > 0) ? (fed / sr) / wall : 0
                 lost = dropped / sr
                 gap = fwd - wall
                 expect = (gap > cap) ? gap - cap : 0
+                if (decdrop > 0)
+                    printf "提示：%s 后台解码队列丢弃 %d 块（上限 50，约 %.1f s 音频未参与识别），推理吞吐低于采集。\n", label, decdrop, decdrop * 0.48
                 if (rate < 0.95 && gap < 1.0)
-                    printf "提示：%s 主循环吞吐 %.2f < 1，持续跟不上采集，应减少推理/渲染开销或改为后台解码。\n", label, rate
+                    printf "提示：%s 主循环吞吐 %.2f < 1，持续跟不上采集；解码已在后台，优先减少渲染/前端开销并核对解码队列。\n", label, rate
                 else if (lost > expect + 1.0)
                     printf "提示：%s 主循环吞吐 %.2f；启动阶段预期丢 %.2f s，实际丢 %.2f s，多出的 %.2f s 是主循环期间持续丢的。\n", label, rate, expect, lost, lost - expect
                 else if (lost > 0 && gap > 0)

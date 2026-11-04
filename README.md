@@ -87,7 +87,7 @@ C++ 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐�
 | 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
 | 工具 | `tools/compare_fbank.py` | C++ 与 Python 前端逐点比较 |
 | 工具 | `tools/compare_asr.py` | C++ 与 Python ASR 逐 token 比较 |
-| 工具 | `tools/bench_perf.sh` | 性能基准：离线 RTF / 实时处理率与丢块，CPU 与 CUDA 对比 |
+| 工具 | `tools/bench_perf.sh` | 性能基准：离线 RTF / 实时处理率、取流与后台解码丢块，CPU 与 CUDA 对比 |
 | 资源 | `onnxruntime/` | 项目内托管的 ONNX Runtime；`install/` 不入库，接入方式见 `onnxruntime/README.md` |
 | 资源 | `weight/` | ASR 模型权重与词表（fp32 / int8 两套），本地放置，不入库 |
 | 资源 | `python_ref/` | Python 参考实现（只读基准，不参与 C++ 编译） |
@@ -340,6 +340,9 @@ wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾�
 - **RTF** = 解码耗时 / 音频时长（离线，< 1 快于实时，越小越好）；
 - **主循环吞吐** = 喂入样本 / 16000 / 墙钟秒数（稳态 ≈ 1，> 1 表示正在消化积压）；
 - **丢块时长** = 取流丢弃样本 / 16000 秒（> 0 说明取流缓冲已溢出）；
+- **解码丢弃** = 后台解码队列因满而丢弃的块数（上限 50 块，每块约 480 ms 音频）。
+  取流没丢但这项 > 0，说明推理吞吐低于实时、丢的是识别内容；它衡量「后台解码
+  跟不上」，与取流丢块衡量的「采集/主循环跟不上」是两种不同的落后。
 - **启动积压** = 实际转发秒数 − 墙钟秒数。入口现在先 `init()` 登录、模型加载完
   才 `start()` 开流，正常情况下这项应接近 0；若明显大于 0，说明开流早于主循环，
   取流缓冲（上限 2.56 s）会先溢出，归因丢块时不能直接当成「主循环慢」。
