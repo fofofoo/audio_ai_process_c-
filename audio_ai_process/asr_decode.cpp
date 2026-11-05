@@ -55,8 +55,9 @@
  * 四、跨块必须存活的状态（只有 reset() 才清零）
  * ============================================================
  *   1. encoder 的全部状态张量（实测 116 个）；
- *   2. hyp：已识别出的 token 序列；
+ *   2. recent_tokens_：最近 kRecentTokens 个已确认 token（有界，只服务显示）；
  *   3. 最近一次的 decoder 输出 decoder_out_。
+ * 全量 token 不在这里保存，由调用方累积；本类对外只吐增量。
  *
  * ============================================================
  * 五、收尾：尾部补 100 帧特征域 0
@@ -71,7 +72,7 @@
  * 解码循环的关键顺序（写错不会报错，只会多吐/少吐 token）：
  *   1. 特征缓冲 > T 才出块，取前 T 帧，时间轴前进 decode_chunk_len 帧；
  *   2. encoder 一次吃 T 帧，吐 nf 帧声学编码（运行时值，当前权重 12）；
- *   3. 对 nf 帧逐帧过 joiner，argmax 非 blank 才接进 hyp 并刷新 decoder_out；
+ *   3. 对 nf 帧逐帧过 joiner，argmax 非 blank 才接进 recent_tokens_ 并刷新 decoder_out；
  *   4. blank 帧沿用旧 decoder_out，省掉绝大多数 decoder 前向。
  */
 
@@ -291,8 +292,8 @@ int64_t AsrDecoder::require_int(const std::string& value, const char* key) {
 // ==================== 状态重置 ====================
 
 // 清空全部跨块状态，回到「刚开始听」：
-//   状态张量按构造期保存的形状/类型重新分配并清零；hyp 只留 context_size 个
-//   blank 占位；decoder_out 用这组 blank 重算；特征缓冲与统计清零。
+//   状态张量按构造期保存的形状/类型重新分配并清零；recent_tokens_ 清空；
+//   decoder_out 用全 blank 占位重算；特征缓冲、尾部文本与统计清零。
 // 模型契约、词表都不动，reset 只影响流式状态。
 void AsrDecoder::reset() {
     // 状态张量按构造期模板重新分配，并全部填 0（Python 的 np.zeros）。
@@ -330,18 +331,17 @@ void AsrDecoder::reset() {
         states_.push_back(std::move(value));
     }
 
-    // 假设序列初始只有 context_size 个 blank 占位；先用这组 blank 跑一次
-    // decoder，得到「还没有听到任何字」时的接龙预测。
-    hyp_.assign(static_cast<size_t>(context_size_),
-                static_cast<int64_t>(blank_id_));
-    decoder_out_ = run_decoder(hyp_);
+    // 最近 token 为空；run_decoder 会按 context_size 补满 blank 占位，得到
+    // 「还没有听到任何字」时的接龙预测（结果与旧版 hyp_=[blk,blk] 等价）。
+    recent_tokens_.clear();
+    recent_text_.clear();
+    decoder_out_ = run_decoder(recent_tokens_);
 
-    // 特征缓冲、统计与文本全部清零。
+    // 特征缓冲、统计与尾部文本全部清零。
     feat_buf_.clear();
     n_buffered_ = 0;
     n_chunks_ = 0;
     n_enc_frames_ = 0;
-    text_.clear();
 }
 
 // ==================== 三个会话的低层调用 ====================
@@ -383,20 +383,27 @@ Ort::Value AsrDecoder::run_encoder(Ort::Value x) {
 // 输入 dtype 跟随模型签名（int64 或 int32），不假设一定是 int64。
 // 只保留数值、不保留 Ort::Value：joiner 每次要把两个输入拼成连续数组，
 // 存 float 缓冲比管理一个跨调用存活的 Value 更简单，512 个数的拷贝可以忽略。
-std::vector<float> AsrDecoder::run_decoder(const std::vector<int64_t>& hyp) {
-    // hyp 末尾的 context_size 个 token 就是接龙网络要看的「最近若干字」；
-    // 对应 Python 的 hyp[-self.context_size:]。
-    const size_t begin =
-        hyp.size() >= static_cast<size_t>(context_size_)
-            ? hyp.size() - static_cast<size_t>(context_size_)
-            : 0;
-    const std::vector<int64_t> last(hyp.begin() + begin, hyp.end());
+//
+// recent 只存已确认 token，不含旧版 hyp_ 开头的 blank 占位，因此这里负责补：
+//   recent = []        -> [blk, blk]
+//   recent = [t1]      -> [blk, t1]
+//   recent = [t1, t2]  -> [t1, t2]
+// 结果与旧版「hyp_ 开头两个 blank + 末尾切片」完全等价。
+std::vector<float> AsrDecoder::run_decoder(const std::deque<int64_t>& recent) {
+    // 先铺 context_size 个 blank，再把 recent 末尾最多 context_size 个 token
+    // 覆盖到尾部；不足时开头保留 blank。
+    std::vector<int64_t> last(static_cast<size_t>(context_size_),
+                              static_cast<int64_t>(blank_id_));
+    const size_t take =
+        std::min(recent.size(), static_cast<size_t>(context_size_));
+    std::copy(recent.end() - static_cast<ptrdiff_t>(take), recent.end(),
+              last.end() - static_cast<ptrdiff_t>(take));
 
     // (1, context_size) 的 token id 张量，dtype 跟随 decoder 输入签名。
     const int64_t shape[2] = {1, static_cast<int64_t>(last.size())};
     std::vector<Ort::Value> inputs;
     if (dec_input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-        // 主流导出：int64 与 hyp_ 元素类型相同，直接拷贝。
+        // 主流导出：int64 与 token id 元素类型相同，直接拷贝。
         Ort::Value y =
             Ort::Value::CreateTensor<int64_t>(allocator_, shape, 2);
         std::copy(last.begin(), last.end(), y.GetTensorMutableData<int64_t>());
@@ -461,9 +468,10 @@ Ort::Value AsrDecoder::run_joiner(const float* encoder_frame, size_t frame_dim,
 
 // 喂一块特征：追加进缓冲，按 `buffered > T` 排空能解的块。
 // 每个块：取前 T 帧 → encoder 一次 → 时间轴前进 T_shift 帧 → 逐帧 joiner
-// → 非 blank 才接进 hyp 并刷新 decoder。
-// 只有本轮产生了新 token 才重算文本（与 Python 版一致）。
-std::string AsrDecoder::accept_features(const LogFbankFeatures& feats) {
+// → 非 blank 才接进 recent_tokens_ 并刷新 decoder。
+// 只返回「本次新增」的 token；整段历史由调用方累积。本轮有新 token 时
+// 重算一次 recent_text_（只处理最近 kRecentTokens 个，代价与总时长无关）。
+std::vector<int64_t> AsrDecoder::accept_features(const LogFbankFeatures& feats) {
     // 先校验形状：维度不对或 data 长度与 n_frames × n_mels 不符时越界读取
     // 不会报错，只会静默算出乱码，所以这里直接抛。
     if (feats.n_mels != n_mels_) {
@@ -484,8 +492,8 @@ std::string AsrDecoder::accept_features(const LogFbankFeatures& feats) {
         n_buffered_ += feats.n_frames;
     }
 
-    // n_new：本段音频成功转出的文字数量。
-    int n_new = 0;
+    // 本次调用新确认的 token；按时间顺序返回给调用方。
+    std::vector<int64_t> new_ids;
 
     // 等待缓存帧数大于模型要求的输入帧数 T（当前 61）才出块。
     // 判据必须是严格大于：若写成 >=，批量条件恰好为 48k + T 时会多喂一次。
@@ -548,37 +556,30 @@ std::string AsrDecoder::accept_features(const LogFbankFeatures& feats) {
             }
 
             if (best != blank_id_) {
-                // 预测字不是空白：接进假设 hyp，并用最近 context_size 个 token
-                // 重算 decoder，判断是否重复并预测下一个字，继续向后接龙。
+                // 预测字不是空白：接进 recent_tokens_（超过显示窗口就丢最老），
+                // 并用最近 context_size 个 token 重算 decoder，判断是否重复并
+                // 预测下一个字，继续向后接龙。
                 // blank：什么都不做，沿用上一次的 decoder_out，省掉绝大多数
                 // decoder 前向 —— 这是贪心搜索能跑得快的关键。
-                hyp_.push_back(best);
-                ++n_new;  // 本段音频成功转出的文字数量 +1
-                decoder_out_ = run_decoder(hyp_);
+                recent_tokens_.push_back(best);
+                if (recent_tokens_.size() > kRecentTokens) {
+                    recent_tokens_.pop_front();
+                }
+                new_ids.push_back(best);
+                decoder_out_ = run_decoder(recent_tokens_);
             }
         }
     }
 
-    // 只有本轮吐出过新 token 才重算文本：没有新字时与上次相同，不必重复
-    // 做 token 查表和 detokenize。单独判断也方便以后换成束搜索 —— 束搜索要
-    // 等一个完整的 chunk 结束才能确定文本，同样走这里。
-    if (n_new > 0) {
-        // 有新字吐出：先从 hyp 取已确认的 token（去掉开头 context_size 个
-        // 占位 blank），再逐个查词表转成 token 字符串。
-        const std::vector<int64_t> ids = token_ids();
-        std::vector<std::string> token_strs;
-        token_strs.reserve(ids.size());
-        for (int64_t id : ids) {
-            // 查表失败用 "?" 兜底：词表外的未知 id 不应让整个解码崩溃。
-            const auto it = id2token_.find(id);
-            token_strs.push_back(it != id2token_.end() ? it->second : "?");
-        }
-        // 最后把 token 字符串还原成人类可读文本；▁ 与中英文空格规则
-        // 由 detokenize 内部处理。
-        text_ = detokenize(token_strs);
+    // 只有本轮吐出过新 token 才重算尾部文本：没有新字时与上次相同，不必
+    // 重复做 token 查表和 detokenize。窗口固定为 kRecentTokens，代价有界。
+    if (!new_ids.empty()) {
+        const std::vector<int64_t> window(recent_tokens_.begin(),
+                                          recent_tokens_.end());
+        recent_text_ = text_of(window);
     }
 
-    return text_;
+    return new_ids;
 }
 
 // ==================== 词表与文本还原 ====================
@@ -704,16 +705,28 @@ std::string AsrDecoder::detokenize(const std::vector<std::string>& tokens) const
     return text;
 }
 
-// ==================== 只读信息 ====================
+// ==================== 对外文本接口 ====================
 
-// 返回已确认的 token：hyp_ 开头有 context_size 个 blank 占位，必须跳过。
-// 还没吐出任何字时（hyp_ 长度不超过占位个数）返回空。
-std::vector<int64_t> AsrDecoder::token_ids() const {
-    if (hyp_.size() <= static_cast<size_t>(context_size_)) {
-        return {};
+// 把 token id 序列逐个查表转成 token 字符串。查不到的 id 用 "?" 兜底：
+// 词表外的未知 id 不应让整个解码崩溃。
+std::vector<std::string> AsrDecoder::token_strings_of(
+    const std::vector<int64_t>& ids) const {
+    std::vector<std::string> token_strs;
+    token_strs.reserve(ids.size());
+    for (int64_t id : ids) {
+        const auto it = id2token_.find(id);
+        token_strs.push_back(it != id2token_.end() ? it->second : "?");
     }
-    return std::vector<int64_t>(hyp_.begin() + context_size_, hyp_.end());
+    return token_strs;
 }
+
+// 对任意一段 token 序列做完整 detokenize：查表 → 拼字符串 → ▁ 与中英文
+// 空格规则。段结算、最终文本、token 导出都走这里，保证与旧版 text_ 逐字节一致。
+std::string AsrDecoder::text_of(const std::vector<int64_t>& ids) const {
+    return detokenize(token_strings_of(ids));
+}
+
+// ==================== 只读信息 ====================
 
 // 把构造期读到的关键尺寸打成一包，供入口打印与上层判断。
 AsrDecoder::Info AsrDecoder::info() const {

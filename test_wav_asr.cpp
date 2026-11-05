@@ -341,7 +341,7 @@ int main(int argc, char** argv) {
             static_cast<double>(wav.samples.size()) / wav.sample_rate;
 
         // 4.2 每个 wav 重置前端、解码器与画布，互不影响。
-        //     解码器内部 116 个状态 + hyp + decoder_out 跨块存活，换文件必须
+        //     解码器内部 116 个状态 + recent_tokens_ + decoder_out 跨块存活，换文件必须
         //     reset()，否则上一段的上下文会带进来。
         //     前端 tail_pad_frames=100：收尾解码要用；那 100 帧特征域 0
         //     只喂解码器，不喂可视化（见 4.5）。
@@ -369,6 +369,9 @@ int main(int argc, char** argv) {
         const auto begin = std::chrono::steady_clock::now();
         std::string shown;
         cv::Mat canvas;
+        // 全量 token 的唯一事实来源：解码器只吐增量，本入口自己累积；
+        // 换文件时随后面的 reset() 一起清空。离线入口不分段、不落盘。
+        std::vector<int64_t> all_ids;
 
         // 4.4 主循环：切块 → 预处理 → 可视化 → 推理 → 打印 → 刷新窗口
         //     （对应 Python 第 4 节；C++ 这里外面还多了一层 wav 文件循环）。
@@ -389,10 +392,14 @@ int main(int argc, char** argv) {
                 canvas = view.accept_features(feats);
             }
             // 4.4.4 推理 + 后处理：贪心搜索和跨块状态都在 AsrDecoder 内部。
-            const std::string text = decoder.accept_features(feats);
+            //       解码器只返回本次新增 token，全量历史由本入口累积。
+            const std::vector<int64_t> new_ids = decoder.accept_features(feats);
+            all_ids.insert(all_ids.end(), new_ids.begin(), new_ids.end());
 
-            // 4.4.5 打印：只在文字变化时刷新 stdout（窗口每帧都重画）；
+            // 4.4.5 打印：显示解码器维护的尾部文本窗口（最近 128 个 token），
+            //       只在文字变化时刷新 stdout（窗口每帧都重画）；
             //       补 8 个空格擦掉上一行多出来的尾巴。
+            const std::string text = decoder.recent_text();
             if (text != shown) {
                 shown = text;
                 std::cout << "\r" << text << std::string(8, ' ')
@@ -428,8 +435,12 @@ int main(int argc, char** argv) {
         //     不是静音值），使最后不满一个 chunk 的尾段也能被解码 —— 少了
         //     这一步，最后几个字会被整段丢掉。返回值尾部带着 100 帧 0，
         //     只喂解码器；喂可视化会多一块假亮尾。
-        const std::string final_text =
+        // 收尾同样走增量接口：先把尾块新增的 token 并进 all_ids，再对全量
+        // token 算一次最终文本（与旧版内部 text_ 逐字节一致）。
+        const std::vector<int64_t> tail_ids =
             decoder.accept_features(front.input_finished());
+        all_ids.insert(all_ids.end(), tail_ids.begin(), tail_ids.end());
+        const std::string final_text = decoder.text_of(all_ids);
         const auto end = std::chrono::steady_clock::now();
         const double elapsed =
             std::chrono::duration<double>(end - begin).count();
@@ -448,7 +459,7 @@ int main(int argc, char** argv) {
 
         // 4.6 token 导出 + 统计：音频时长、耗时、RTF、喂入样本 / 产出帧、
         //     encoder 调用次数与 token 数（口径与 Python 5.2 一致）。
-        const std::vector<int64_t> ids = decoder.token_ids();
+        const std::vector<int64_t>& ids = all_ids;
         dump_token_line(dump_out, base_name(wav_path), ids);
 
         std::cout << "\n识别结果：" << final_text << "\n"

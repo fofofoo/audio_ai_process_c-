@@ -9,6 +9,9 @@
 # results/ 只保留目录占位，录音与截图不入库
 /results/*
 !/results/.gitkeep
+# log/ 只保留目录占位，实时转写 asr_last_text.txt 不入库
+/log/*
+!/log/.gitkeep
 
 # ===== 本机维护说明，不入库 =====
 /CLAUDE.md

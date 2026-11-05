@@ -16,8 +16,12 @@
  *
  * 流式状态（跨块存活，只有 reset() 清零）：
  *   1. encoder 的全部状态张量（形状/类型从 ONNX 输入签名推导，动态维填 1）；
- *   2. hyp：已确认的 token 序列（开头含 context_size 个 blank 占位）；
+ *   2. recent_tokens_：最近 kRecentTokens 个已确认 token（不含 blank、不含占位）；
  *   3. decoder_out：最近一次 decoder 输出，blank 帧不刷新。
+ *
+ * 状态有界：不保存整段会话的 token。每次 accept_features() 只返回本次新增的
+ * token id，全量历史由调用方（入口 / AsrSession）自行累积。解码前需要的
+ * context_size 个历史 token 由 recent_tokens_ 提供，不足时补 blank 占位。
  *
  * 与 Python 版逐点对应的不变量：
  *   - 出块判据是 `buffered_frames > T`（严格大于），每块前进 decode_chunk_len 帧；
@@ -33,6 +37,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -69,18 +74,25 @@ public:
     /// 清空全部跨块状态，回到「刚开始听」；模型契约与词表保持不变。
     void reset();
 
+    /// 解码器内部保留的 token 数：只服务 recent_text() 的显示窗口，
+    /// 与 run_decoder() 需要的 context_size 无关。
+    static constexpr size_t kRecentTokens = 128;
+
     /**
      * @brief 喂一块特征，把能解码的都解掉。
      * @param feats 行主序特征 (n_frames, n_mels)，允许 0 帧
-     * @return 当前完整识别文本；没有新 token 时与上次相同
+     * @return 本次新增的已确认 token id，按时间顺序；没有新 token 时为空。
+     *         不含 blank、不含开头 context_size 个占位。
      */
-    std::string accept_features(const LogFbankFeatures& feats);
+    std::vector<int64_t> accept_features(const LogFbankFeatures& feats);
 
-    /// 当前识别文本。
-    const std::string& text() const { return text_; }
+    /// 最近 kRecentTokens 个 token 拼出的尾部文本（有界，供显示）。
+    /// 段边界不 reset 时会自然跨段滚动；显式 reset() 后为空。
+    const std::string& recent_text() const { return recent_text_; }
 
-    /// 已确认的 token id，**不含**开头那 context_size 个占位 blank。
-    std::vector<int64_t> token_ids() const;
+    /// 对给定的 token 序列做一次完整 detokenize（段结算 / 收尾 / 导出用）。
+    /// 纯查表 + 字符串处理，没有推理，可在任意线程调用。
+    std::string text_of(const std::vector<int64_t>& ids) const;
 
     Info info() const;
 
@@ -91,13 +103,15 @@ public:
 private:
     // —— 三个会话的低层调用 ——
     Ort::Value run_encoder(Ort::Value x);
-    std::vector<float> run_decoder(const std::vector<int64_t>& hyp);
+    /// 取 recent 末尾 context_size 个 token，不足补 blank 占位，跑一次 decoder。
+    std::vector<float> run_decoder(const std::deque<int64_t>& recent);
     Ort::Value run_joiner(const float* encoder_frame, size_t frame_dim,
                           const std::vector<float>& decoder_out);
 
     // —— 词表与文本还原 ——
     void load_tokens(const std::string& path);
     int64_t find_blank() const;
+    std::vector<std::string> token_strings_of(const std::vector<int64_t>& ids) const;
     std::string detokenize(const std::vector<std::string>& tokens) const;
 
     // —— 构造期：读 metadata / 输入签名 ——
@@ -148,13 +162,13 @@ private:
 
     // —— 流式状态 ——
     std::vector<Ort::Value> states_;
-    std::vector<int64_t> hyp_;
+    std::deque<int64_t> recent_tokens_;  ///< 最近 kRecentTokens 个已确认 token
+    std::string recent_text_;            ///< recent_tokens_ 对应的尾部文本
     std::vector<float> decoder_out_;   ///< 最近一次 decoder 输出 (1, 512)
     std::vector<float> feat_buf_;   ///< 行主序待解码特征
     int n_buffered_ = 0;            ///< feat_buf_ 里的帧数
     int n_chunks_ = 0;
     int64_t n_enc_frames_ = 0;
-    std::string text_;
     std::map<int64_t, std::string> id2token_;
 };
 

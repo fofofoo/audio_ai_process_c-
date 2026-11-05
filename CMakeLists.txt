@@ -185,6 +185,7 @@ set(audio_ai_process_SOURCES
 if(ORT_FOUND)
     list(APPEND audio_ai_process_SOURCES
         ${AAP_DIR}/asr_decode.cpp
+        ${AAP_DIR}/asr_session.cpp
         ${AAP_DIR}/kws_decode.cpp
     )
 endif()
@@ -359,6 +360,7 @@ set(HK_AUDIO_HEADERS
 
 set(AAP_HEADERS
     ${AAP_DIR}/audio_preprocess.h
+    ${AAP_DIR}/block_worker.h
     ${AAP_DIR}/kws_context_graph.h
     ${AAP_DIR}/spectrogram_image.h
     ${AAP_DIR}/text_utils.h
@@ -367,6 +369,7 @@ set(AAP_HEADERS
 if(ORT_FOUND)
     list(APPEND AAP_HEADERS
         ${AAP_DIR}/asr_decode.h
+        ${AAP_DIR}/asr_session.h
         ${AAP_DIR}/kws_decode.h
     )
 endif()
