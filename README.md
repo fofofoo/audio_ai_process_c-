@@ -41,7 +41,8 @@ SHARED 库，入口只做装配。
    命中后切到完整识别，出现结束语或连续 10 秒没有新 token 再切回监听。唤醒时回填最近
    100 帧特征，避免命令词开头被 chunk 边界吃掉；两个解码器由同一个后台 Worker 串行驱动，
    切换时各自 `reset()`。ASR 段按 64 token 结算并追加 `log/asr_last_text.txt`，
-   窗口底部两行分别显示模式状态与识别文本。
+   窗口底部两行分别显示模式状态与识别文本；`--record` 可在长跑时把音频一并存成
+   `results/kws_asr_<时间戳>.wav`，便于事后回放复现。
 10. **模型自检与数值对拍**：`load_onnx_model.out` 校验三模型加载与 metadata；
    `fbank_dump.out` + `compare_fbank.py`、`--dump-tokens` + `compare_asr.py` 分别做
    逐帧逐 Mel 与逐 token 对拍，保证 C++ 移植没有静默偏移。
@@ -64,7 +65,10 @@ SHARED 库，入口只做装配。
 | 模型加载与契约 | `load_onnx_model.out` | CPU 与 CUDA EP 均通过；`T=61`、`decode_chunk_len=48`、`context_size=2`、`vocab_size=5000` |
 | 设备长时取流 | G.722.1 运行 45 s 组 | 完整交付 46.4 s 音频，回调未中断 |
 | 设备实时识别 | `bench_perf.sh --realtime 20`（Jetson CPU） | 丢块 **0**，启动积压 **−0.34 s**，吞吐 0.99（20 秒场景） |
-| 设备实时双模式 | `test_mic_kws_asr.out --no-window --seconds 60`（WSL2 CPU） | 唤醒 3 次、结束语切回 3 次、回填 300 帧、ASR 47 token、转写 3 段；取流与解码丢块均为 0 |
+| 设备实时双模式（首轮） | `test_mic_kws_asr.out --no-window --seconds 60`（WSL2 CPU） | 唤醒 3 次、结束语切回 3 次、回填 300 帧、ASR 47 token、转写 3 段；取流与解码丢块均为 0 |
+| 设备实时双模式（超时与多轮） | 带窗口 + `--record`，单轮 101 s、多轮 138 s | 单轮静默 10 s 触发 `[超时 10s]` 切回；多轮 3 唤醒 3 切回（2 次结束语 + 1 次超时），每轮文本只含本轮内容，转写 3 行 = 3 段；丢块 0 |
+| 设备实时双模式（长时监听） | 外放视频 336 s，`--seconds 600` | **0 次误唤醒**、0 条接近阈值候选；RSS 367.5 → 367.6 MB（+128 kB）；取流与解码丢块 0 |
+| 转写落盘（连续语音） | 90 s 视频语音，1 次唤醒后不切回 | 472 token / 8 段 / `log/asr_last_text.txt` 8 行，行数 = 段数；段边界不 reset，拼接后无重复无丢字 |
 | wav 识别性能 | `test_wav_asr.out --no-window` | CPU 上 RTF ≈ 0.06（入口结束打印） |
 | 平台 | Linux x86_64 / WSL2、aarch64 / Jetson | 通过；Windows 未实测 |
 
@@ -403,6 +407,9 @@ DISPLAY=:0 ./build/test_mic_kws_asr.out
 ./build/test_mic_kws_asr.out --keywords keywords/kws_keywords.txt
 ./build/test_mic_kws_asr.out --cuda --no-window
 
+# 双模式长跑 + 录音：音频存 results/kws_asr_<时间戳>.wav，便于回放复现
+DISPLAY=:0 ./build/test_mic_kws_asr.out --record --seconds 120
+
 # KWS：默认跑权重包自带 9 条 wav，检查命中集合与流式不变性
 ./build/test_wav_kws.out
 
@@ -716,6 +723,7 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | `KwsAsrSession` | 空闲计时用 `steady_clock` 墙钟，只在 Worker 线程读写；没有新音频时不会执行超时判定 | 与 Python 口径一致；设备断流期间不会自动切回 KWS，恢复后按下一块的新 token 重新计时 |
 | `KwsAsrSession` | 唤醒时回填最近 100 帧，回填音频包含唤醒词本身，ASR 文本开头可能带唤醒词 | 这是为避免命令词开头被 chunk 边界吃掉的折中，不要在后处理里强行删前缀 |
 | `KwsAsrSession` | 结束语判定按 UTF-8 后缀匹配，先剥尾部中英文标点；规则是硬切，不看句义 | 现场话术变化时改 `KwsAsrSessionConfig::end_phrases`，不要改判定逻辑 |
+| 双模式入口 `--record` | 窗口模式按空格暂停会走 `client.stop()`，顺带结束录音，恢复后不续录；窗口退出会停住最后一屏等按键（`--seconds` 到点也一样） | 需要完整录音时用 `--no-window` 或不按暂停；录音失败只告警，不影响识别测试 |
 | 双模式入口 | 两组各三个 ONNX session 同时驻留，Jetson 上内存与加载时间约翻倍；加载仍在设备 `start()` 之前 | 内存紧张时先确认权重包是否必需两套同时加载，或改用 `--initial-asr` 单独调试 |
 | `test_mic_asr.cpp` | 解码在后台线程（`BlockWorker` 有界队列 50 块，满时丢最旧，尾块 `push_final()` 永不丢弃）；`AsrDecoder` / `KwsDecoder` 只被该线程访问，主线程仅在 `finish_and_join()` 后读统计 | 其他入口仍是主循环同步解码；要改就复用 `BlockWorker` + Session，不要在多线程里共享同一个解码器 |
 | 两个 ASR 入口 | Jetson 实测 CUDA EP 反而更慢：每块只编码 61 帧，joiner/decoder 逐帧调用，116 个状态张量每次进出一遍 | 实时场景默认用 CPU；开 `--cuda` 前先用 `tools/bench_perf.sh --cuda` 实测 |

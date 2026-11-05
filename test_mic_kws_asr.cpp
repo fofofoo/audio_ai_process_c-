@@ -37,8 +37,8 @@
  *   - ASR 转写按 64 个 token 结算一段并追加 log/asr_last_text.txt（Python
  *     版没有落盘）；切回 KWS 时先结算尾段再清空本会话文本，转写文件保留。
  *   - 窗口底部优先 FreeType 渲染中文（Python 的 cv2.putText 只支持 ASCII）。
- *   - 新增 --no-window / --cuda / --seconds / --initial-asr / --keywords
- *     五个开关（Python 版配置全写死）。
+ *   - 新增 --no-window / --cuda / --seconds / --initial-asr / --keywords /
+ *     --record 六个开关（Python 版配置全写死）。
  *   - Ctrl+C 用 SIGINT 置标志位、走正常收尾；Python 捕获 KeyboardInterrupt。
  *
  * ============================================================
@@ -78,6 +78,8 @@
  *       初始进入 ASR 模式（调试纯识别行为，等价单模式入口）
  *   ./build/test_mic_kws_asr.out --keywords keywords/kws_keywords.txt
  *       覆盖默认唤醒词文件
+ *   ./build/test_mic_kws_asr.out --no-window --record --seconds 45
+ *       长跑同时把音频录到 results/kws_asr_<时间戳>.wav，便于事后回放复现
  */
 
 #include "audio_ai_process/asr_decode.h"
@@ -98,7 +100,9 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -122,6 +126,19 @@ volatile std::sig_atomic_t g_interrupted = 0;
 
 void on_sigint(int) {
     g_interrupted = 1;
+}
+
+// 生成带时间戳的录音路径，避免多次运行互相覆盖。
+// 格式：results/kws_asr_20261105_153045.wav（本地时间）；采集库内部会把
+// 相对路径转成绝对路径并建目录，这里只负责拼名字。
+std::string make_record_path(const std::string& project_dir) {
+    const std::time_t now_time =
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm local_tm{};
+    localtime_r(&now_time, &local_tm);
+    std::ostringstream name;
+    name << "kws_asr_" << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << ".wav";
+    return join_path(join_path(project_dir, "results"), name.str());
 }
 
 }  // namespace
@@ -216,10 +233,11 @@ int main(int argc, char** argv) {
     constexpr int kIdleWaitMs = 10;
 
     // 1.9 命令行开关。设备地址、模型路径、画布尺寸仍写死在上方，
-    //     命令行只控制「开不开窗口 / 用不用 GPU / 跑多久 / 初始模式 / 唤醒词」。
+    //     命令行只控制「开不开窗口 / 用不用 GPU / 跑多久 / 初始模式 / 唤醒词 / 录音」。
     bool no_window = false;
     bool use_cuda = false;
     bool initial_asr = false;
+    bool record = false;       // 长跑时把取到的音频存 wav，便于回放复现
     double run_seconds = 0.0;  // >0 时到点自动收尾，便于无人值守自检
     std::string keywords_path = kws_keywords_path;
     for (int i = 1; i < argc; ++i) {
@@ -230,6 +248,8 @@ int main(int argc, char** argv) {
             use_cuda = true;
         } else if (arg == "--initial-asr") {
             initial_asr = true;
+        } else if (arg == "--record") {
+            record = true;
         } else if (arg == "--seconds") {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "--seconds 需要一个秒数\n");
@@ -250,11 +270,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "未知参数：%s\n", arg.c_str());
             std::fprintf(stderr,
                          "用法：%s [--no-window] [--cuda] [--seconds 秒数] "
-                         "[--initial-asr] [--keywords 文件]\n",
+                         "[--initial-asr] [--keywords 文件] [--record]\n",
                          argv[0]);
             return 2;
         }
     }
+    // 录音路径在 start() 成功后才生成（含时间戳），失败时保持空表示未录音。
+    std::string record_path;
 
     // Ctrl+C → 标志位 → 主循环正常退出并走收尾（对应 Python 的
     // KeyboardInterrupt 分支）。v2 之后 C++ 标准也保证 signal() 可用。
@@ -410,6 +432,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 3.8.1 可选录音：开流成功后立刻开始写盘，退出时 client.stop() 会自动
+    //       stop_record() 回填 wav 头并改名。录音失败只告警、不中断识别测试：
+    //       录音是辅助手段，不能因为它写不了盘就放弃本轮真机验证。
+    //       注意：窗口模式按空格暂停走 client.stop()，会把录音一并结束且恢复后
+    //       不再续录——需要完整录音时用 --no-window 或不按暂停。
+    if (record) {
+        record_path = make_record_path(project_dir);
+        if (!client.start_record(record_path)) {
+            std::cerr << "[警告] 录音启动失败：" << client.last_error()
+                      << "，继续识别测试\n";
+            record_path.clear();
+        }
+    }
+
     // 3.9 装配会话与 Worker。
     //     AsrSession：全量 token、64 token 分段、log/asr_last_text.txt 落盘。
     //     KwsAsrSession：模式机、回填环、空闲计时、事件与统计。
@@ -506,6 +542,11 @@ int main(int argc, char** argv) {
         std::cout << (i == 0 ? "" : " / ") << kws_asr_cfg.end_phrases[i];
     }
     std::cout << "\n"
+              << "录音  : "
+              << (!record ? std::string("关闭")
+                          : (record_path.empty() ? std::string("启用失败")
+                                                 : record_path))
+              << "\n"
               << "画布  : " << kSpecCols << " 列 x " << asr_info.n_mels
               << " 行 = " << kSpecCols * front.frame_step() / front.sample_rate()
               << " 秒窗口\n"
@@ -765,6 +806,16 @@ int main(int argc, char** argv) {
               << "转写  : " << asr_session.transcript_path()
               << (asr_session.transcript_ok() ? "（每段一行，已 flush）"
                                               : "（写入不可用）")
+              << "\n"
+              << "录音  : "
+              << (!record ? std::string("未启用")
+                          : (record_path.empty()
+                                 ? std::string("启用失败（见启动日志）")
+                                 : record_path + "（" +
+                                       std::to_string(
+                                           static_cast<unsigned long long>(
+                                               stats.recorded_bytes)) +
+                                       " 字节）"))
               << "\n"
               << "取流丢弃 " << static_cast<unsigned long long>(
                      stats.stream_dropped_samples)
