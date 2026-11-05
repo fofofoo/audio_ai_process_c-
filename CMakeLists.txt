@@ -4,8 +4,8 @@
 #  库：
 #    lib_hk_sdk_audio_client.so  麦克风采集：登录、语音转发、G.722.1 解码、
 #                               可选降采样、wav 录制、取流缓冲与统计
-#    lib_audio_ai_process.so     ASR 处理：LogFBank 前端、AsrDecoder（ORT）、
-#                               KWS 关键词前缀树、语谱图与文本渲染
+#    lib_audio_ai_process.so     ASR 处理：LogFBank 前端、AsrDecoder / KwsDecoder
+#                               （ORT）、KWS 关键词前缀树、语谱图与文本渲染
 #
 #  两个库互不 include 对方头文件；组合关系只出现在可执行入口里。
 #
@@ -81,8 +81,8 @@ find_package(Threads REQUIRED)
 #   x86_64  (WSL / PC)       -> onnxruntime-1.23.2
 #   aarch64 (Jetson Orin NX) -> onnxruntime-1.18.0
 #
-# 找不到时只跳过依赖 ORT 的目标（asr_decode.cpp / 三个 ASR 入口），
-# 音频采集、语谱图与 fbank 对拍仍可构建。
+# 找不到时只跳过依赖 ORT 的目标（asr_decode.cpp / kws_decode.cpp 与四个
+# ORT 入口），音频采集、语谱图与 fbank 对拍仍可构建。
 # ---------------------------------------------------------------------
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(ORT_VERSION_DIR "onnxruntime-1.18.0")
@@ -169,9 +169,9 @@ endforeach()
 # =====================================================================
 #  二、ASR 处理库（不依赖 HCNetSDK / 采集库）
 #
-#  LogFBank 前端、AsrDecoder（ORT）、KWS 关键词前缀树、语谱图与文本渲染。
-#  ORT 缺失时跳过 asr_decode.cpp 与三个推理入口，
-#  音频采集、语谱图与 fbank 对拍仍可构建。
+#  LogFBank 前端、AsrDecoder / KwsDecoder（ORT）、KWS 关键词前缀树、
+#  语谱图与文本渲染。ORT 缺失时跳过 asr_decode.cpp / kws_decode.cpp 与四个
+#  ORT 入口，音频采集、语谱图与 fbank 对拍仍可构建。
 # =====================================================================
 set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
 
@@ -183,7 +183,10 @@ set(audio_ai_process_SOURCES
     ${AAP_DIR}/text_renderer.cpp
 )
 if(ORT_FOUND)
-    list(APPEND audio_ai_process_SOURCES ${AAP_DIR}/asr_decode.cpp)
+    list(APPEND audio_ai_process_SOURCES
+        ${AAP_DIR}/asr_decode.cpp
+        ${AAP_DIR}/kws_decode.cpp
+    )
 endif()
 
 set(LIB_DEMOS
@@ -252,6 +255,7 @@ add_executable(test_context_graph.out tools/test_context_graph.cpp)
 # 依赖 ORT 的入口：未安装 ONNX Runtime 时整体跳过
 if(ORT_FOUND)
     add_executable(test_wav_asr.out test_wav_asr.cpp)
+    add_executable(test_wav_kws.out test_wav_kws.cpp)
     add_executable(test_mic_asr.out test_mic_asr.cpp)
     add_executable(load_onnx_model.out load_onnx_model.cpp)
 endif()
@@ -259,7 +263,8 @@ endif()
 # --- 3.2 按依赖分组，用 foreach 统一设置 ---
 # 每个入口只链接自己需要的库：
 #   仅采集库          save_audio_wav
-#   仅 ASR 库         test_spectrogram_cv_wav / fbank_dump / test_wav_asr / load_onnx_model
+#   仅 ASR 库         test_spectrogram_cv_wav / fbank_dump / test_wav_asr /
+#                     test_wav_kws / load_onnx_model
 #   两个库都链接      test_spectrogram_cv_mic / test_mic_asr
 set(EXEC_DEMOS
     save_audio_wav.out
@@ -282,9 +287,11 @@ set(EXEC_LINK_AAP
 )
 
 if(ORT_FOUND)
-    list(APPEND EXEC_DEMOS test_wav_asr.out test_mic_asr.out load_onnx_model.out)
+    list(APPEND EXEC_DEMOS
+        test_wav_asr.out test_wav_kws.out test_mic_asr.out load_onnx_model.out)
     list(APPEND EXEC_LINK_HK test_mic_asr.out)
-    list(APPEND EXEC_LINK_AAP test_wav_asr.out test_mic_asr.out load_onnx_model.out)
+    list(APPEND EXEC_LINK_AAP
+        test_wav_asr.out test_wav_kws.out test_mic_asr.out load_onnx_model.out)
 endif()
 
 foreach(TARGET ${EXEC_DEMOS})
@@ -358,7 +365,10 @@ set(AAP_HEADERS
     ${AAP_DIR}/text_renderer.h
 )
 if(ORT_FOUND)
-    list(APPEND AAP_HEADERS ${AAP_DIR}/asr_decode.h)
+    list(APPEND AAP_HEADERS
+        ${AAP_DIR}/asr_decode.h
+        ${AAP_DIR}/kws_decode.h
+    )
 endif()
 
 # 安装一个模块：头文件 + 自身共享库。
