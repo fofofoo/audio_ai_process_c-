@@ -1,7 +1,7 @@
 # KWS 接入计划与进度
 
-- 状态：B1、B2 已完成；B3 待实施
-- 当前临时插入：ASR 缓存与转写落盘改造（见 `doc/asr_bounded_state_plan.md`），完成后再回到 B3
+- 状态：B1、B2、B3 均已完成（2026-11-05）；实时双模式入口已在真机上跑通
+- 遗留：KWS oracle 对拍、双模式性能基准脚本、负样本扩充（见第五、七节）
 - 相关文档：
   - [BlockWorker 异步处理机制](audio_ai_block_worker.md)
   - [ASR 有界状态与转写落盘改造计划](asr_bounded_state_plan.md)
@@ -29,7 +29,7 @@ KWS 监听 --命中唤醒词--> ASR 识别
 |---|---|---|
 | B1 | 关键词前缀树 `KwsContextGraph` + 单测 | 已完成 |
 | B2 | 束搜索解码器 `KwsDecoder` + 离线 wav 入口 `test_wav_kws.out` | 已完成 |
-| B3 | 设备实时 KWS+ASR 双模式入口 | 待实施 |
+| B3 | 设备实时 KWS+ASR 双模式入口 | 已完成（2026-11-05） |
 
 ---
 
@@ -97,14 +97,14 @@ KWS 监听 --命中唤醒词--> ASR 识别
 - 离线 wav 末尾必须补**样本域**真静音（默认 0.5 秒）；特征域补 0 是 log 能量 1，
   不是静音，不能替代。
 
-**当前限制**
+**交付时的限制（B3 已解除其中第一条）**
 
-- 只有离线 wav 入口，还没有接设备实时麦克风；
+- ~~只有离线 wav 入口，还没有接设备实时麦克风~~ → B3 已补 `test_mic_kws_asr.out`；
 - 还没有和 sherpa-onnx wheel 的 oracle 逐条对拍（`--dump-hits` 已具备导出能力）。
 
 ---
 
-## 三、B3：实时双模式入口（待实施）
+## 三、B3：实时双模式入口（已完成，2026-11-05）
 
 ### 3.1 目标形态
 
@@ -174,9 +174,9 @@ KWS 监听 --命中唤醒词--> ASR 识别
 
 ```cpp
 KwsAsrSession session(asr, kws, cfg);
-BlockWorker<LogfbankFeatures> worker(
+BlockWorker<LogFbankFeatures> worker(
     [&session](const AudioFeatureInput& item) { session.on_block(item); },
-    [](const LogfbankFeatures& f) {
+    [](const LogFbankFeatures& f) {
         return f.n_frames <= 0 || f.data.empty();
     });
 ```
@@ -210,7 +210,8 @@ BlockWorker 的 `Item` 带 `is_tail` 标记，`KwsAsrSession` 在 KWS 模式下�
 
 ### 3.6 关键词文件
 
-计划新增根目录 `keywords/kws_keywords.txt`，三条中文唤醒词沿用 Python 参考实现
+已在仓库根新增 `keywords/kws_keywords.txt`（`test_mic_kws_asr.out` 默认读取，
+`--keywords` 可覆盖），三条中文唤醒词沿用 Python 参考实现
 已验证的配置：
 
 ```
@@ -240,6 +241,47 @@ C++ 侧读取的是生成后的音素行格式：
 - 收尾：KWS 模式忽略 `is_tail`，ASR 模式正常解码尾块；
 - 回归：`test_context_graph.out`、`test_wav_kws.out`、`test_wav_asr.out` 仍通过；
 - 性能：Jetson 上实时处理率、取流丢块、后台队列丢块可观测，不因双模型加载明显掉队。
+
+### 3.8 实施结果（2026-11-05）
+
+**新增 / 改动文件**
+
+- `audio_ai_process/kws_asr_session.h/.cpp`：模式机、100 帧回填环、空闲计时、
+  结束语判定、事件序号与统计；只做业务编排，不碰 ORT / 线程 / 队列。
+- `test_mic_kws_asr.cpp`：设备取流 → 前端 → `BlockWorker` → `KwsAsrSession`，
+  窗口两行状态（模式行 + 文本行），5 个命令行开关照设计落地。
+- `audio_ai_process/asr_session.h/.cpp`：补 `settle_segment()` / `token_count()` /
+  `current_text()` / `clear_history()`，供模式切换使用。
+- `keywords/kws_keywords.txt`：从 `python_ref/keywords/kws_keywords.txt` 复制。
+- `CMakeLists.txt`：库源、安装头文件、入口声明与链接分组同步。
+
+**离线验证（临时验程序，不入库）**
+
+- 唤醒 wav + 0.5 s 真静音 + 语音 wav 组合喂入，结束语设为该 wav 结尾词；
+- 结果：唤醒 1 次、切回 1 次、回填 100 帧、尾块跳过 0 次、转写 1 段，
+  `log/asr_last_text.txt` 行数与段数一致。
+- 回归：`test_context_graph.out` 通过；`test_wav_kws.out` 9 条命中集合与
+  160/1600 块长不变性通过（累计触发 10 次）；`test_wav_asr.out` 四条 wav 文本与
+  改造前一致（27 / 20 / 23 / 32 token）。
+
+**真机 60 秒（x64 / G.722.1 / 16 kHz / int8）**
+
+| 事件 | 内容 |
+|---|---|
+| 唤醒 1 | `小智同学`（avg_prob 0.467222，t=2.8 s）→ 结束语「再见」切回 |
+| 唤醒 2 | `小智同学`（avg_prob 0.657341，t=2.44 s）→ 结束语「再见」切回 |
+| 唤醒 3 | `你好小智`（avg_prob 0.401793，t=0.32 s）→ 结束语「还没结束」误命中「结束」后切回 |
+
+- 统计：ASR encoder 34 次 / 408 帧 / 47 token；KWS encoder 284 次 / 1136 帧 /
+  3 次命中；唤醒 3、切回 3、回填 300 帧、尾块跳过 1 次；
+  取流丢块 0、解码丢块 0、取流缓冲峰值 1。
+- `log/asr_last_text.txt` 恰 3 行，与 3 次 ASR 会话一一对应。
+
+**已知行为**
+
+- 回填包含唤醒词本身，ASR 文本开头常带唤醒词（如「小智同学，……」），属预期；
+- 结束语按后缀硬匹配，第 3 次会话的「还没结束」被判为结束语，说明短语表需要按
+  现场话术收紧（例如改判整句相等，或去掉过于通用的「结束」）。
 
 ---
 
@@ -288,21 +330,25 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
 
 ---
 
-## 五、B3 恢复时的待办与开放问题
+## 五、B3 落地时的口径确认（已完成）
 
-1. **模式切换时如何结算 ASR 段**：已解决——`AsrSession` 提供公开的
-   `settle_segment()`（2026-11-05 补），内部复用 `close_segment()`，不足
-   `segment_tokens` 也结算。`KwsAsrSession` 切回 KWS 时在 **Worker 线程内**
-   调用它（不能与 `on_block()` 并发），再清空回填缓冲、切到 KWS 解码。
-2. **空闲计时的口径**：Python 用 `time.perf_counter()` 距上次新 token 的时间；
-   C++ 可放在 `KwsAsrSession` 里按墙钟计时，`on_block` 有新 token 就刷新。
-   设备无数据时 Worker 不执行 `on_block`，但此时也不存在「用户还在说话」的场景。
-3. **结束语匹配**：去掉尾部空白与中英文标点后 `endswith`；列表是否需要按现场话术调整。
-4. **回填实现**：按帧维护 100 帧的环形缓冲，唤醒时拼成一个 `LogfbankFeatures`
-   喂给 `AsrDecoder`；回填块不经过 Worker，直接在同一线程调用。
-5. **初始模式**：默认 KWS；`--initial-asr` 用于复用原纯 ASR 调试路径。
-6. **关键词文件生成**：C++ 仓库暂不新增生成工具，先复制 Python 侧已生成的
-   `kws_keywords.txt`；后续如果需要现场改唤醒词，再补生成脚本。
+1. **模式切换时如何结算 ASR 段**：`AsrSession` 提供公开的 `settle_segment()`
+   （2026-11-05 补），内部复用 `close_segment()`，不足 `segment_tokens` 也结算。
+   `KwsAsrSession` 切回 KWS 时在 **Worker 线程内**调用它（不能与 `on_block()` 并发），
+   随后 `clear_history()` 清本会话 token，文件与段计数保留。
+2. **空闲计时的口径**：沿用 Python 的「距上次新 token 的墙钟时间」，
+   `KwsAsrSession` 用 `std::chrono::steady_clock` 计时，`on_block` 里发现
+   `token_count()` 增长就刷新。设备无数据时 Worker 不执行 `on_block`，也就不会触发
+   超时判断——此时不存在「用户还在说话」的场景。
+3. **结束语匹配**：去掉尾部空白与中英文标点后做 UTF-8 后缀比较，已按 Python 列表
+   落地（再见 / 拜拜 / 结束 / 退出 / 没事了 / 滚吧 / 滚 / 退下 / 闭嘴 / 退下吧）。
+   真机发现「还没结束」会被判为结束语，短语表需按现场话术收紧，见 3.8。
+4. **回填实现**：按帧维护 100 帧环形缓冲（`ring_` + `ring_head_` + `ring_frames_`），
+   唤醒时按时间顺序拼成一个 `LogFbankFeatures`，直接在同一 Worker 线程调用
+   `AsrSession::on_block()`，不经过队列。
+5. **初始模式**：默认 KWS；`--initial-asr` 从 ASR 起步，用于复用纯 ASR 调试路径。
+6. **关键词文件生成**：仓库根 `keywords/kws_keywords.txt` 已建，内容复制自 Python 侧
+   生成物；C++ 侧仍不引入拼音生成工具，现场改词需要重新跑 Python 生成流程。
 7. **oracle 对拍**：KWS 与 sherpa-onnx wheel 的逐条对拍仍是低优先级待办，
    `--dump-hits` 的 TSV 已具备对拍所需的字段。
 
@@ -336,10 +382,10 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
 |---|---|---|---|
 | B1 | ContextGraph：trie + fail/output 弧 | `kws_context_graph.h/.cpp`、`tools/test_context_graph.cpp` | 完成（`facb499`） |
 | B2 | KeywordSpotter：束搜索 + 触发 + 软重置 | `kws_decode.h/.cpp` | 完成（`c339cd6`） |
-| B3 | 关键词文件运行时加载，不引入拼音库 | 解析 `token... :score #threshold @原文` | 解析能力随 `KwsDecoder` 落地；仓库根 `keywords/` 尚未建 |
+| B3 | 关键词文件运行时加载，不引入拼音库 | 解析 `token... :score #threshold @原文` | 解析能力随 `KwsDecoder` 落地；仓库根 `keywords/kws_keywords.txt` 已建 |
 | B4 | 离线验收入口：9 条自带 wav | `test_wav_kws.cpp` | 完成（`c339cd6`） |
-| B5 | 实时双模式入口 | `test_mic_kws_asr.cpp` | 待实施（即当前 B3） |
-| B6 | CMake + 文档 | `CMakeLists.txt`、README、CLAUDE.md | 部分完成：库与离线入口的 CMake / README 已加；实时入口相关待补 |
+| B5 | 实时双模式入口 | `test_mic_kws_asr.cpp` | 完成（2026-11-05，见第三节） |
+| B6 | CMake + 文档 | `CMakeLists.txt`、README、CLAUDE.md | 完成：库与两个实时入口的 CMake、安装头文件、README 与 CLAUDE.md 已同步 |
 
 ### 7.2 测试单列的版本
 
@@ -348,8 +394,8 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
 - B1：ContextGraph + `test_context_graph.out` —— 完成；
 - B2：KwsDecoder + `test_wav_kws.out` —— 完成；
 - B3：`tools/compare_kws.py`，C++ 与 Python 逐条对拍 —— 未做；
-- B4：`test_mic_kws_asr.out`，真机双模式 —— 待做；
-- B5：回归与文档 —— 待做。
+- B4：`test_mic_kws_asr.out`，真机双模式 —— 完成（2026-11-05）；
+- B5：回归与文档 —— 完成（离线三条回归 + README / CLAUDE.md 同步）。
 
 当前文档统一采用「B1 前缀树、B2 解码器 + 离线入口、B3 实时入口」的简化编号；
 看到旧记录里的 B4 / B5 时，按上表换算即可。
@@ -376,9 +422,10 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
   C++ 侧还没有对应入口，`--dump-hits` 的字段已经够用。
 - **关键词三处一致**：`小智同学` 的 1.5 已在 raw、生成物、调优报告之间统一；
   改词时仍需三处一起核对，C++ 只读生成物，不读 raw。
-- **实时入口统计**：KWS encoder 次数 / 帧数 / 触发次数、ASR token 数、唤醒 / 切回
-  次数、回填帧数、设备丢块、队列丢块，都要在 B3 入口打印。
-- **性能基准**：`tools/bench_perf.sh` 目前只覆盖纯 ASR；双模式入口落地后要补
-  实时处理率与丢块对比。
-- **文档收尾**：B3 完成后删除 README 中「KWS 尚无实时入口」的已知限制，并同步
-  CLAUDE.md 的 KWS 小节与命令表。
+- **实时入口统计**：已完成——`test_mic_kws_asr.out` 打印 KWS encoder 次数 / 帧数 /
+  命中次数、ASR encoder 次数 / 帧数 / token 数、唤醒 / 切回次数、回填帧数、
+  尾块跳过次数、设备丢块与解码丢块。
+- **性能基准**：`tools/bench_perf.sh` 目前只覆盖纯 ASR；双模式入口的实时处理率、
+  两类编码调用与丢块对比尚未纳入脚本。
+- **文档收尾**：已完成——README 的「KWS 尚无实时入口」已替换为 oracle 对拍与
+  性能基准两项遗留，CLAUDE.md 的模块表、命令表与不变量已补双模式小节。

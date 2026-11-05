@@ -37,10 +37,15 @@ SHARED 库，入口只做装配。
    trie 状态；走完整条关键词并攒够尾随 blank 帧后输出命中词、首 token 时间与平均声学概率。
    关键词由文本文件配置（`token... :boost #threshold @原文`），换唤醒词不用重训模型；
    `test_wav_kws.out` 跑权重包自带 9 条 wav（含 3 条负样本），并检查命中集合与块长不变性。
-9. **模型自检与数值对拍**：`load_onnx_model.out` 校验三模型加载与 metadata；
+9. **设备实时双模式（唤醒 + 识别）**：`test_mic_kws_asr.out` 平时只跑关键词唤醒，
+   命中后切到完整识别，出现结束语或连续 10 秒没有新 token 再切回监听。唤醒时回填最近
+   100 帧特征，避免命令词开头被 chunk 边界吃掉；两个解码器由同一个后台 Worker 串行驱动，
+   切换时各自 `reset()`。ASR 段按 64 token 结算并追加 `log/asr_last_text.txt`，
+   窗口底部两行分别显示模式状态与识别文本。
+10. **模型自检与数值对拍**：`load_onnx_model.out` 校验三模型加载与 metadata；
    `fbank_dump.out` + `compare_fbank.py`、`--dump-tokens` + `compare_asr.py` 分别做
    逐帧逐 Mel 与逐 token 对拍，保证 C++ 移植没有静默偏移。
-10. **两个零耦合库与安装**：采集库不依赖 OpenCV / ORT，ASR 库不依赖 HCNetSDK；
+11. **两个零耦合库与安装**：采集库不依赖 OpenCV / ORT，ASR 库不依赖 HCNetSDK；
    两个库互不 include 对方头文件，`cmake --install build` 输出到 `install/<库名>/`。
 
 **一句话亮点：从设备取流、流式前端到中文 ASR、关键词唤醒与实时可视化全链路 C++，ASR 与 Python 参考实现逐位、逐 token 对齐，KWS 沿用同一套解码语义。**
@@ -59,6 +64,7 @@ SHARED 库，入口只做装配。
 | 模型加载与契约 | `load_onnx_model.out` | CPU 与 CUDA EP 均通过；`T=61`、`decode_chunk_len=48`、`context_size=2`、`vocab_size=5000` |
 | 设备长时取流 | G.722.1 运行 45 s 组 | 完整交付 46.4 s 音频，回调未中断 |
 | 设备实时识别 | `bench_perf.sh --realtime 20`（Jetson CPU） | 丢块 **0**，启动积压 **−0.34 s**，吞吐 0.99（20 秒场景） |
+| 设备实时双模式 | `test_mic_kws_asr.out --no-window --seconds 60`（WSL2 CPU） | 唤醒 3 次、结束语切回 3 次、回填 300 帧、ASR 47 token、转写 3 段；取流与解码丢块均为 0 |
 | wav 识别性能 | `test_wav_asr.out --no-window` | CPU 上 RTF ≈ 0.06（入口结束打印） |
 | 平台 | Linux x86_64 / WSL2、aarch64 / Jetson | 通过；Windows 未实测 |
 
@@ -84,6 +90,9 @@ SHARED 库，入口只做装配。
 | ASR 源码 | `audio_ai_process/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
 | KWS 源码 | `audio_ai_process/kws_decode.{h,cpp}` | 流式关键词唤醒：三模型推理、trie 约束的束搜索、尾随 blank 触发判定、静音软重置 |
 | KWS 源码 | `audio_ai_process/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
+| 框架 | `audio_ai_process/block_worker.h` | header-only 异步管家：有界队列 + 单消费者线程，满时丢最旧、尾块阻塞不丢、异常捕获与 join |
+| 双模式源码 | `audio_ai_process/asr_session.{h,cpp}` | ASR 外部长期缓存：全量 token、64 token 分段、转写落盘、显示快照 |
+| 双模式源码 | `audio_ai_process/kws_asr_session.{h,cpp}` | 双模式模式机：KWS ↔ ASR 切换、100 帧回填环、10 秒空闲计时、结束语判定、事件与统计 |
 | ASR 源码 | `audio_ai_process/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
 | ASR 源码 | `audio_ai_process/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
 | ASR 源码 | `audio_ai_process/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
@@ -93,6 +102,7 @@ SHARED 库，入口只做装配。
 | 入口 | `test_wav_asr.cpp` | wav 语音识别入口：文本 +（可选）语谱图与中文识别条 |
 | 入口 | `test_wav_kws.cpp` | wav 关键词唤醒入口：批量跑 wav、打印命中词与时间、检查期望集合与块长不变性；不开窗口 |
 | 入口 | `test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 后台解码 → 文本 + 滚动语谱图（其他入口的线程模型参照此文件） |
+| 入口 | `test_mic_kws_asr.cpp` | 设备实时双模式入口：KWS 监听 → 唤醒 → ASR → 结束语/超时切回；窗口两行状态 |
 | 入口 | `load_onnx_model.cpp` | ASR 三模型加载自检入口 |
 | 工具 | `tools/wav_reader.h` | 最小 RIFF 解析，wav 类入口共用 |
 | 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
@@ -105,6 +115,7 @@ SHARED 库，入口只做装配。
 | 资源 | `python_ref/` | Python 参考实现（只读基准，不参与 C++ 编译） |
 | 资源 | `results/` | 运行产物：录音 wav 与语谱图 png，只提交 `.gitkeep` |
 | 资源 | `log/` | 实时转写 `asr_last_text.txt`（每段一行，启动截断），只提交 `.gitkeep` |
+| 资源 | `keywords/` | 双模式唤醒词文件 `kws_keywords.txt`（由 Python 侧生成物复制，只读生成结果） |
 
 ### 依赖链（谁编译在先）
 
@@ -128,7 +139,7 @@ FreeType 缺失时 `text_renderer` 编译空实现，入口回退 `cv::putText`�
                                                             +--> /32768.0 --> AudioPreprocess
 wav 文件 --tools/wav_reader.h（RIFF 解析）------------------+                      |
                                                                                   v
-                                                                    LogfbankFeatures (n,80)
+                                                                    LogFbankFeatures (n,80)
                                                                                   |
                           +---------------------------+---------------------------+
                           v                           v                           v
@@ -189,9 +200,12 @@ ASR 与 KWS 是两条并列的解码分支，共用同一个前端：前者输�
 | | `finish_and_join()` / `dropped()` / `error()` | 排空并 join / 队列丢弃块数 / Handler 异常 |
 | `audio_ai::AsrSession` | `on_block(input)` / `settle_segment()` / `latest_text()` | 后台线程处理一块特征 / 立即结算当前段（供双模式切换）/ 读显示快照 |
 | | `finish()` / `all_token_ids()` / `n_segments()` | 结算尾段并返回全量文本 / 全量 token / 已结算段数 |
+| | `token_count()` / `current_text()` / `clear_history()` | 双模式用：本会话 token 数 / 全量文本 / 清空本会话历史（保留转写文件与段数） |
 | `audio_ai::KwsDecoder` | `accept_features(feats)` | 喂特征，返回本次新命中的 `KeywordHit`（关键词、token 时间、平均概率） |
 | | `keywords()` / `info()` | 关键词原文列表 / 模型契约与束宽 |
 | | `reset()` / `n_hits()` / `n_chunks()` | 清空束搜索与 encoder 状态 / 累计命中与编码次数 |
+| `audio_ai::KwsAsrSession` | `on_block(input)` / `finish()` | 后台线程处理一块特征（内部按模式分发给 KWS / ASR）/ 收尾并返回最近一次 ASR 文本 |
+| | `snapshot()` / `stats()` | 读模式、文本、事件与计数（短锁）/ 收尾统计（`finish()` 后读） |
 | `audio_ai::Utf8TextRenderer` | `init(path, face_index)` / `draw(...)` | 加载字体 / 把 UTF-8 文本画到 BGR 画布；不可用时回退 `cv::putText` |
 | | `draw_tail(..., max_width)` | 从尾部按像素宽度截断后绘制（累积文本滑动显示，中英混排同样准确） |
 
@@ -377,6 +391,17 @@ DISPLAY=:0 ./build/test_mic_asr.out
 
 # 只打印文本；跑 10 秒自动收尾退出（无人值守自检）
 ./build/test_mic_asr.out --no-window --seconds 10
+
+# 双模式：默认 KWS 监听，说出唤醒词后自动切到识别；q / Esc 退出
+DISPLAY=:0 ./build/test_mic_kws_asr.out
+
+# 双模式自检：只打印事件与文本，跑 20 秒自动收尾
+./build/test_mic_kws_asr.out --no-window --seconds 20
+
+# 双模式：初始进入 ASR（调试纯识别行为）/ 换唤醒词文件 / CUDA EP
+./build/test_mic_kws_asr.out --initial-asr --no-window --seconds 10
+./build/test_mic_kws_asr.out --keywords keywords/kws_keywords.txt
+./build/test_mic_kws_asr.out --cuda --no-window
 
 # KWS：默认跑权重包自带 9 条 wav，检查命中集合与流式不变性
 ./build/test_wav_kws.out
@@ -586,8 +611,10 @@ Jetson 实测丢块从 4.52 s 降到 **0**，启动积压从 6.70 s 降到 **−
 滞后若干块，且推理真的跟不上时会丢弃最早的音频块（统计行「解码丢弃 N 块」）；
 尾块走 `push_final()` 阻塞等空位，绝不丢弃。`AsrDecoder` 明确非线程安全，全程只有
 Worker 线程访问它，主线程在 `finish_and_join()` 之后才读 `n_chunks` /
-`all_token_ids()` 等统计。其他入口仍是主循环同步解码，需要时参照此脚本改造，
-不要在多线程间共享同一个 `AsrDecoder`。
+`all_token_ids()` 等统计。双模式入口 `test_mic_kws_asr.cpp` 复用同一套装配，只把
+Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式切换与文本刷新都在
+这一线程内完成，主线程只读一把短锁保护的快照。其他入口仍是主循环同步解码，需要时
+参照这两个脚本改造，不要在多线程间共享同一个解码器。
 
 **有界解码状态与转写落盘**：`AsrDecoder` 不再保存整段会话的 token，只保留最近
 128 个用于显示；`accept_features()` 返回本次新增 token，全量由 `AsrSession`
@@ -676,8 +703,8 @@ Worker 线程访问它，主线程在 `finish_and_join()` 之后才读 `n_chunks
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
 | `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
-| 两个 ASR 入口 | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
-| 两个带识别文字的入口 | `draw_tail` 底层是 alpha 混合（`dst = dst * (1 - alpha/255)`），同一串字画在已经画过字的像素上会让边缘逐次变深 | `test_mic_asr.cpp` / `test_wav_asr.cpp` 都在画字前先刷白底条（保留首行黑线）；新增入口若复用「缓存画布 + 每轮重画」必须照做，否则文字会一深一浅地闪 |
+| 三个带窗口的识别入口 | 中文字体候选写死 Linux 常见路径（Noto / 文泉驿 / Droid） | 其他平台或精简系统找不到字体时回退 ASCII，中文显示为 `?` |
+| 三个带识别文字的入口 | `draw_tail` 底层是 alpha 混合（`dst = dst * (1 - alpha/255)`），同一串字画在已经画过字的像素上会让边缘逐次变深 | `test_mic_asr.cpp` / `test_mic_kws_asr.cpp` / `test_wav_asr.cpp` 都在画字前先刷白底条（保留首行黑线）；新增入口若复用「缓存画布 + 每轮重画」必须照做，否则文字会一深一浅地闪 |
 | `AsrDecoder` | 非线程安全，跨块状态（116 个状态 + 最近 128 token + `decoder_out`）必须 `reset()` 才能换音频；解码器内部不再保存全量 token | 全量历史由调用方（`AsrSession` / 入口）累积；多文件 / 多路复用时要按流隔离实例或串行调用 |
 | `AsrSession` | 按 token 数硬切段（默认 64），段内可能断在句子中间；txt 一行一段 | 行文本只用于落盘，最终展示与对拍以 `text_of(all_ids)` 为准 |
 | `AsrSession` | 启动时截断 `log/asr_last_text.txt`；写失败只告警一次，不中断解码 | 需要保留历史转写时应在外部拷贝，文件名固定、不带时间戳 |
@@ -685,8 +712,12 @@ Worker 线程访问它，主线程在 `finish_and_join()` 之后才读 `n_chunks
 | `KwsDecoder` / `test_wav_kws.cpp` | 触发要求关键词后至少 2 个 blank 输出帧（80 ms）；KWS 不使用 `input_finished()` 的特征域补 0 | 离线 wav 必须在**样本域**末尾补真静音（默认 0.5 s），否则句末关键词不触发 |
 | `test_wav_kws.cpp` | 非 16 kHz 的 wav 直接判 FAIL、不重采样；不在期望表里的自定义文件只打印命中、不做集合检查 | 送检前先自行重采样到 16 kHz；新增回归样本时同步补 `kExpected` |
 | `KwsDecoder` | 触发阈值与 boosting score 是逐关键词配置的，默认 0.25 / 1.0 | 误触发或漏触发要改关键词文件的 `#threshold` / `:score`，不能靠调全局参数 |
-| KWS | 目前只有离线 wav 入口，尚未接入设备实时麦克风；也没有与 sherpa-onnx wheel 的 oracle 对拍 | 实时双模式与 oracle 对拍在后续计划中，现阶段以期望集合 + 块长不变性验收 |
-| `test_mic_asr.cpp` | 解码在后台线程（`BlockWorker` 有界队列 50 块，满时丢最旧，尾块 `push_final()` 永不丢弃）；`AsrDecoder` 只被该线程访问，主线程仅在 `finish_and_join()` 后读统计 | 其他入口仍是主循环同步解码；要改就复用 `BlockWorker` + `AsrSession`，不要在多线程里共享同一个 `AsrDecoder` |
+| KWS | 实时双模式入口已落地，但还没有与 sherpa-onnx wheel 的 oracle 逐条对拍 | 现阶段以离线期望集合 + 块长不变性 + 真机唤醒验证；`--dump-hits` 的字段可直接用于后续对拍 |
+| `KwsAsrSession` | 空闲计时用 `steady_clock` 墙钟，只在 Worker 线程读写；没有新音频时不会执行超时判定 | 与 Python 口径一致；设备断流期间不会自动切回 KWS，恢复后按下一块的新 token 重新计时 |
+| `KwsAsrSession` | 唤醒时回填最近 100 帧，回填音频包含唤醒词本身，ASR 文本开头可能带唤醒词 | 这是为避免命令词开头被 chunk 边界吃掉的折中，不要在后处理里强行删前缀 |
+| `KwsAsrSession` | 结束语判定按 UTF-8 后缀匹配，先剥尾部中英文标点；规则是硬切，不看句义 | 现场话术变化时改 `KwsAsrSessionConfig::end_phrases`，不要改判定逻辑 |
+| 双模式入口 | 两组各三个 ONNX session 同时驻留，Jetson 上内存与加载时间约翻倍；加载仍在设备 `start()` 之前 | 内存紧张时先确认权重包是否必需两套同时加载，或改用 `--initial-asr` 单独调试 |
+| `test_mic_asr.cpp` | 解码在后台线程（`BlockWorker` 有界队列 50 块，满时丢最旧，尾块 `push_final()` 永不丢弃）；`AsrDecoder` / `KwsDecoder` 只被该线程访问，主线程仅在 `finish_and_join()` 后读统计 | 其他入口仍是主循环同步解码；要改就复用 `BlockWorker` + Session，不要在多线程里共享同一个解码器 |
 | 两个 ASR 入口 | Jetson 实测 CUDA EP 反而更慢：每块只编码 61 帧，joiner/decoder 逐帧调用，116 个状态张量每次进出一遍 | 实时场景默认用 CPU；开 `--cuda` 前先用 `tools/bench_perf.sh --cuda` 实测 |
 | 两个 ASR 入口 | 已改为 `init()` → 模型加载 → `start()`：开流时主循环已就绪，启动阶段不再丢音频 | Jetson 实测丢块 0；若再出现启动积压，先确认 `start()` 是否被提前调用 |
 | 共享库 | 两个库以 SHARED 构建，Linux 下无需导出宏；ORT / OpenCV 不随安装复制 | Windows 构建需补 `__declspec(dllexport)`；部署机需自备 ORT 与 OpenCV 运行库 |
@@ -703,9 +734,9 @@ Worker 线程访问它，主线程在 `finish_and_join()` 之后才读 `n_chunks
 | 中 | CUDA EP 在 Jetson 上比 CPU 慢 1.9 倍 | 离线 RTF 0.5145 vs 0.2713；原因是每块 61 帧、joiner/decoder 逐帧、116 个状态张量反复搬运 | 试 fp16、TensorRT EP、增大编码块或合并小块推理；每次都用 `bench_perf.sh --cuda` 对比 |
 | 中 | PCM 长会话没有自动分段重开 | 已确认 21.5 秒是单次 `StartVoiceCom` 会话上限（重启设备、持久配置后一致）；实测 25 秒 `stop()` → `start()` 后包数与取流恢复，但客户端未自动做 | 在 `HkSdkAudioClient` 内对 PCM 下行每约 20 秒自动重开语音转发；注意与录制收尾、暂停状态和 `StartVoiceCom` 约 1.2 秒阻塞协调 |
 | 中 | 不做自动重连 | 断流后需上层 `stop()` → `start()`，登录会话未失效时不必 `init()` | 加 watchdog：`packets` 一段时间不增长即重连；必须抑制「设备静音不发包」的误判，阈值取设备最长静音间隔 |
-| 中 | KWS 尚无实时入口 | 离线链路（trie + `KwsDecoder` + `test_wav_kws.out`）已通，设备流还没接 | 参照 `python_ref/test_mic_kws_asr.py` 增加「KWS 唤醒成功 → 切 ASR，ASR 静默 10 s / 结束语 → 切回 KWS」的主循环；切换时两个解码器各自 `reset()`，前端保持连续 |
-| 低 | KWS 没有 oracle 对拍 | `--dump-hits` 已能导出关键词 / 首 token 时间 / 平均概率，但还没和 sherpa-onnx wheel 逐条比较 | 移植 `python_ref/test_kws_oracle_mini.py` 的做法，对拍 TSV 的关键词与时间戳 |
-| 低 | 仓库自有唤醒词文件未落地 | C++ 入口目前只读权重包自带的 `test_wavs/keywords.txt`，不能改 `weight/` | 增加仓库级 `keywords/kws_keywords.txt`（运行时只读），入口默认指向它，权重包文件保留作回归基准 |
+| 中 | 双模式缺少性能基准 | `bench_perf.sh` 只解析 ASR 入口的统计行，`test_mic_kws_asr.out` 暂未纳入 | 补脚本分支：解析双模式入口的唤醒 / 切回 / 回填 / 两类编码调用，比较 KWS 长时监听与 ASR 段的 CPU 占用 |
+| 低 | KWS 没有 oracle 对拍 | 实时双模式已落地，但 `--dump-hits` 导出的关键词 / 首 token 时间 / 平均概率还没和 sherpa-onnx wheel 逐条比较 | 移植 `python_ref/test_kws_oracle_mini.py` 的做法，对拍 TSV 的关键词与时间戳 |
+| 低 | 唤醒词文件只在双模式入口可换 | 仓库级 `keywords/kws_keywords.txt` 已建，`test_mic_kws_asr.out` 默认读它并支持 `--keywords`；离线 `test_wav_kws.out` 仍读权重包自带的 `test_wavs/keywords.txt` | 给离线入口也加 `--keywords`，默认保持权重包文件作回归基准 |
 | 低 | 启动失败报错时机 | `init()` 的登录/编码错误能立即报；`StartVoiceCom` 失败要等模型加载完才报 | 若现场更在意早报错，可在 `init()` 后追加一次「起流 → 立即停流」探测，代价是约 1.2 秒 |
 | 低 | 没有单元测试框架 | 全靠对拍脚本与自检入口，依赖人工执行 | 把 `compare_fbank.py`、`compare_asr.py` 与三个自检入口接入 CI |
 | 低 | Windows 未实机验证 | 目录与链接路径已配置，共享库缺导出宏 | 补 `__declspec(dllexport)` 后在 Windows 上走一遍构建与冒烟 |

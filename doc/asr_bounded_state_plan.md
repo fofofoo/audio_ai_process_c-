@@ -29,7 +29,7 @@
 ```
 入口 main
  ├─ 持有 Ort::Session / AsrDecoder          （模型与解码）
- ├─ 持有 BlockWorker<LogfbankFeatures>       （线程 / 队列 / 背压）
+ ├─ 持有 BlockWorker<LogFbankFeatures>       （线程 / 队列 / 背压）
  └─ 持有 AsrSession                          （token 累积、分段、落盘、快照）
 
 worker 线程：BlockWorker -> AsrSession::on_block -> decoder.accept_features
@@ -55,7 +55,7 @@ class AsrDecoder {
 public:
     /// 本次新增的已确认 token，按时间顺序；没有新 token 时返回空。
     /// 不含 blank、不含开头 context_size 个占位。
-    std::vector<int64_t> accept_features(const LogfbankFeatures& feats);
+    std::vector<int64_t> accept_features(const LogFbankFeatures& feats);
 
     /// 最近 kRecentTokens 个 token 拼出的尾部文本（有界，供显示）。
     const std::string& recent_text() const;
@@ -155,7 +155,7 @@ std::vector<int64_t> segment_ids;  // 当前段的 token
 ### 4.3 AsrSession 接口
 
 ```cpp
-using AudioFeatureInput = BlockWorker<LogfbankFeatures>::Item;
+using AudioFeatureInput = BlockWorker<LogFbankFeatures>::Item;
 
 struct AsrSessionConfig {
     size_t segment_tokens = 64;  // 当前段满 64 个 token 就结算
@@ -267,12 +267,12 @@ public:
 入口装配：
 
 ```cpp
-using AudioFeatureInput = BlockWorker<LogfbankFeatures>::Item;
+using AudioFeatureInput = BlockWorker<LogFbankFeatures>::Item;
 
 AsrSession session(decoder, cfg);
-BlockWorker<LogfbankFeatures> worker(
+BlockWorker<LogFbankFeatures> worker(
     [&session](const AudioFeatureInput& item) { session.on_block(item); },
-    [](const LogfbankFeatures& f) {
+    [](const LogFbankFeatures& f) {
         return f.n_frames <= 0 || f.data.empty();
     });
 ```

@@ -91,6 +91,20 @@ void AsrSession::on_block(const AudioFeatureInput& item) {
 // close_segment()，所以段计数、落盘、清空语义完全一致。
 void AsrSession::settle_segment() { close_segment(); }
 
+// 当前会话文本：全量 token 走解码器唯一的 detokenize 入口，规则与落盘一致。
+std::string AsrSession::current_text() const {
+    return decoder_.text_of(all_ids_);
+}
+
+// 清空本会话历史：调用方（双模式）已经先结算过当前段，这里只丢累积状态，
+// 不动转写文件、不清 n_segments_ —— 段计数与 txt 行数必须保持一一对应。
+void AsrSession::clear_history() {
+    all_ids_.clear();
+    segment_ids_.clear();
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.clear();
+}
+
 // 主线程随时可读；锁内只做一次字符串拷贝，不等待推理。
 std::string AsrSession::latest_text() const {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);

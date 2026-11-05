@@ -86,6 +86,19 @@ public:
     /// 只能在 Worker 线程或 join 之后调用，不能与 on_block() 并发。
     void settle_segment();
 
+    /// 当前会话累计的 token 数（不含已清空的历史）。
+    /// 双模式用它判断「这一块有没有产出新 token」；只能 Worker 线程调用。
+    size_t token_count() const { return all_ids_.size(); }
+
+    /// 当前会话的全量文本（text_of(all_ids_)）。
+    /// 双模式用它做结束语判定；只能 Worker 线程或 join 之后调用。
+    std::string current_text() const;
+
+    /// 清空本会话的 token 历史与显示快照，转写文件与段计数保留。
+    /// 双模式切回 KWS 时调用：先把当前段 settle_segment() 落盘，再清历史，
+    /// 下一次唤醒从空文本重新累积。只能 Worker 线程或 join 之后调用。
+    void clear_history();
+
     /// 显示快照：解码器最近 kRecentTokens 个 token 的文本（有界）。
     std::string latest_text() const;
 

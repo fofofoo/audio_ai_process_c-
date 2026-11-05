@@ -9,10 +9,12 @@
 代码细节不是重点，理解这套分工和扩展方式才是。
 
 > **代码位置**：`audio_ai_process/block_worker.h`（header-only 模板，随
-> `lib_audio_ai_process` 安装）；单模式 Session 在 `asr_session.h/.cpp`。
+> `lib_audio_ai_process` 安装）；单模式 Session 在 `asr_session.h/.cpp`，
+> 双模式 Session 在 `kws_asr_session.h/.cpp`。
 >
-> **状态**：已落地。`test_mic_asr.cpp` 已用 `BlockWorker` + `AsrSession` 替换
-> 原来的 `AsrWorker`；双模式入口 `test_mic_kws_asr.cpp` 待实施时复用同一套装配。
+> **状态**：已落地。`test_mic_asr.cpp` 用 `BlockWorker` + `AsrSession` 替换了
+> 原来的 `AsrWorker`；`test_mic_kws_asr.cpp` 复用同一套装配，Session 换成
+> `KwsAsrSession`（2026-11-05 完成，真机跑通）。
 
 ---
 
@@ -29,7 +31,7 @@
       │ PCM16
       ▼
 ③ AudioPreprocess（LogFBank）
-      │ LogfbankFeatures (n, 80)
+      │ LogFbankFeatures (n, 80)
       ├────────────────────────────────┐
       ▼                                ▼
 ④ SpectrogramImage        ⑤ BlockWorker 音频特征输入队列
@@ -65,7 +67,7 @@ PCM16；PCM 下行的 32 kHz 数据会在采集库内部降采样到 16 kHz。wa
 ### ② 前端：把 PCM 变成特征
 
 `AudioPreprocess` 接收任意长度的 PCM 块，做分帧、预加重、加窗、FFT、Mel 滤波和
-取 log，输出 `LogfbankFeatures`：一个 `n × 80` 的行主序矩阵，每行是一帧、每列是
+取 log，输出 `LogFbankFeatures`：一个 `n × 80` 的行主序矩阵，每行是一帧、每列是
 一个 Mel 频带。
 
 前端是流式的：这次没凑满一帧的样本留在内部缓存里，下次接着凑。所以每次拿到的
@@ -99,7 +101,7 @@ PCM16；PCM 下行的 32 kHz 数据会在采集库内部降采样到 16 kHz。wa
 主线程调用 `worker.push(块)`，把这一块特征放进 **音频特征输入队列**——这是 Worker
 内部唯一的那条有界队列，专门承载「喂给音频处理能力的输入」，不是通用的消息队列，
 也不承载输出。队列里的一项叫**音频特征输入块**，包含两样东西：前端产出的特征块
-（`LogfbankFeatures`），以及一个「是否为收尾块」的标记。后续无论接 ASR、KWS 还是
+（`LogFbankFeatures`），以及一个「是否为收尾块」的标记。后续无论接 ASR、KWS 还是
 新的音频能力，输入都统一成这个形状。
 
 投递有三个约定。
@@ -407,7 +409,7 @@ Worker 做的是一组看起来琐碎、但漏一条就会出问题的并发工�
 
 ```cpp
 TextSnapshot asr_text;
-BlockWorker<LogfbankFeatures> worker(
+BlockWorker<LogFbankFeatures> worker(
     [&decoder, &asr_text](const Item& item) {
         asr_text.set(decoder.accept_features(item.block));
     });
@@ -417,7 +419,7 @@ BlockWorker<LogfbankFeatures> worker(
 
 ```cpp
 KwsAsrSession session(asr, kws, ...);
-BlockWorker<LogfbankFeatures> worker(
+BlockWorker<LogFbankFeatures> worker(
     [&session](const Item& item) { session.on_block(item); });
 ```
 
@@ -440,8 +442,8 @@ public:
 其中 `AudioFeatureInput` 就是音频特征输入队列里的一项：
 
 ```cpp
-using AudioFeatureInput = BlockWorker<LogfbankFeatures>::Item;
-// { LogfbankFeatures block; bool is_tail; }
+using AudioFeatureInput = BlockWorker<LogFbankFeatures>::Item;
+// { LogFbankFeatures block; bool is_tail; }
 ```
 
 单模式 `AsrSession` 的实际形态（已落地）：
@@ -580,9 +582,11 @@ BlockWorker<TtsRequest> worker(
 退出全部保留。变化的只是把「线程 + 队列」从 ASR 专用的 `AsrWorker` 里抽出来，
 变成任何能力都能复用的 `BlockWorker`，并把单模式的 lambda 收进 `AsrSession`。
 
-迁移分两步：先做纯重构（Worker + AsrSession，行为不变），再做双模式入口。第一步
+迁移分两步：先做纯重构（Worker + AsrSession，行为不变），再做双模式入口。两步都
 已完成：`test_mic_asr.cpp` 的输出文本、后台丢弃统计、尾块处理与改造前一致，另增加
-按 64 token 分段落盘。若第二步在真机上出问题，可以单独保留这一步。
+按 64 token 分段落盘；`test_mic_kws_asr.cpp` 在真机上跑通唤醒 → ASR → 结束语/超时
+切回，取流与解码丢块均为 0。两步互相独立：若双模式入口在别的设备上出问题，单模式
+入口仍可单独保留。
 
 一句话总结：
 

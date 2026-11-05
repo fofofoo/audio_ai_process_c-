@@ -186,6 +186,7 @@ if(ORT_FOUND)
     list(APPEND audio_ai_process_SOURCES
         ${AAP_DIR}/asr_decode.cpp
         ${AAP_DIR}/asr_session.cpp
+        ${AAP_DIR}/kws_asr_session.cpp
         ${AAP_DIR}/kws_decode.cpp
     )
 endif()
@@ -258,6 +259,7 @@ if(ORT_FOUND)
     add_executable(test_wav_asr.out test_wav_asr.cpp)
     add_executable(test_wav_kws.out test_wav_kws.cpp)
     add_executable(test_mic_asr.out test_mic_asr.cpp)
+    add_executable(test_mic_kws_asr.out test_mic_kws_asr.cpp)
     add_executable(load_onnx_model.out load_onnx_model.cpp)
 endif()
 
@@ -289,10 +291,12 @@ set(EXEC_LINK_AAP
 
 if(ORT_FOUND)
     list(APPEND EXEC_DEMOS
-        test_wav_asr.out test_wav_kws.out test_mic_asr.out load_onnx_model.out)
-    list(APPEND EXEC_LINK_HK test_mic_asr.out)
+        test_wav_asr.out test_wav_kws.out test_mic_asr.out
+        test_mic_kws_asr.out load_onnx_model.out)
+    list(APPEND EXEC_LINK_HK test_mic_asr.out test_mic_kws_asr.out)
     list(APPEND EXEC_LINK_AAP
-        test_wav_asr.out test_wav_kws.out test_mic_asr.out load_onnx_model.out)
+        test_wav_asr.out test_wav_kws.out test_mic_asr.out
+        test_mic_kws_asr.out load_onnx_model.out)
 endif()
 
 foreach(TARGET ${EXEC_DEMOS})
@@ -370,6 +374,7 @@ if(ORT_FOUND)
     list(APPEND AAP_HEADERS
         ${AAP_DIR}/asr_decode.h
         ${AAP_DIR}/asr_session.h
+        ${AAP_DIR}/kws_asr_session.h
         ${AAP_DIR}/kws_decode.h
     )
 endif()
