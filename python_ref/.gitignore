@@ -7,6 +7,10 @@
 #   git clone https://github.com/k2-fsa/sherpa-onnx.git sharpa-onnx
 /sharpa-onnx/
 
+# ===== 唤醒词录制样本 =====
+# tools/record_keywords.py 生成，是个人录音，只在本地用于调阈值
+/recordings/
+
 # ===== 数据集音频 =====
 # wav 体积大，用 data/aishell1_subset/download_aishell1_subset.py 重新拉取；
 # CSV / JSON / README 保留入库（CSV 是本仓库改过的 UTF-8 版）

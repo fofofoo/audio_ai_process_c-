@@ -61,6 +61,7 @@ import cv2
 
 from src.audio_preprocess import AudioPreprocess
 from src.asr_decode import AsrDecoder
+from src.cv_text import fit_text_tail
 from src.mic_client import MicClient, list_devices
 from src.spectrogram_image import SpectrogramImage
 import onnxruntime as ort
@@ -69,7 +70,7 @@ import onnxruntime as ort
 PROVIDERS = ["CPUExecutionProvider"]    #"CUDAExecutionProvider",
 
 # 麦克风设备：None = 系统默认输入设备；也可以写设备编号（如 1）或设备名
-MIC_DEVICE = None
+MIC_DEVICE = 3
 
 # 语谱图窗口：400 列 x 10ms = 4 秒滚动窗口；底部 56px 用来画识别结果
 SPEC_COLS = 400
@@ -129,7 +130,7 @@ def main():
     # ========================================================
     # 1.连接麦克风
     # ========================================================
-    # list_devices()        # 想看本机有哪些设备，把这一行取消注释
+    list_devices()        # 想看本机有哪些设备，把这一行取消注释
     device = normalize_device(MIC_DEVICE)
 
     # 初始化麦克风客户端：
@@ -213,7 +214,9 @@ def main():
                     sys.stdout.write("\r%s" % text.ljust(72))
                     sys.stdout.flush()
                 # 4.6 识别结果画到底部白条，再显示（putText 只支持 ASCII）
-                cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+                #     文本按画布宽度裁掉开头的旧字，保证刚说的内容始终可见
+                draw_text = fit_text_tail(text, cv_frame.shape[1] - 16)
+                cv2.putText(cv_frame, draw_text, (8, cv_frame.shape[0] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0),
                             1, cv2.LINE_AA)
                 cv2.imshow(SPEC_WINDOW, cv_frame)
@@ -244,7 +247,8 @@ def main():
     text = asr_decoder.accept_features(preprocessor.input_finished())
     # 最后一屏按当前缓存重画（不喂补 0 特征），把完整识别结果写到底部
     cv_frame = spec_view.frame()
-    cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+    draw_text = fit_text_tail(text, cv_frame.shape[1] - 16)
+    cv2.putText(cv_frame, draw_text, (8, cv_frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.imshow(SPEC_WINDOW, cv_frame)
     # 5.3 正常退出，统计结果

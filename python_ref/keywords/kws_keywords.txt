@@ -1,0 +1,6 @@
+# 自动生成，请勿手改 —— 改 keywords/kws_keywords_raw.txt 后重跑：
+#   python -I tools/gen_keywords.py --force
+# 词表：sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
+x iǎo zh ì t óng x ué :1.5 #0.3 @小智同学
+x iǎo zh ì x iǎo zh ì :1.5 #0.3 @小智小智
+n ǐ h ǎo x iǎo zh ì :1.5 #0.35 @你好小智

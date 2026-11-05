@@ -44,7 +44,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 常用命令
 
 ```bash
-# 实时麦克风：OpenCV 滚动语谱图 + 识别文字
+# 实时麦克风：先唤醒，再识别 + OpenCV 滚动语谱图
+python -I test_mic_kws_asr.py
+
+# 实时麦克风：纯识别（不含唤醒），与下面 wav 入口同构
 python -I test_mic_asr_mini.py
 
 # wav 识别（与上者同构，输入换成文件）
@@ -53,12 +56,22 @@ python -I test_wav_asr_mini.py
 # 只看 wav 的滚动语谱图（不加载 onnx）
 python -I test_spectrogram_cv_mini.py
 
+# 离线 KWS：跑模型自带的 9 条 wav，检查命中关键词与时间戳
+python -I test_wav_kws_mini.py
+
+# ContextGraph 单测：搬上游 gtest 的 4 组期望值，不需要 onnx
+python -I test_context_graph_mini.py
+
+# KWS 解码头对拍（开发期，需 pip install sherpa-onnx）
+python -I test_kws_oracle_mini.py
+
 # 打包（不含 weight/、sharpa-onnx/、wav 等被 .gitignore 排除的项）
 git archive --format=zip --output=audio_ai_process.zip HEAD
 ```
 
-不收命令行参数：onnx 与词表路径、执行器、麦克风设备都硬编码在入口文件顶部。
-没有测试框架，验证方式就是跑上面三个入口；只想确认链路正常，跑 `test_wav_asr_mini.py`。
+不收命令行参数：两组 onnx 与词表路径、执行器、麦克风设备、初始模式都硬编码在入口
+文件顶部。没有测试框架，验证方式就是跑上面的入口；只想确认 ASR 链路正常，跑
+`test_wav_asr_mini.py`；只确认 KWS 链路正常，跑 `test_wav_kws_mini.py`。
 
 ## 架构
 
@@ -77,6 +90,7 @@ git archive --format=zip --output=audio_ai_process.zip HEAD
 |---|---|
 | `src/audio_preprocess.py` | 显式逐帧的自研前端：分帧、逐帧预加重、povey 窗、FFT、Mel 滤波、log。维护跨块样本尾巴 |
 | `src/asr_decode.py` | 三个 session 的贪心搜索 + 文本还原；`accept_features()` 维护特征缓冲、encoder 状态、`hyp`、`decoder_out` |
+| `src/kws_decode.py` | KWS：关键词 trie + 束搜索 + 触发判定；`accept_features()` 返回本次命中的 `KeywordHit` 列表 |
 | `src/mic_client.py` | PortAudio 回调采集；`get_last_audio()` 取走自上次调用以来累积的**全部**样本 |
 | `src/spectrogram_image.py` | 特征 → BGR 滚动语谱图画布（viridis），自带特征缓存与色阶标定 |
 
@@ -105,6 +119,38 @@ git archive --format=zip --output=audio_ai_process.zip HEAD
 - **116 个 encoder 状态张量 + `hyp` + 最近一次 `decoder_out` 必须跨块存活**，除 `reset()` 外绝不清零。状态初值由 ONNX 输入签名自动推导（字符串维按 batch=1 取 1），换模型不用改代码。
 - 文本还原：`▁`(U+2581) 转空格后，CJK 之间、全角标点前后的空格去掉，但 **CJK 与 ASCII 之间的空格要保留**（`是 Monday` 不能粘成 `是Monday`）。
 - **可视化路径的前端要传 `tail_pad_frames=0`**。补出来的 100 帧 0 在语谱图上是一块比静音还亮的假色块，只该喂解码器。
+
+## 关键词唤醒（KWS）分支
+
+`test_mic_kws_asr.py` 有两套模式，默认从 KWS 开始：
+
+```
+KWS --命中唤醒词--> ASR
+ASR --10s 无新 token 或解出结束语--> KWS
+```
+
+同一时刻只有一个解码器吃特征；切换时双方 `reset()`，`AudioPreprocess` 始终连续。
+`INITIAL_MODE = MODE_ASR` 可退回原来的纯 ASR 行为。
+
+- **模型**：`weight/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20`，默认 chunk-8。
+  263 个音素级 token（CMU 音素 + 部分拼音），`context_size=2`，输出 40 ms/帧。
+- **唤醒词**：`keywords/kws_keywords.txt`，格式 `token... [:boost] [#threshold] @原文`。
+  改唤醒词改这个文件；`weight/` 里的原始文件只读。
+- **KWS 的 blank 硬编码为 0**，`<unk>` 也按 blank 处理。空白假设的 token 历史是
+  `[-1] * (context_size-1) + [0]`，**`-1` 是 ONNX Gather 的合法负索引，不要 clamp**。
+- **这个模型的 joiner 要二维输入** `(N, 320)`，不是常规的 `(N, 1, 320)`。以 onnx
+  输入签名为准，`run_joiner()` 已按二维实现。
+- **触发需要关键词后至少 2 个 blank 输出帧**（`num_trailing_blanks=1`，判定是
+  `>`）。离线跑 wav 必须在末尾补真静音（本项目补 0.5 s），否则句子末尾的关键词
+  不触发；麦克风流是连续的，不存在这个问题。
+- **静音 1.5 s 会软重置**（保留未消费的特征尾巴，重置 encoder 状态与 beam），
+  对齐 C++ `DecodeStreams`。
+- 解码器逐行移植自 `sharpa-onnx/csrc/{context-graph,transducer-keyword-decoder}.cc`
+  和 `keyword-spotter-transducer-impl.h`，后续转 C++ 时可直接对照。
+
+验证：`test_context_graph_mini.py`（trie，4 组上游期望值）、`test_wav_kws_mini.py`
+（9 条自带 wav；其中 `zh_0~2` 是负样本）、`test_kws_oracle_mini.py`（与
+sherpa-onnx wheel 对拍，关键词与时间戳一致）。
 
 ## 前端对齐的既有结论
 

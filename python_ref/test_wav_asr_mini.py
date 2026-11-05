@@ -58,6 +58,7 @@ import cv2
 
 from src.audio_preprocess import AudioPreprocess
 from src.asr_decode import AsrDecoder
+from src.cv_text import fit_text_tail
 from src.spectrogram_image import SpectrogramImage
 import onnxruntime as ort
 
@@ -205,7 +206,9 @@ def main():
             sys.stdout.write("\r%s" % text.ljust(72))
             sys.stdout.flush()
         # 4.7 识别结果画到底部白条，再显示 + 处理按键（putText 只支持 ASCII）
-        cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+        #     文本按画布宽度裁掉开头的旧字，保证刚说的内容始终可见
+        draw_text = fit_text_tail(text, cv_frame.shape[1] - 16)
+        cv2.putText(cv_frame, draw_text, (8, cv_frame.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
         cv2.imshow(SPEC_WINDOW, cv_frame)
         key = cv2.waitKey(1) & 0xFF
@@ -221,7 +224,8 @@ def main():
     text = dec.accept_features(front.input_finished())
     # 最后一屏按当前缓存重画（不喂补 0 特征），把完整识别结果写到底部
     cv_frame = spec_view.frame()
-    cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+    draw_text = fit_text_tail(text, cv_frame.shape[1] - 16)
+    cv2.putText(cv_frame, draw_text, (8, cv_frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.imshow(SPEC_WINDOW, cv_frame)
     # 5.2 统计结果

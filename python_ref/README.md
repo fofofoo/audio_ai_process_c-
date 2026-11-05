@@ -2,12 +2,13 @@
 
 中文流式语音识别（streaming zipformer2 transducer）的**纯 Python 复现** —— mini 版。
 
-这个分支只做一件事：把底层 ASR 讲清楚、跑起来。前端用自研的传统实现
-（numpy）产出模型输入，推理与后处理用 `onnxruntime`，再配一个 OpenCV 语谱图窗口。
-不依赖 sherpa-onnx 运行时，只保留底层 ASR 与一个 OpenCV 窗口。
+这个分支把底层语音链路讲清楚、跑起来：**ASR**（中文流式识别）与 **KWS**
+（关键词唤醒）两条流水线，共用同一套自研前端（numpy），推理用 `onnxruntime`，
+再配一个 OpenCV 语谱图窗口。不依赖 sherpa-onnx 运行时。
 
-模型：`sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05`
-（int8 量化，中英混合，自带标点）
+- ASR 模型：`sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05`
+  （int8 量化，中英混合，自带标点）
+- KWS 模型：`sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20`（3M 参数，音素级词表）
 
 ---
 
@@ -22,6 +23,7 @@
 | 实时链路峰值负载（单次喂 encoder / 喂间隔） | **6 ~ 9%** |
 | 模型会话加载耗时 | ≈ 1.5 s |
 | 端到端运行时依赖 | `onnxruntime` + `numpy` + `soundfile` + `sounddevice` + `opencv-python` |
+| KWS 离线验收（9 条自带 wav） | 关键词集合全部符合期望，负样本零误触发；与 sherpa-onnx wheel 对拍**时间戳偏差 0 ms** |
 
 `kaldi_native_fbank` 只在开发期当「数值标尺」用，证明自研前端是对的——
 **交付形态不依赖它**。
@@ -46,10 +48,17 @@ kaldi_native_fbank 1.22.3   # 仅数值对拍需要，不是运行时依赖
 权重目录放在 `weight/` 下（脚本会自动找：目录里同时有 `tokens.txt` 和 `encoder*.onnx` 即可）。
 
 ```bash
-python -I test_mic_asr_mini.py        # 实时麦克风 → 识别文字 + 滚动语谱图
+python -I test_mic_kws_asr.py         # 实时麦克风 → 先唤醒，再识别 + 滚动语谱图
+python -I test_mic_asr_mini.py        # 实时麦克风 → 纯识别（不唤醒）
 python -I test_wav_asr_mini.py        # wav 文件 → 识别文字 + 滚动语谱图
+python -I test_wav_kws_mini.py        # wav 文件 → 命中的关键词（离线 KWS）
 python -I test_spectrogram_cv_mini.py # 只看 wav 的语谱图，不加载 onnx
 ```
+
+`test_mic_kws_asr.py` 默认先进入关键词唤醒模式，命中唤醒词后切到完整 ASR；
+把入口顶部的 `INITIAL_MODE` 改成 `MODE_ASR` 即可退回纯 ASR 行为。
+`test_mic_asr_mini.py` 是不含唤醒的纯 ASR 入口，与 `test_wav_asr_mini.py` 同构，
+只把输入从 wav 换成麦克风。
 
 识别结果用 `print` 原地刷新，同时用 `cv2.putText` 画在语谱图底部的白条上
 （该函数只支持 ASCII，中文会显示为问号，终端输出不受影响）。
@@ -74,29 +83,36 @@ git archive --format=zip --output=audio_ai_process.zip HEAD
 
 ```
 audio_ai_process/
-├── test_mic_asr_mini.py       ← 实时麦克风（OpenCV 语谱图 + 识别文字）
+├── test_mic_kws_asr.py        ← 实时麦克风（唤醒 + 识别 + 语谱图）
+├── test_mic_asr_mini.py       ← 实时麦克风（纯识别，不唤醒）
 ├── test_wav_asr_mini.py       ← wav 识别（与上面同构，输入换成文件）
+├── test_wav_kws_mini.py       ← 离线 wav 关键词唤醒（自带 9 条样本验收）
+├── test_context_graph_mini.py ← 关键词 trie 单测（搬上游 gtest，不需要 onnx）
+├── test_kws_oracle_mini.py    ← 与 sherpa-onnx wheel 对拍（开发期）
 ├── test_spectrogram_cv_mini.py ← 只看 wav 的滚动语谱图（不加载 onnx）
 ├── src/                       ← 自包含的 mini 实现（学习 / C++ 移植用）
 │   ├── audio_preprocess.py       波形块 → LogFBank 特征
 │   ├── asr_decode.py             特征 → 文本（贪心搜索）
+│   ├── kws_decode.py             特征 → 命中的关键词（束搜索 + trie）
 │   ├── mic_client.py             回调采集 + get_last_audio()
 │   └── spectrogram_image.py      特征 → BGR 滚动语谱图画布（OpenCV）
+├── keywords/                  ← 仓库自有的唤醒词文件（运行时只读）
 ├── data/                      ← aishell1 子集（train/test CSV + wav），离线样本来源
-├── doc/                       ← 调研报告与工作流报告
+├── doc/                       ← 调研报告、工作流报告与 KWS 接入方案
 ├── weight/                    ← ONNX 权重（自行下载放置）
 └── sharpa-onnx/               ← sherpa-onnx 上游源码（只作阅读参考，不参与运行）
 ```
 
-三个入口都只是「配置 + 数据源」：装配 `AudioPreprocess` / `AsrDecoder` /
-`SpectrogramImage`，然后按块喂数据。三个类互不知道对方的存在，靠特征矩阵相连。
+入口脚本都只是「配置 + 数据源」：装配 `AudioPreprocess` / `AsrDecoder` /
+`KeywordSpotter` / `SpectrogramImage`，然后按块喂数据。这些类互不知道对方的存在，
+只靠特征矩阵相连。
 
 ---
 
 ## 预处理特征工程：从波形到 80 维 LogFBank
 
 模型不直接吃波形，吃的是每 10 ms 一帧、80 维的对数 Mel 能量。这一章讲这套特征怎么算、
-每个参数为什么这么取；与 kaldi 逐项对齐的修复过程见[核心实现·一](#一前端把-kaldi-口径一项项抠出来)。
+每个参数为什么这么取；与 kaldi 逐项对齐的修复过程见[核心实现·一](#一预处理前端把-kaldi-口径一项项抠出来)。
 
 ### 1. 为什么是这套流程
 
@@ -174,7 +190,7 @@ audio_ai_process/
 ## ASR 模型结构与数据流
 
 这一节按「输入 → 输出」把模型串起来：每一段吃什么、吐什么、形状怎么变、状态存在哪。
-贪心搜索的代码细节见后面[二、解码](#二解码transducer-贪心搜索)。
+贪心搜索的代码细节见后面[二、ASR 解码](#二asr解码transducer-贪心搜索)。
 
 ### 1. 端到端数据流
 
@@ -298,9 +314,54 @@ decoder 前向的原因。
 
 ---
 
+## 双模式：唤醒 + 识别（`test_mic_kws_asr.py`）
+
+入口脚本把两条链路接成一个「先说唤醒词、再说话」的实时程序。同一时刻只有一个
+解码器吃特征，切换时双方 `reset()`，而 `AudioPreprocess` 始终连续，特征时间轴不断。
+
+```
+mic.get_last_audio()                      ← PortAudio 回调累积的全部样本
+  │
+  ▼
+preprocessor.accept_waveform(samples)     → feats (n, 80)
+  │
+  ├──► spec_view.accept_features(feats) → cv2.imshow（每帧都画，不看模式）
+  │
+  └──► 按当前 mode 分派
+         │
+         ├─ MODE_KWS：keyword_spotter.accept_features(feats)
+         │     ├ 无命中 → 继续听
+         │     └ 命中 → asr_decoder.reset()
+         │              回填最近 100 帧特征（让命令开头不被 chunk 边界吃掉）
+         │              mode = MODE_ASR，打印 [唤醒] <keyword>
+         │
+         └─ MODE_ASR：asr_decoder.accept_features(feats)
+               ├ token 数增加 → 刷新 last_activity
+               └ 结束语 或 空闲 > 10 s
+                     → asr_decoder.reset()
+                       keyword_spotter.reset()
+                       mode = MODE_KWS，打印 [切回]
+```
+
+几个设计点：
+
+- **回填 100 帧（约 1 s）**：唤醒词末尾和命令开头之间可能横跨 chunk 边界，不回填会
+  吃掉第一个音节。代价是 ASR 文本开头可能带出唤醒词本身；不想要就把
+  `ASR_BACKFILL_FRAMES` 设为 0。
+- **切回条件**：结束语（`END_PHRASES`，默认「再见 / 拜拜 / 结束 / 退出 / 没事了」，
+  比对前先去掉尾部标点）优先，其次 10 s 没有新 token（`ASR_IDLE_TIMEOUT`）。
+- **收尾不对称**：退出时若在 ASR 模式，仍要补尾帧 + 100 帧特征域 0，否则最后几个字
+  丢失；若在 KWS 模式，什么都不用补。
+- 窗口底部状态条用 ASCII（`KWS | listening` / `ASR | ...`），中文识别结果以控制台为准。
+
+所有开关都在入口文件顶部的「运行配置」一节：`INITIAL_MODE`（设为 `MODE_ASR` 可退回
+原来的纯 ASR 行为）、`ASR_IDLE_TIMEOUT`、`END_PHRASES`、`ASR_BACKFILL_FRAMES`。
+
+---
+
 ## 核心实现
 
-### 一、前端：把 kaldi 口径一项项抠出来
+### 一、预处理前端：把 kaldi 口径一项项抠出来
 
 以 `kaldi_native_fbank` 的输出为 ground truth（它与模型训练时的前端一致）。初版实现
 在 hamming 窗下偏差 `max|Δ| = 10.44`、`mean|Δ| = 0.92`，定位到七项差异后逐项修复：
@@ -327,7 +388,7 @@ decoder 前向的原因。
 >
 > 详细推导见 [工作流报告 第三节](doc/sherpa-onnx-ASR预处理及后处理工作流报告.md)。
 
-### 二、解码：transducer 贪心搜索
+### 二、ASR解码：transducer 贪心搜索
 
 三个 ONNX 各开一个 `InferenceSession`，`intra_op`/`inter_op` 线程数都为 1。
 
@@ -364,7 +425,166 @@ while start + T < n_feat_frames:            # T = 61
 文本还原要处理 `▁`（U+2581，词首标记）：转空格后，**CJK 之间**的空格、**全角标点前后**的
 空格要去掉，但 **CJK 与 ASCII 之间**的空格要保留（`是 Monday` 不能粘成 `是Monday`）。
 
-### 三、流式：同一份代码维护跨块状态
+### 三、束搜索：每帧保留 4 条路径
+
+KWS 的贪心搜索不够用：263 个音素级 token 里，很多发音相近（`zh`/`z`、前后鼻音），
+argmax 一旦在关键词中段选错，后面的帧再准也救不回来。束搜索用「多留几条候选、
+最后一刻再判」换稳定性，代价是每帧多算几条路径。
+
+**一条假设**（`_Hypothesis`）除了 token 序列，还挂五样东西：
+
+| 字段 | 含义 |
+|---|---|
+| `ys` | token 序列；前 `context_size - 1` 个是占位符 `-1`，最后一个是 blank |
+| `timestamps` | 第 i 个非 blank token 出现在哪个输出帧 |
+| `ys_probs` | 第 i 个 token 在那一帧的**声学概率**（不是 log 概率），触发判定用 |
+| `log_prob` | 整条路径的累计分（log 域） |
+| `context_state` | 这条路径当前落在 trie 的哪个节点 |
+| `num_trailing_blanks` | 末尾连续 blank 输出帧数，判断关键词是否已说完 |
+
+同一个 token 序列的两条路径会合并（key 是 `tuple(ys)`），分数用
+`log(exp(a) + exp(b))` 相加——这是 log 域的加法，对应「两条路径都通向同一个假设，
+概率应当累加」。
+
+**每帧六步**（`KeywordSpotter._decode_frames`，对照 `transducer-keyword-decoder.cc`）：
+
+```
+prev = 当前 beam 的全部假设（≤ 4 条）
+  │
+  ① decoder([h.ys[-2:] for h in prev])            → (H, 320)
+  ② joiner(当前 encoder 帧复制 H 份, decoder_out)  → (H, 263)
+  ③ log_softmax 每行，加上各假设的 log_prob
+  ④ 在 H × 263 个候选里取全局 top-4
+       非 blank/unk → 追加 token、记时间戳与概率、走一步 trie
+       blank/unk   → 只把 num_trailing_blanks 加一
+  ⑤ 按 token 序列合并（log-sum-exp）
+  ⑥ 取最佳假设做触发判定
+```
+
+几个和贪心搜索相反的地方：
+
+- **decoder 每帧都要跑**，而且一次喂 H 条历史。贪心搜索可以因为「blank 不刷新
+  decoder」省掉大部分调用，束搜索不行：blank 候选本身的分数也要算，否则没法比较
+  「继续听」和「出下一个音素」哪条路径更优。
+- **joiner 输入是批量的**。这个模型的 joiner 只要二维 `(N, 320)`，所以把当前
+  encoder 帧复制 H 份后直接拼成 `(H, 320)`；ASR 的 joiner 则是 `(1, 1, 512)` 的三维
+  单帧。
+- **每个候选都要走一次 trie**。贪心只给唯一的 argmax 走 trie，束搜索要给 4 条候选
+  分别推进各自的 `context_state`。
+
+**触发判定**（在第 ⑥ 步）：
+
+```
+best = 累计分最高的假设
+matched, node = trie.is_matched(best.context_state)
+if matched
+   and best.num_trailing_blanks > 1        # 关键词后至少 2 个 blank 输出帧
+   and mean(best.ys_probs[:node.level]) >= node.ac_threshold
+then 触发
+```
+
+三个条件缺一不可：trie 说「这条路径已经走完某个关键词」，blank 说「这个词已经说
+完了、后面是停顿」，平均概率说「这条路径的声学证据足够强」。`node.level` 是该关键词
+的 token 数；这里取 `ys_probs` 的**前** `level` 个求平均（C++ 的做法），单一关键词
+场景下 `ys_probs` 恰好只有 `level` 个元素。
+
+触发后只把 beam 重置成一条空白假设，**encoder 状态继续累积**——唤醒词之后紧接着
+说话时，声学上下文不用重来。
+
+### 四、唤醒词机制：原文 → token → 触发参数
+
+上一节是「拿到 token 后怎么判定触发」；这一节补前半段：人写的唤醒词怎样变成
+解码器能用的发音序列。完整推导见
+[调研报告](doc/sherpa-onnx-KWS关键词唤醒调研报告.md)。
+
+> **生成与调参只在 Python 侧实现。** C++ 部署只消费生成好的 `keywords.txt`，
+> 运行时做「符号 → id」查表，不移植 `text2token`，也不装注音库。
+
+开集 KWS 不是分类器：通用音素模型不动，靠解码器里的前缀树把输出约束到给定发音
+序列，增删关键词不重训。它对应语音里的 lexicon——闭集把词典写进模型，开集把词典
+当运行时参数传入。
+
+所以可以切成两个阶段：生成侧（离线）做 G2P，把原文查表成音素符号；识别侧（运行时）
+只把符号换成 id。两侧共用的不是某本词典，而是 `tokens.txt` 的符号列；交接物只有
+`keywords.txt` 一行文本。中文拆「声母 + 带调韵母」，声调写在韵母上；英文查 CMU
+词典，`0/1/2` 是重音等级。
+
+每条关键词可带两个参数，各管一头：
+
+| 参数 | 作用 | 方向 |
+|---|---|---|
+| `:score` | 摊到 trie 各节点，影响束搜索排序 | 越大越容易**走到** |
+| `#threshold` | 只看纯声学平均概率 | 越大越**难认下** |
+
+`0.0` 是「未设置」哨兵，回落到全局默认（1.0 / 0.25）。调参从默认值开始，用
+`KWS_DEBUG` 收集「走到末端但没过阈值」的分数，在正负样本之间取值；经验上阈值
+通常不是瓶颈。换唤醒词只改文件，C++ 不用改——两边契约是文件格式，不是生成器代码。
+
+### 五、关键词前缀树：把「只认这几个词」写进状态
+
+263 词表的束搜索仍然可以吐出任意音素序列。让结果收敛到关键词上的，是每条假设挂着
+的那个 trie 状态：走得上关键词前缀的路径被加分，走不上的立刻回到根、清空历史。
+
+**节点**（`_ContextState`）与 C++ 的 `ContextState` 逐字段对应：
+
+| 字段 | 含义 |
+|---|---|
+| `token` | 到达本节点消耗的 token id；根节点是 `-1` |
+| `token_score` | 这条边的 boosting score |
+| `node_score` | 从根走到本节点的累计 score |
+| `output_score` | 若本节点或 fail 链上构成关键词，能拿到的输出奖励 |
+| `level` | 本节点在所属关键词里的序号（1-based） |
+| `is_end` / `phrase` / `ac_threshold` | 关键词结尾标记、原文、触发阈值 |
+| `next` | `{token_id: 子节点}` |
+| `fail` / `output` | 失配跳转节点、fail 链上最近的 end 节点 |
+
+**构建**（`_build`）。逐条把 token 序列插进树，公共前缀复用节点。多个关键词共享
+前缀时，边的分数取较大值（`token_score = max(...)`），该节点的 `node_score` 按新
+分数重算；只有关键词最后一个 token 的节点才置 `is_end`、`output_score`、`phrase`
+和 `ac_threshold`。
+
+**fail 链与 output 弧**（`_fill_fail_output`）。建完树后 BFS 一遍，给每个节点找
+「失配时能接上当前 token 的最长后缀节点」。`output` 沿 fail 链指到最近的 end 节点，
+并把那个 end 节点的 `output_score` 加进来。它解决的是「走到一半才发现前面已经完整
+说出了一个短关键词」的情况：
+
+以 `HE` / `SHELL` / `THEM` 三条关键词为例：
+
+```
+根 ├─ H ── E                 HE   (end)
+   ├─ S ── H ── E ── L ── L  SHELL (end)
+   └─ T ── H ── E ── M       THEM (end)
+```
+
+走到 `T H E` 时，`THE` 节点本身不是任何关键词的结尾，但它的 fail 链指向 `H E`
+（`HE` 的结尾节点），output 弧就把 `HE` 报出来。失配同理：走到 `S H` 后输入一个
+不在 `next` 里的 token，沿 fail 链回退到能接它的最长后缀节点，继续走。失配不是
+「回根重来」，而是回退到仍可能匹配的最长后缀。
+
+**走一步**（`forward_one_step`）：
+
+1. 在 `next` 里查得到 → 沿边走，`score = 子节点.token_score`；
+2. 查不到 → 沿 `fail` 链回退，`score = 新节点.node_score - 旧节点.node_score`。
+   因为是往浅处回退，这个值通常为负：相当于把之前走过、但不属于新匹配的分数扣掉；
+3. 返回值再加 `node.output_score`，即这条边带来的 boosting 奖励；
+4. 返回 `(score, new_state, matched_state)`。解码器默认 `strict_mode=True`；
+   上游单测里的非 strict 模式会「命中即回根、一次结算」，只用于对拍。
+
+**回根即清空**。如果走完一步后 `new_state` 是根（`token == -1`），说明当前 token
+不属于任何关键词前缀，这条路径的 `ys` 会被重置成空白假设
+`[-1] * (context_size - 1) + [0]`，时间戳和概率一并清空。这是 C++ 的原意
+（「start matching from the start state」）——关键词匹配不是自由转写，不允许在
+关键词之外积累上下文。
+
+> `-1` 不是笔误也不是哨兵：ONNX `Gather` 支持负索引，`-1` 取的是词表最后一行。
+> 照抄 C++，**不要 clamp 成 0**。
+
+**验证**。`test_context_graph_mini.py` 把上游 `context-graph-test.cc` 的 4 组
+用例原样搬了过来（strict / 非 strict × 默认分 / 自定义分），用 9 条互为前后缀的
+字符串压 fail 链和 output 弧，逐项比对累计分数；另外用真实的 `tokens.txt` +
+`keywords.txt` 校验 10 条关键词的解析结果。这个脚本不需要 onnx。
+
+### 六、流式装配：同一份代码维护跨块状态
 
 mini 版没有另写一套流式实现，而是让每个类自己保管跨块状态：
 
@@ -395,7 +615,7 @@ mini 版没有另写一套流式实现，而是让每个类自己保管跨块状
 积压解完。它也不会卡住采集：麦克风在 PortAudio 回调线程里独立缓冲（上限约 2.56 s），
 主循环慢下来时下一次 `get_last_audio()` 会把积压一次性取走。
 
-### 四、可视化：特征 → BGR 画布
+### 七、可视化：特征 → BGR 画布
 
 `SpectrogramImage` 只接收特征、不碰波形，与 `AsrDecoder` 只接收特征是同一个边界。
 每块特征进来后：
@@ -409,7 +629,7 @@ mini 版没有另写一套流式实现，而是让每个类自己保管跨块状
 可视化路径的前端要传 `tail_pad_frames=0`：那 100 帧补出来的 0 在图上是一块比静音还亮的
 假色块，只该喂解码器，不该喂给眼睛。
 
-### 五、ASR 模型的音频输入格式与处理方式
+### 八、ASR 模型的音频输入格式与处理方式
 
 这一节说明模型对音频输入的要求。核心结论：前端参数（25 ms 帧长、10 ms 帧移、80 个 Mel、
 povey 窗……）不是自由设计，而是**照着模型训练时的特征口径复刻**。权重里没有写死这些数字，
@@ -466,7 +686,7 @@ povey 窗……）不是自由设计，而是**照着模型训练时的特征口
 | 改成 25 ms 窗 + 25 ms 帧移（零重叠）行不行？ | 不行。帧率与所有按帧计数的参数（`T`、chunk、压缩比、KV cache、卷积核）都会错位。 |
 | 和 GPT 的 token 有什么不同？ | 文本是离散切分、天然不重叠；语音是连续波形，短时分析必然产生重叠。 |
 
-### 六、输入块长与帧率解耦：10 ms、40 ms 还是任意长度
+### 九、输入块长与帧率解耦：10 ms、40 ms 还是任意长度
 
 `AudioPreprocess.accept_waveform()` 不假设「一次调用 = 一块 10 ms 音频」。它只根据
 **累计已喂入的样本数**决定当前能产出几帧，所以块长只影响特征「打包」的节奏，不影响
@@ -530,7 +750,7 @@ n − keep_from < 400 个样本（< 25 ms）      # 与块长、运行时长都�
 > 对 C++ 库的启示：外部系统按任意大小的 PCM 块调用即可。库内部只要把「喂入样本数 →
 > 可出帧数」的判据用**绝对样本索引**表达，就不必要求固定块长，也不必为不同块长各写一套逻辑。
 
-### 七、流式客户端的设计
+### 十、流式客户端的设计
 
 流式数据处理的核心是一个**缓存池**：输入端不断往里写，输出端先规定需要的数据包大小；
 只要缓存池里的累计数据超过一个包，就从池里一次性打捞走所有满足条件的数据，并在搬走的
@@ -560,7 +780,7 @@ n − keep_from < 400 个样本（< 25 ms）      # 与块长、运行时长都�
 
 - encoder 每次吃 61 帧，但时间轴只前进 48 帧，多出的 13 帧是下一次输入的重叠上下文。
 - 判据是 `len(_feat_buf) > 61`（**严格大于**）。写成 `>=` 会在恰好 `48k + 61` 帧时多喂
-  一次；它与批量解码严格等价的推导见[三、流式](#三流式同一份代码维护跨块状态)。
+  一次；它与批量解码严格等价的推导见[六、流式装配](#六流式装配同一份代码维护跨块状态)。
 - 每轮取前 61 帧喂 encoder，然后删掉最老的 48 帧（`_feat_buf[48:]`），留下 13 帧等拼接。
 - 同样是 `while` 排空：主循环一次取回多块音频时，一次调用里会连着喂多次 encoder，
   把积压解完。
@@ -604,9 +824,14 @@ n − keep_from < 400 个样本（< 25 ms）      # 与块长、运行时长都�
 ```
 src/audio_preprocess.py   AudioPreprocess   波形块 → LogFBank 特征
 src/asr_decode.py         AsrDecoder        特征 → 文本（贪心搜索）
+src/kws_decode.py         KeywordSpotter    特征 → 命中的关键词（束搜索 + trie）
 src/mic_client.py         MicClient         回调采集 + get_last_audio()
 src/spectrogram_image.py  SpectrogramImage  特征 → BGR 滚动语谱图画布（numpy + OpenCV）
 ```
+
+两个解码器刻意不做成一个类：输出契约（文本 vs 事件）、搜索方式（贪心 vs 束搜索）
+和词表都不同，拆开后也正好对应上游 `transducer-greedy-search-decoder.cc` 与
+`transducer-keyword-decoder.cc` 两个编译单元。
 
 `get_last_audio()` 取走的是自上次调用以来累积的**全部**样本，而不是只取最新一块：
 只保留「最新一块」会让两次拉取之间的语音出现断口，去直流和预加重会把断口当突变，
@@ -616,11 +841,12 @@ Mel 谱错乱、吞字。波形连续无损比单次延迟更重要。
 
 ## 验证
 
-三个入口都能直接跑；只想确认前端与解码链路是否正常，跑一次 wav 入口即可
+所有入口都能直接跑；只想确认前端与解码链路是否正常，跑一次 wav 入口即可
 （权重包自带 `test_wavs/`）：
 
 ```bash
 python -I test_wav_asr_mini.py          # 前端 + 解码 + 可视化
+python -I test_wav_kws_mini.py          # KWS：9 条自带 wav，关键词集合必须与期望一致
 python -I test_spectrogram_cv_mini.py   # 只看前端产出的语谱图
 ```
 
@@ -682,3 +908,6 @@ python -I test_spectrogram_cv_mini.py   # 只看前端产出的语谱图
 |---|---|
 | [工作流报告](doc/sherpa-onnx-ASR预处理及后处理工作流报告.md) | 模型契约、七项前端差异的完整推导、解码链路、流式等价性证明、全部实测数据 |
 | [部署调研报告](doc/sherpa-onnx-ASR部署调研报告.md) | 调用路径与可行性调研 |
+| [KWS 接入方案](doc/KWS接入方案.md) | 模型事实、解码器设计、关键词生成、模式状态机与实施记录 |
+| [KWS 调研报告](doc/sherpa-onnx-KWS关键词唤醒调研报告.md) | 词表解剖、两级字典（text2token / EncodeKeywords）、声调编码规则、解码约束、选词与阈值 |
+| [KWS 唤醒词设置与参数调优报告](doc/KWS唤醒词设置与参数调优报告.md) | 正式唤醒词的生成流程、录制与评估工具、7 组参数实测、未命中诊断与选词建议 |
