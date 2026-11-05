@@ -68,12 +68,13 @@ C++ 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐�
 | 类别 | 路径 | 一句话职责 |
 | --- | --- | --- |
 | 库 | `lib_hk_sdk_audio_client.so` | 麦克风采集：登录、语音转发、G.722.1 解码、可选降采样与 wav 录制、取流缓冲与统计；不依赖 OpenCV/ORT |
-| 库 | `lib_audio_ai_process.so` | ASR 处理：LogFBank 前端、`AsrDecoder`（ORT 三模型）、语谱图、文本渲染；不依赖 HCNetSDK |
+| 库 | `lib_audio_ai_process.so` | ASR 处理：LogFBank 前端、`AsrDecoder`（ORT 三模型）、KWS 关键词前缀树、语谱图、文本渲染；不依赖 HCNetSDK |
 | 采集源码 | `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 设备连接与音频流水线 |
 | 采集源码 | `hk_mic_client/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），PCM 32 kHz → 16 kHz；零外部依赖 |
 | 采集源码 | `hk_mic_client/hk_sdk/` | 厂商 HCNetSDK 头文件与预编译库（按平台分目录） |
 | ASR 源码 | `audio_ai_process/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
 | ASR 源码 | `audio_ai_process/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
+| KWS 源码 | `audio_ai_process/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
 | ASR 源码 | `audio_ai_process/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
 | ASR 源码 | `audio_ai_process/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
 | ASR 源码 | `audio_ai_process/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
@@ -87,6 +88,7 @@ C++ 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐�
 | 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
 | 工具 | `tools/compare_fbank.py` | C++ 与 Python 前端逐点比较 |
 | 工具 | `tools/compare_asr.py` | C++ 与 Python ASR 逐 token 比较 |
+| 工具 | `tools/test_context_graph.cpp` | KWS 前缀树单测：上游 4 组 gtest 期望值 + phrase/threshold/output 弧字段自检，不需要权重与 ORT |
 | 工具 | `tools/bench_perf.sh` | 性能基准：离线 RTF / 实时处理率、取流与后台解码丢块，CPU 与 CUDA 对比 |
 | 资源 | `onnxruntime/` | 项目内托管的 ONNX Runtime；`install/` 不入库，接入方式见 `onnxruntime/README.md` |
 | 资源 | `weight/` | ASR 模型权重与词表（fp32 / int8 两套），本地放置，不入库 |
@@ -104,7 +106,8 @@ FreeType（可选） ────────┘                             │
                                                        └── test_spectrogram_cv_mic / test_mic_asr 同时链接两个库
 ```
 
-ORT 缺失时 `asr_decode.cpp` 与三个 ASR 入口自动跳过；FreeType 缺失时
+ORT 缺失时 `asr_decode.cpp` 与三个 ASR 入口自动跳过；`kws_context_graph.cpp`
+与 `test_context_graph.out` 不依赖 ORT，仍可构建。FreeType 缺失时
 `text_renderer` 编译空实现，入口回退 `cv::putText`。
 
 ### 数据流（谁把数据给谁）
@@ -280,6 +283,9 @@ DISPLAY=:0 ./build/test_mic_asr.out
 
 # 只打印文本；跑 10 秒自动收尾退出（无人值守自检）
 ./build/test_mic_asr.out --no-window --seconds 10
+
+# KWS 关键词前缀树单测：不需要权重 / ORT，通过时返回 0
+./build/test_context_graph.out
 ```
 
 WSLg 下如果窗口打不开，先确认 `DISPLAY=:0`；环境里可能残留无效的远程 `DISPLAY`。
@@ -289,6 +295,16 @@ WSLg 下如果窗口打不开，先确认 `DISPLAY=:0`；环境里可能残留�
 ### 对拍与自检
 
 没有单元测试框架；验证按改动层次选择下面的最小集合。
+
+KWS 关键词前缀树：
+
+```bash
+./build/test_context_graph.out
+```
+
+搬上游 `context-graph-test.cc` 的 4 组期望值（strict / 非 strict × 默认分 /
+自定义分），并补 phrase、逐关键词阈值、fail/output 弧与空关键词抛异常的
+字段自检。纯标准库实现，不加载 onnx，换机也能单独跑。
 
 前端逐点对拍：
 

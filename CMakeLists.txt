@@ -5,7 +5,7 @@
 #    lib_hk_sdk_audio_client.so  麦克风采集：登录、语音转发、G.722.1 解码、
 #                               可选降采样、wav 录制、取流缓冲与统计
 #    lib_audio_ai_process.so     ASR 处理：LogFBank 前端、AsrDecoder（ORT）、
-#                               语谱图与文本渲染
+#                               KWS 关键词前缀树、语谱图与文本渲染
 #
 #  两个库互不 include 对方头文件；组合关系只出现在可执行入口里。
 #
@@ -169,7 +169,7 @@ endforeach()
 # =====================================================================
 #  二、ASR 处理库（不依赖 HCNetSDK / 采集库）
 #
-#  LogFBank 前端、AsrDecoder（ORT）、语谱图与文本渲染。
+#  LogFBank 前端、AsrDecoder（ORT）、KWS 关键词前缀树、语谱图与文本渲染。
 #  ORT 缺失时跳过 asr_decode.cpp 与三个推理入口，
 #  音频采集、语谱图与 fbank 对拍仍可构建。
 # =====================================================================
@@ -177,6 +177,7 @@ set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
 
 set(audio_ai_process_SOURCES
     ${AAP_DIR}/audio_preprocess.cpp
+    ${AAP_DIR}/kws_context_graph.cpp
     ${AAP_DIR}/spectrogram_image.cpp
     ${AAP_DIR}/text_utils.cpp
     ${AAP_DIR}/text_renderer.cpp
@@ -246,6 +247,7 @@ add_executable(save_audio_wav.out save_audio_wav.cpp)
 add_executable(test_spectrogram_cv_mic.out test_spectrogram_cv_mic.cpp)
 add_executable(test_spectrogram_cv_wav.out test_spectrogram_cv_wav.cpp)
 add_executable(fbank_dump.out tools/fbank_dump.cpp)
+add_executable(test_context_graph.out tools/test_context_graph.cpp)
 
 # 依赖 ORT 的入口：未安装 ONNX Runtime 时整体跳过
 if(ORT_FOUND)
@@ -264,6 +266,7 @@ set(EXEC_DEMOS
     test_spectrogram_cv_mic.out
     test_spectrogram_cv_wav.out
     fbank_dump.out
+    test_context_graph.out
 )
 
 set(EXEC_LINK_HK
@@ -275,6 +278,7 @@ set(EXEC_LINK_AAP
     test_spectrogram_cv_mic.out
     test_spectrogram_cv_wav.out
     fbank_dump.out
+    test_context_graph.out
 )
 
 if(ORT_FOUND)
@@ -348,6 +352,7 @@ set(HK_AUDIO_HEADERS
 
 set(AAP_HEADERS
     ${AAP_DIR}/audio_preprocess.h
+    ${AAP_DIR}/kws_context_graph.h
     ${AAP_DIR}/spectrogram_image.h
     ${AAP_DIR}/text_utils.h
     ${AAP_DIR}/text_renderer.h
