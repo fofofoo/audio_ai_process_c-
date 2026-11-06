@@ -5,6 +5,7 @@
 - 相关文档：
   - [BlockWorker 异步处理机制](audio_ai_block_worker.md)
   - [ASR 有界状态与转写落盘改造计划](asr_bounded_state_plan.md)
+  - [KWS 待机 CPU 占用实测计划](kws_cpu_bench_plan.md)（待执行）
   - [Python 参考实现 KWS 说明](../python_ref/README.md)
 
 ---
@@ -444,6 +445,8 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
   命中次数、ASR encoder 次数 / 帧数 / token 数、唤醒 / 切回次数、回填帧数、
   尾块跳过次数、设备丢块与解码丢块。
 - **性能基准**：`tools/bench_perf.sh` 目前只覆盖纯 ASR；双模式入口的实时处理率、
-  两类编码调用与丢块对比尚未纳入脚本。
+  两类编码调用与丢块对比尚未纳入脚本。脚本不采集进程 CPU 占用，KWS 待机 / ASR
+  识别态的 CPU 对比先按 [KWS 待机 CPU 占用实测计划](kws_cpu_bench_plan.md) 手工测，
+  数据稳定后再把采样逻辑并入脚本。
 - **文档收尾**：已完成——README 的「KWS 尚无实时入口」已替换为 oracle 对拍与
   性能基准两项遗留，CLAUDE.md 的模块表、命令表与不变量已补双模式小节。
