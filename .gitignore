@@ -4,6 +4,14 @@
 /audio_ai_process/build/
 # 旧根工程 build 改名保留的临时目录（确认无用后可删除）
 /audio_ai_process/build.legacy/
+# catkin 工作区：只入库 catkin_ws/src 下的包，构建与运行产物不入库
+/catkin_ws/build/
+/catkin_ws/devel/
+/catkin_ws/install/
+/catkin_ws/log/
+/catkin_ws/.catkin_workspace
+# catkin_make 自动生成的 toplevel.cmake 符号链接，换机由工具重建
+/catkin_ws/src/CMakeLists.txt
 
 # ===== 安装产物 =====
 # cmake --install 输出到 3rd/zl_3rd，按需在本机生成

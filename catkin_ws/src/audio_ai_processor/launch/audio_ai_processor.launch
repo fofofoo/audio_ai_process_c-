@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <!--
+      语音处理节点：海康设备实时取流，KWS 关键词唤醒 + ASR 连续识别。
+      发布话题：
+        /audio_ai/asr_text   std_msgs/String  当前识别文本（变化时发布）
+        /audio_ai/kws_event  std_msgs/String  唤醒 / 结束语 / 超时切回事件
+
+      现场覆盖示例：
+        roslaunch audio_ai_processor audio_ai_processor.launch ip:=10.168.2.66
+        roslaunch audio_ai_processor audio_ai_processor.launch use_cuda:=true
+    -->
+
+    <!-- ========== 设备连接 ========== -->
+    <arg name="ip" default="10.168.2.65"/>          <!-- 音频设备 IP -->
+    <arg name="sdk_port" default="8000"/>           <!-- HCNet 私有协议端口 -->
+    <arg name="username" default="admin"/>
+    <arg name="password" default="Password"/>
+    <arg name="voice_channel" default="1"/>         <!-- 语音通道号，本机实测为 1 -->
+
+    <!-- ========== 模型与唤醒词 ========== -->
+    <!-- audio_ai_process 仓库根：库与权重都在它下面；换机器时改这一项即可 -->
+    <arg name="audio_ai_root" default="/home/liyun/code/AI/audio_ai_process"/>
+    <arg name="asr_model_dir" default="$(arg audio_ai_root)/weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05"/>
+    <arg name="kws_model_dir" default="$(arg audio_ai_root)/weight/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"/>
+    <!-- 唤醒词文件；改唤醒词改它，不动 weight/ 里的原始文件 -->
+    <arg name="keywords" default="$(arg audio_ai_root)/audio_ai_process/keywords/kws_keywords.txt"/>
+    <!-- ASR 分段转写落盘（每 64 token 一行，父目录自动创建） -->
+    <arg name="transcript_path" default="$(arg audio_ai_root)/log/asr_last_text.txt"/>
+
+    <!-- ========== 双模式行为 ========== -->
+    <!-- true = 从 ASR 模式起步（调试纯识别行为） -->
+    <arg name="initial_asr" default="false"/>
+    <!-- ASR 模式连续多少秒没有新 token 就切回 KWS 监听 -->
+    <arg name="idle_timeout" default="10.0"/>
+    <!-- 唤醒时回填最近多少帧（10 ms/帧），避免命令词开头被 chunk 边界吃掉 -->
+    <arg name="backfill_frames" default="100"/>
+
+    <!-- ========== 运行开关 ========== -->
+    <!-- ASR 与 KWS 都尝试 CUDA EP，注册失败自动回退 CPU -->
+    <arg name="use_cuda" default="false"/>
+    <!-- 是否显示语谱图窗口；机器人/服务器上保持 false -->
+    <arg name="show_window" default="false"/>
+
+    <param name="ip" value="$(arg ip)"/>
+    <param name="sdk_port" value="$(arg sdk_port)"/>
+    <param name="username" value="$(arg username)"/>
+    <param name="password" value="$(arg password)"/>
+    <param name="voice_channel" value="$(arg voice_channel)"/>
+
+    <param name="audio_ai_root" value="$(arg audio_ai_root)"/>
+    <param name="asr_model_dir" value="$(arg asr_model_dir)"/>
+    <param name="kws_model_dir" value="$(arg kws_model_dir)"/>
+    <param name="keywords" value="$(arg keywords)"/>
+    <param name="transcript_path" value="$(arg transcript_path)"/>
+
+    <param name="initial_asr" value="$(arg initial_asr)"/>
+    <param name="idle_timeout" value="$(arg idle_timeout)"/>
+    <param name="backfill_frames" value="$(arg backfill_frames)"/>
+
+    <param name="use_cuda" value="$(arg use_cuda)"/>
+    <param name="show_window" value="$(arg show_window)"/>
+
+    <node name="audio_ai_processor_node" pkg="audio_ai_processor"
+          type="audio_ai_processor_node" output="screen"/>
+</launch>

@@ -134,6 +134,7 @@ ASR 结果与 `audio_ai_process/python/` 中的 Python 参考实现逐点、逐 
 | 资源 | `results/` | 运行产物：录音 wav 与语谱图 png，只提交 `.gitkeep` |
 | 资源 | `log/` | 实时转写 `asr_last_text.txt`（每段一行，启动截断），只提交 `.gitkeep` |
 | 资源 | `audio_ai_process/keywords/` | 双模式唤醒词文件 `kws_keywords.txt`（由 Python 侧生成物复制，只读生成结果） |
+| ROS 节点 | `catkin_ws/src/audio_ai_processor/` | 设备实时双模式的 ROS 封装：复用上面两个库，发布 `/audio_ai/asr_text`（识别文本）与 `/audio_ai/kws_event`（唤醒 / 切回事件） |
 
 ### 依赖链（谁编译在先）
 
@@ -190,7 +191,7 @@ ASR 与 KWS 是两条并列的解码分支，共用同一个前端：前者输�
   PCM 存在**单次 `StartVoiceCom` 会话上限**：约 21.5 秒后停止交付，把 PCM 写成持久
   配置并重启设备后复测结果不变；`stop()` → `start()` 重开语音转发可恢复（2026-11-04
   实测）。PCM 只建议用于短会话或无损采集调试，详见
-  [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) 1.7.2。
+  [`hk_mic_client/README.md`](hk_mic_client/README.md) 1.7.2。
 - **wav 文件**：支持 PCM16 与 float32，多声道只取第一声道；不做重采样，
   非 16 kHz 的 wav 可以画图，但喂 ASR 前必须自行重采样。
 
@@ -379,6 +380,31 @@ HCNetSDK 运行库。ORT、OpenCV、FreeType 不随安装复制，属于外部�
 `-L3rd/zl_3rd/hk_mic_client/lib -lhk_mic_client` 或
 `-L3rd/zl_3rd/audio_ai_process/lib -laudio_ai_process`；只需要采集能力时
 不必链接 OpenCV 或 ONNX Runtime。
+
+### ROS 节点（catkin_ws）
+
+`catkin_ws/src/audio_ai_processor/` 是设备实时双模式的 ROS 封装，以
+`test_mic_kws_asr.cpp` 为蓝本：设备直连、固定 16 kHz，算法全部复用上面两个库，
+节点层只做参数、话题与主循环。
+
+| 话题 | 类型 | 说明 |
+| --- | --- | --- |
+| `/audio_ai/asr_text` | `std_msgs/String` | 当前 ASR 会话文本，变化时发布；切回 KWS 后为空串 |
+| `/audio_ai/kws_event` | `std_msgs/String` | 唤醒 / 结束语 / 超时切回事件，每个事件发布一次 |
+
+CMake 从包位置向上三级定位仓库根（`audio_ai_processor` → `src` → `catkin_ws` →
+仓库根），库、ORT 与权重都跟着走，仓库整体搬目录不用改；launch 覆盖设备地址、
+模型目录、唤醒词、CUDA / 窗口开关等现场参数。构建与运行（细节见该包 README）：
+
+```bash
+cd catkin_ws
+catkin_make
+source devel/setup.bash
+roslaunch audio_ai_processor audio_ai_processor.launch
+```
+
+catkin 的 `build/`、`devel/`、`install/`、`log/` 与自动生成的
+`src/CMakeLists.txt` 符号链接都在 `.gitignore` 里，只入库包源码。
 
 ### 常用命令
 
@@ -714,7 +740,7 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 
 - **25 单元/秒不是 25 包/秒**。前者是 40 ms 解码单元的节奏，后者是实际回调次数；
   设备会把多帧聚合进一个回调包。完整链路与逐级推导见
-  [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) 1.9 节。
+  [`hk_mic_client/README.md`](hk_mic_client/README.md) 1.9 节。
 - 设备编码单元由 SDK 的 80 B → 1280 B 约定和 16 kbps 码率共同决定；码率改为 32 kbps 后
   「80 B = 40 ms」不再成立。
 - 前端出帧只由帧移决定，与回调包长度、读取间隔无关；语谱图 wav 入口默认 1x 播放，
@@ -783,7 +809,7 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 
 | 文档 | 内容 |
 | --- | --- |
-| [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) | G.722.1 帧长、回调包、解码单元、PCM 对比、上行保活、init/start/stop/deinit 生命周期与失败分级 |
+| [`hk_mic_client/README.md`](hk_mic_client/README.md) | G.722.1 帧长、回调包、解码单元、PCM 对比、上行保活、init/start/stop/deinit 生命周期与失败分级 |
 | [`audio_ai_process/python/README.md`](audio_ai_process/python/README.md) | Python 参考实现：前端七项 kaldi 口径、模型结构、贪心搜索、KWS 束搜索与唤醒词设置、流式等价性与实测数据 |
 | [`3rd/onnxruntime/README.md`](3rd/onnxruntime/README.md) | 两个平台的 ONNX Runtime 安装、CUDA EP 与 cuDNN 9 配置 |
 | [`weight/`](weight/) 各模型目录的 `README.md` | 权重来源、模型结构说明与官方 `test_onnx.py` |
