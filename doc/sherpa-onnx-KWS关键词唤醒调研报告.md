@@ -5,7 +5,7 @@
 > 上游版本：sherpa-onnx（本地源码副本 `sharpa-onnx/`）
 > 目标：摸清「唤醒词 → 运行时匹配」的完整链路，为确定正式唤醒词和后续 C++ 移植提供依据。
 >
-> 相关文档：[KWS 接入方案](KWS接入方案.md)、[README · 关键词唤醒](../README.md#关键词唤醒kws)、[上游 Keyword spotting 文档](Keyword_spotting_index.rst)
+> 相关文档：[KWS 接入方案](KWS接入方案.md)、[README · 关键词唤醒](../audio_ai_process/README.md#关键词唤醒kws)、[上游 Keyword spotting 文档](Keyword_spotting_index.rst)
 
 ---
 

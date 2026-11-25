@@ -174,6 +174,9 @@ int main(int argc, char** argv) {
         }
 
         // 5.1 取音频：与是否录制无关，一次取走上次调用以来的全部 PCM16。
+        //     交付粒度是 SDK 解码单元 640 点（40 ms）：G.722.1 凑满 80 B 才解码，
+        //     一次回调可能含多个单元，这里一并取走，不按 40 ms 对齐
+        //     （块长由回调节奏决定，可能是 0 / 640 / 1280 点）。
         if (!client.get_last_audio(pcm)) {
             quit = !handle_key(cv::waitKey(kKeyWaitMs) & 0xFF);
             continue;
@@ -186,6 +189,11 @@ int main(int argc, char** argv) {
         }
 
         // 5.3 前端出特征（块长任意，内部按绝对样本索引凑帧），可视化出画布。
+        //     出帧粒度是帧移 160 点（10 ms），与上面的 G.722.1 40 ms 交付是两回事；
+        //     每行特征本身覆盖 400 点（25 ms 帧长），相邻帧重叠 15 ms。
+        //     稳态下每 640 点出 4 帧，首批因 first_=-120 只出 3 帧；
+        //     不足一帧的尾巴留在前端缓存，下一块继续凑，所以这里不需要
+        //     补零对齐 40 ms。
         const LogFbankFeatures feats = front.accept_waveform(chunk);
         canvas = view.accept_features(feats);
 

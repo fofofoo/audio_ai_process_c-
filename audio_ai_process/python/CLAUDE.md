@@ -105,7 +105,7 @@ git archive --format=zip --output=audio_ai_process.zip HEAD
   所以 48 帧输入对应 12 帧输出。512 是第 3 个 stack 的宽度，也是 `encoder_out` 维度。
 - 116 个状态 = 2 个全局 + 19×4 注意力缓存（key / value / value2 / non-linear attn）
   + 19×2 卷积缓存。
-- 结构、逐层形状与输入输出契约见 [落地报告](doc/src-预处理与模型框架-ASR落地报告.md)。
+- 结构、逐层形状与输入输出契约见 [落地报告](../../doc/src-预处理与模型框架-ASR落地报告.md)。
 
 ## 必须记住的不变量
 
@@ -154,7 +154,7 @@ sherpa-onnx wheel 对拍，关键词与时间戳一致）。
 
 ## 前端对齐的既有结论
 
-初版在 hamming 窗下 `max|Δ| = 10.44`，定位到七项差异后逐项修复（`snip_edges=False` 的分帧语义、povey 窗、窗分母 `N-1`、Mel 域遍历整数 bin 的滤波器组、`symmetric` 边界、`log(max(e, eps_f32))` 地板、逐帧预加重），最终 `mean|Δ|` 从 0.92 降到 4×10⁻⁶。**改 `audio_preprocess.py` 前先读** [工作流报告](doc/sherpa-onnx-ASR预处理及后处理工作流报告.md) 里的完整推导——里面每一项都有实测依据，重写容易把对的地方改错。
+初版在 hamming 窗下 `max|Δ| = 10.44`，定位到七项差异后逐项修复（`snip_edges=False` 的分帧语义、povey 窗、窗分母 `N-1`、Mel 域遍历整数 bin 的滤波器组、`symmetric` 边界、`log(max(e, eps_f32))` 地板、逐帧预加重），最终 `mean|Δ|` 从 0.92 降到 4×10⁻⁶。**改 `audio_preprocess.py` 前先读** [工作流报告](../../doc/sherpa-onnx-ASR预处理及后处理工作流报告.md) 里的完整推导——里面每一项都有实测依据，重写容易把对的地方改错。
 
 `high_freq` 口径仍有分歧未实测：官方 `test_onnx.py` 取 8000 Hz（Nyquist），sherpa-onnx C++ 默认 `-400`（7600 Hz）。当前默认 8000 Hz。
 

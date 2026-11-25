@@ -505,4 +505,4 @@ const std::string& text() const;
 |---|---|
 | [工作流报告](sherpa-onnx-ASR预处理及后处理工作流报告.md) | 七项前端差异的完整推导、流式等价性证明、全部实测数据 |
 | [部署调研报告](sherpa-onnx-ASR部署调研报告.md) | 调用路径与可行性调研 |
-| [README](../README.md) | 成果速览、快速开始、项目结构、C++ 移植计划 |
+| [README](../audio_ai_process/README.md) | 成果速览、快速开始、项目结构、C++ 移植计划 |

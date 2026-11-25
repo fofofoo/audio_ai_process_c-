@@ -40,7 +40,7 @@
     <!-- ASR 与 KWS 都尝试 CUDA EP，注册失败自动回退 CPU -->
     <arg name="use_cuda" default="false"/>
     <!-- 是否显示语谱图窗口；机器人/服务器上保持 false -->
-    <arg name="show_window" default="false"/>
+    <arg name="show_window" default="true"/>
 
     <param name="ip" value="$(arg ip)"/>
     <param name="sdk_port" value="$(arg sdk_port)"/>
