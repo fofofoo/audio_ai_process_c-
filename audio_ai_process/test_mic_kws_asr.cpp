@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
     const std::string asr_tokens_path = join_path(asr_dir, "tokens.txt");
 
     // 1.3 KWS 模型与关键词：默认 chunk-8（160 ms 推进，唤醒延迟低于 chunk-16），
-    //     encoder / joiner int8，decoder fp32。关键词文件在仓库根 keywords/，
+    //     encoder / joiner int8，decoder fp32。关键词文件在 audio_ai_process/keywords/，
     //     改唤醒词改它，不动 weight/ 里的原始文件。
     const std::string kws_dir =
         project_dir +
@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
         join_path(kws_dir, "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx");
     const std::string kws_tokens_path = join_path(kws_dir, "tokens.txt");
     const std::string kws_keywords_path =
-        join_path(project_dir, "keywords/kws_keywords.txt");
+        join_path(project_dir, "audio_ai_process/keywords/kws_keywords.txt");
 
     // 1.4 KWS 解码参数：与 test_wav_kws.cpp / Python 参考实现口径一致。
     //     关键词行里的 `:score #threshold` 会覆盖这两个默认值。

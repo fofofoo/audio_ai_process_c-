@@ -6,7 +6,7 @@
   - [BlockWorker 异步处理机制](audio_ai_block_worker.md)
   - [ASR 有界状态与转写落盘改造计划](asr_bounded_state_plan.md)
   - [KWS 待机 CPU 占用实测计划](kws_cpu_bench_plan.md)（待执行）
-  - [Python 参考实现 KWS 说明](../python_ref/README.md)
+  - [Python 参考实现 KWS 说明](../audio_ai_process/python/README.md)
 
 ---
 
@@ -48,7 +48,7 @@ KWS 监听 --命中唤醒词--> ASR 识别
 - `tools/test_context_graph.cpp`：搬上游 `context-graph-test.cc` 的 4 组期望值，
   另补 phrase / threshold / output 弧字段自检；不需要权重和 ORT。
 
-**验证结果**：`./build/test_context_graph.out` 通过，退出码表示成败。
+**验证结果**：`./audio_ai_process/build/test_context_graph.out` 通过，退出码表示成败。
 
 **已固定的语义**
 
@@ -71,17 +71,17 @@ KWS 监听 --命中唤醒词--> ASR 识别
 - `include/kws_decode.h` 与 `src/kws_decode.cpp`：流式关键词唤醒。持有三个 `Ort::Session`
   与 38 个状态张量，按值持有 `KwsContextGraph`；完成分块编码、束搜索（每帧批量跑
   decoder / joiner）、尾随 blank 触发判定与静音软重置。
-- `test_wav_kws.cpp`：离线 wav 入口，对应 `python_ref/test_wav_kws_mini.py`。
+- `test_wav_kws.cpp`：离线 wav 入口，对应 `audio_ai_process/python/test_wav_kws_mini.py`。
   逐文件读 wav、末尾补 0.5 秒真静音、按块喂前端与 `KwsDecoder`，打印命中词、
   首 token 时间与平均概率；内嵌 `kExpected` 期望集合，并用 160 / 1600 两种块长复测。
-- Python 侧 `python_ref/src/kws_decode.py`、`kws_context_graph.py` 与
+- Python 侧 `audio_ai_process/python/src/kws_decode.py`、`kws_context_graph.py` 与
   `test_wav_kws_mini.py`、`test_context_graph_mini.py` 作为参考实现。
 
 **验证结果**
 
-- `./build/test_wav_kws.out`：权重包自带 9 条 wav，命中集合与 `kExpected` 一致；
+- `./audio_ai_process/build/test_wav_kws.out`：权重包自带 9 条 wav，命中集合与 `kExpected` 一致；
   `zh_0~2` 为负样本，零误触发；160 / 1600 块长结果相同；累计触发 10 次。
-- `./build/test_context_graph.out`：通过。
+- `./audio_ai_process/build/test_context_graph.out`：通过。
 
 **模型契约（chunk-8，当前默认）**
 
@@ -109,7 +109,7 @@ KWS 监听 --命中唤醒词--> ASR 识别
 
 ### 3.1 目标形态
 
-新增 `test_mic_kws_asr.cpp`，对应 `python_ref/test_mic_kws_asr.py`：
+新增 `test_mic_kws_asr.cpp`，对应 `audio_ai_process/python/test_mic_kws_asr.py`：
 
 ```
 海康设备取流 -> AudioPreprocess -> 同一份特征
@@ -211,7 +211,7 @@ BlockWorker 的 `Item` 带 `is_tail` 标记，`KwsAsrSession` 在 KWS 模式下�
 
 ### 3.6 关键词文件
 
-已在仓库根新增 `keywords/kws_keywords.txt`（`test_mic_kws_asr.out` 默认读取，
+已在仓库根新增 `audio_ai_process/keywords/kws_keywords.txt`（`test_mic_kws_asr.out` 默认读取，
 `--keywords` 可覆盖），三条中文唤醒词沿用 Python 参考实现
 已验证的配置：
 
@@ -227,9 +227,9 @@ C++ 侧读取的是生成后的音素行格式：
 <token...> :score #threshold @原文
 ```
 
-直接由 `python_ref/keywords/kws_keywords.txt` 复制或对照生成，`weight/` 里的原始
+直接由 `audio_ai_process/python/keywords/kws_keywords.txt` 复制或对照生成，`weight/` 里的原始
 关键词文件保持只读。参数依据见
-`python_ref/keywords/kws_keywords_raw.txt` 的 30 条真机样本扫描记录：score=1.5 时
+`audio_ai_process/python/keywords/kws_keywords_raw.txt` 的 30 条真机样本扫描记录：score=1.5 时
 三个词命中率为 10/10、9/10、8/10；2.0 反而下降。
 
 ### 3.7 验收标准
@@ -253,7 +253,7 @@ C++ 侧读取的是生成后的音素行格式：
   窗口两行状态（模式行 + 文本行），5 个命令行开关照设计落地。
 - `include/asr_session.h` 与 `src/asr_session.cpp`：补 `settle_segment()` / `token_count()` /
   `current_text()` / `clear_history()`，供模式切换使用。
-- `keywords/kws_keywords.txt`：从 `python_ref/keywords/kws_keywords.txt` 复制。
+- `audio_ai_process/keywords/kws_keywords.txt`：从 `audio_ai_process/python/keywords/kws_keywords.txt` 复制。
 - `CMakeLists.txt`：库源、安装头文件、入口声明与链接分组同步。
 
 **离线验证（临时验程序，不入库）**
@@ -366,7 +366,7 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
    唤醒时按时间顺序拼成一个 `LogFbankFeatures`，直接在同一 Worker 线程调用
    `AsrSession::on_block()`，不经过队列。
 5. **初始模式**：默认 KWS；`--initial-asr` 从 ASR 起步，用于复用纯 ASR 调试路径。
-6. **关键词文件生成**：仓库根 `keywords/kws_keywords.txt` 已建，内容复制自 Python 侧
+6. **关键词文件生成**：仓库根 `audio_ai_process/keywords/kws_keywords.txt` 已建，内容复制自 Python 侧
    生成物；C++ 侧仍不引入拼音生成工具，现场改词需要重新跑 Python 生成流程。
 7. **oracle 对拍**：KWS 与 sherpa-onnx wheel 的逐条对拍仍是低优先级待办，
    `--dump-hits` 的 TSV 已具备对拍所需的字段。
@@ -401,7 +401,7 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
 |---|---|---|---|
 | B1 | ContextGraph：trie + fail/output 弧 | `kws_context_graph.h/.cpp`、`tools/test_context_graph.cpp` | 完成（`facb499`） |
 | B2 | KeywordSpotter：束搜索 + 触发 + 软重置 | `kws_decode.h/.cpp` | 完成（`c339cd6`） |
-| B3 | 关键词文件运行时加载，不引入拼音库 | 解析 `token... :score #threshold @原文` | 解析能力随 `KwsDecoder` 落地；仓库根 `keywords/kws_keywords.txt` 已建 |
+| B3 | 关键词文件运行时加载，不引入拼音库 | 解析 `token... :score #threshold @原文` | 解析能力随 `KwsDecoder` 落地；仓库根 `audio_ai_process/keywords/kws_keywords.txt` 已建 |
 | B4 | 离线验收入口：9 条自带 wav | `test_wav_kws.cpp` | 完成（`c339cd6`） |
 | B5 | 实时双模式入口 | `test_mic_kws_asr.cpp` | 完成（2026-11-05，见第三节） |
 | B6 | CMake + 文档 | `CMakeLists.txt`、README、CLAUDE.md | 完成：库与两个实时入口的 CMake、安装头文件、README 与 CLAUDE.md 已同步 |

@@ -2,9 +2,9 @@
 
 **稳定版**：海康拾音器实时音频或 wav 文件 → 流式 LogFBank → 中文流式 ASR / 关键词唤醒 / OpenCV 滚动语谱图。
 仓库同时提供「设备实时取流」与「wav 文件」两条数据源，共用同一套前端；
-ASR 结果与 `python_ref/` 中的 Python 参考实现逐点、逐 token 对齐，KWS 按同一套
-束搜索与 trie 触发语义移植。工程拆成「麦克风采集」与「ASR 处理」两个零耦合
-SHARED 库，入口只做装配。
+ASR 结果与 `audio_ai_process/python/` 中的 Python 参考实现逐点、逐 token 对齐，KWS 按同一套
+束搜索与 trie 触发语义移植。工程拆成「采集 + 特征工程」与「模型处理」两个可独立
+构建的 SHARED 库：前者不依赖后者，后者依赖前者，入口只做装配。
 
 ## 实机验证结论
 
@@ -59,8 +59,9 @@ SHARED 库，入口只做装配。
 10. **模型自检与数值对拍**：`load_onnx_model.out` 校验三模型加载与 metadata；
    `fbank_dump.out` + `compare_fbank.py`、`--dump-tokens` + `compare_asr.py` 分别做
    逐帧逐 Mel 与逐 token 对拍，保证 C++ 移植没有静默偏移。
-11. **两个零耦合库与安装**：采集库不依赖 OpenCV / ORT，ASR 库不依赖 HCNetSDK；
-   两个库互不 include 对方头文件，`cmake --install build` 输出到 `install/<库名>/`。
+11. **两个可独立构建的库**：`hk_mic_client` 负责采集与特征工程，不依赖 ASR 库；
+   `audio_ai_process` 负责模型处理，依赖 `hk_mic_client` 的安装产物；
+   各自 `cmake --install` 到 `3rd/zl_3rd/<库名>/`，第三方依赖统一放在 `3rd/`。
 
 **一句话亮点：从设备取流、流式前端到中文 ASR、关键词唤醒与实时可视化全链路 C++，ASR 与 Python 参考实现逐位、逐 token 对齐，KWS 沿用同一套解码语义。**
 
@@ -98,52 +99,56 @@ SHARED 库，入口只做装配。
 
 | 类别 | 路径 | 一句话职责 |
 | --- | --- | --- |
-| 库 | `lib_hk_sdk_audio_client.so` | 麦克风采集：登录、语音转发、G.722.1 解码、可选降采样与 wav 录制、取流缓冲与统计；不依赖 OpenCV/ORT |
-| 库 | `lib_audio_ai_process.so` | ASR / KWS 处理：LogFBank 前端、`AsrDecoder` / `KwsDecoder`（ORT）、KWS 关键词前缀树、语谱图、文本渲染；不依赖 HCNetSDK |
-| 采集源码 | `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 设备连接与音频流水线 |
-| 采集源码 | `hk_mic_client/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），PCM 32 kHz → 16 kHz；零外部依赖 |
-| 采集源码 | `hk_mic_client/hk_sdk/` | 厂商 HCNetSDK 头文件与预编译库（按平台分目录） |
-| ASR 源码 | `{include,src}/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
-| ASR 源码 | `{include,src}/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
-| KWS 源码 | `{include,src}/kws_decode.{h,cpp}` | 流式关键词唤醒：三模型推理、trie 约束的束搜索、尾随 blank 触发判定、静音软重置 |
-| KWS 源码 | `{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
-| 框架 | `include/block_worker.h` | header-only 异步管家：有界队列 + 单消费者线程，满时丢最旧、尾块阻塞不丢、异常捕获与 join |
-| 双模式源码 | `{include,src}/asr_session.{h,cpp}` | ASR 外部长期缓存：全量 token、64 token 分段、转写落盘、显示快照 |
-| 双模式源码 | `{include,src}/kws_asr_session.{h,cpp}` | 双模式模式机：KWS ↔ ASR 切换、100 帧回填环、10 秒空闲计时、结束语判定、事件与统计 |
-| ASR 源码 | `{include,src}/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
-| ASR 源码 | `{include,src}/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
-| ASR 源码 | `{include,src}/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
-| 入口 | `save_audio_wav.cpp` | 录 10 秒设备音频到 `results/` |
-| 入口 | `test_spectrogram_cv_mic.cpp` | 设备实时语谱图入口 |
-| 入口 | `test_spectrogram_cv_wav.cpp` | wav 文件语谱图入口 |
-| 入口 | `test_wav_asr.cpp` | wav 语音识别入口：文本 +（可选）语谱图与中文识别条 |
-| 入口 | `test_wav_kws.cpp` | wav 关键词唤醒入口：批量跑 wav、打印命中词与时间、检查期望集合与块长不变性；不开窗口 |
-| 入口 | `test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 后台解码 → 文本 + 滚动语谱图（其他入口的线程模型参照此文件） |
-| 入口 | `test_mic_kws_asr.cpp` | 设备实时双模式入口：KWS 监听 → 唤醒 → ASR → 结束语/超时切回；窗口两行状态 |
-| 入口 | `load_onnx_model.cpp` | ASR 三模型加载自检入口 |
-| 工具 | `tools/wav_reader.h` | 最小 RIFF 解析，wav 类入口共用 |
-| 工具 | `tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
+| 库 | `libhk_mic_client.so` | 采集 + 特征工程：登录、语音转发、G.722.1 解码、降采样、wav 录制、LogFBank、语谱图；不依赖 ASR 库 / ORT / FreeType |
+| 库 | `libaudio_ai_process.so` | 模型处理：`AsrDecoder` / `KwsDecoder`（ORT）、关键词前缀树、双模式 session、中文渲染；依赖 `hk_mic_client` 与 ORT |
+| 采集源码 | `hk_mic_client/{include,src}/hk_sdk_audio_client.{h,cpp}` | 设备连接与音频流水线 |
+| 采集源码 | `hk_mic_client/{include,src}/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），PCM 32 kHz → 16 kHz；零外部依赖 |
+| 采集源码 | `3rd/hk_sdk/` | 厂商 HCNetSDK 头文件与预编译库（按平台分目录） |
+| 特征源码 | `hk_mic_client/{include,src}/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
+| ASR 源码 | `audio_ai_process/{include,src}/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
+| KWS 源码 | `audio_ai_process/{include,src}/kws_decode.{h,cpp}` | 流式关键词唤醒：三模型推理、trie 约束的束搜索、尾随 blank 触发判定、静音软重置 |
+| KWS 源码 | `audio_ai_process/{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
+| 框架 | `audio_ai_process/include/block_worker.h` | header-only 异步管家：有界队列 + 单消费者线程，满时丢最旧、尾块阻塞不丢、异常捕获与 join |
+| 双模式源码 | `audio_ai_process/{include,src}/asr_session.{h,cpp}` | ASR 外部长期缓存：全量 token、64 token 分段、转写落盘、显示快照 |
+| 双模式源码 | `audio_ai_process/{include,src}/kws_asr_session.{h,cpp}` | 双模式模式机：KWS ↔ ASR 切换、100 帧回填环、10 秒空闲计时、结束语判定、事件与统计 |
+| 特征源码 | `hk_mic_client/{include,src}/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
+| ASR 源码 | `audio_ai_process/{include,src}/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
+| 特征源码 | `hk_mic_client/{include,src}/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
+| 入口 | `hk_mic_client/save_audio_wav.cpp` | 录 10 秒设备音频到 `results/` |
+| 入口 | `hk_mic_client/test_spectrogram_cv_mic.cpp` | 设备实时语谱图入口 |
+| 入口 | `hk_mic_client/test_spectrogram_cv_wav.cpp` | wav 文件语谱图入口 |
+| 入口 | `audio_ai_process/test_wav_asr.cpp` | wav 语音识别入口：文本 +（可选）语谱图与中文识别条 |
+| 入口 | `audio_ai_process/test_wav_kws.cpp` | wav 关键词唤醒入口：批量跑 wav、打印命中词与时间、检查期望集合与块长不变性；不开窗口 |
+| 入口 | `audio_ai_process/test_mic_asr.cpp` | 设备实时语音识别入口：取流 → 特征 → 后台解码 → 文本 + 滚动语谱图（其他入口的线程模型参照此文件） |
+| 入口 | `audio_ai_process/test_mic_kws_asr.cpp` | 设备实时双模式入口：KWS 监听 → 唤醒 → ASR → 结束语/超时切回；窗口两行状态 |
+| 入口 | `audio_ai_process/load_onnx_model.cpp` | ASR 三模型加载自检入口 |
+| 工具 | `hk_mic_client/include/wav_reader.h` | 最小 RIFF 解析，wav 类入口共用 |
+| 工具 | `hk_mic_client/tools/fbank_dump.cpp` | 前端对拍：裸 float32 PCM → 裸 float32 特征 |
 | 工具 | `tools/compare_fbank.py` | C++ 与 Python 前端逐点比较 |
 | 工具 | `tools/compare_asr.py` | C++ 与 Python ASR 逐 token 比较 |
-| 工具 | `tools/test_context_graph.cpp` | KWS 前缀树单测：上游 4 组 gtest 期望值 + phrase/threshold/output 弧字段自检，不需要权重与 ORT |
+| 工具 | `audio_ai_process/tools/test_context_graph.cpp` | KWS 前缀树单测：上游 4 组 gtest 期望值 + phrase/threshold/output 弧字段自检，不需要权重与 ORT |
 | 工具 | `tools/bench_perf.sh` | 性能基准：离线 RTF / 实时处理率、取流与后台解码丢块，CPU 与 CUDA 对比 |
-| 资源 | `onnxruntime/` | 项目内托管的 ONNX Runtime；`install/` 不入库，接入方式见 `onnxruntime/README.md` |
+| 资源 | `3rd/onnxruntime/` | 项目内托管的 ONNX Runtime；`install/` 不入库，接入方式见 `3rd/onnxruntime/README.md` |
 | 资源 | `weight/` | ASR 模型权重与词表（fp32 / int8 两套），本地放置，不入库 |
-| 资源 | `python_ref/` | Python 参考实现（只读基准，不参与 C++ 编译） |
+| 资源 | `audio_ai_process/python/` | Python 参考实现（只读基准，不参与 C++ 编译） |
 | 资源 | `results/` | 运行产物：录音 wav 与语谱图 png，只提交 `.gitkeep` |
 | 资源 | `log/` | 实时转写 `asr_last_text.txt`（每段一行，启动截断），只提交 `.gitkeep` |
-| 资源 | `keywords/` | 双模式唤醒词文件 `kws_keywords.txt`（由 Python 侧生成物复制，只读生成结果） |
+| 资源 | `audio_ai_process/keywords/` | 双模式唤醒词文件 `kws_keywords.txt`（由 Python 侧生成物复制，只读生成结果） |
 
 ### 依赖链（谁编译在先）
 
 ```
-HCNetSDK ───────────────> lib_hk_sdk_audio_client.so ──┐
-                                                       ├──> 入口（按需链接：save_audio_wav / test_* / load_onnx_model）
-OpenCV ──────────────────> lib_audio_ai_process.so ────┤
-ONNX Runtime（可选） ────┘                             │
-FreeType（可选） ────────┘                             │
-                                                       └── test_spectrogram_cv_mic / test_mic_asr 同时链接两个库
+HCNetSDK ──> libhk_mic_client.so ──> 采集 / 可视化入口
+                  │                  （save_audio_wav、test_spectrogram_cv_*、fbank_dump）
+                  │
+                  └──> libaudio_ai_process.so ──> ASR / KWS 入口
+                           ↑                    （test_wav_*、test_mic_*、load_onnx_model）
+                           └── ONNX Runtime / OpenCV / FreeType
 ```
+
+编译顺序由此确定：先构建并安装 `hk_mic_client`，再构建 `audio_ai_process`。
+`test_mic_asr` / `test_mic_kws_asr` 通过 ASR 库的公共依赖拿到采集能力，
+入口层按需显式链接两个库。
 
 ORT 缺失时 `asr_decode.cpp` / `kws_decode.cpp` 与四个 ORT 入口自动跳过；
 `kws_context_graph.cpp` 与 `test_context_graph.out` 不依赖 ORT，仍可构建。
@@ -154,7 +159,7 @@ FreeType 缺失时 `text_renderer` 编译空实现，入口回退 `cv::putText`�
 ```
 海康拾音器 --HCNetSDK 语音转发--> HkSdkAudioClient --PCM16--+
                                                             +--> /32768.0 --> AudioPreprocess
-wav 文件 --tools/wav_reader.h（RIFF 解析）------------------+                      |
+wav 文件 --wav_reader.h（RIFF 解析）------------------+                      |
                                                                                   v
                                                                     LogFbankFeatures (n,80)
                                                                                   |
@@ -260,11 +265,11 @@ C++ 侧三个部件：
 
 | 部件 | 路径 | 职责 |
 | --- | --- | --- |
-| `KwsContextGraph` | `{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树：加分、逐 token 步进、命中判定；纯标准库 |
-| `KwsDecoder` | `{include,src}/kws_decode.{h,cpp}` | 分块编码、trie 约束的束搜索、触发判定、静音软重置 |
+| `KwsContextGraph` | `audio_ai_process/{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树：加分、逐 token 步进、命中判定；纯标准库 |
+| `KwsDecoder` | `audio_ai_process/{include,src}/kws_decode.{h,cpp}` | 分块编码、trie 约束的束搜索、触发判定、静音软重置 |
 | `test_wav_kws.out` | `test_wav_kws.cpp` | 离线验收入口：wav → 特征 → 命中事件，不开窗口 |
 
-Python 参考实现在 `python_ref/src/kws_decode.py`；C++ 按它的逐帧语义移植，并按
+Python 参考实现在 `audio_ai_process/python/src/kws_decode.py`；C++ 按它的逐帧语义移植，并按
 「图 + 解码器 + 入口」拆成三层。
 
 ### 2. 模型与解码要点
@@ -312,129 +317,141 @@ token token ... [:boost] [#threshold] @原文
 
 逐帧流程、易错点、与上游 `context-graph` / `transducer-keyword-decoder` /
 `keyword-spotter-transducer-impl` 的逐项对应，见
-[python_ref/README.md](python_ref/README.md) 的「束搜索」「唤醒词机制」两章和
-[KWS 调研报告](python_ref/doc/sherpa-onnx-KWS关键词唤醒调研报告.md)。
+[audio_ai_process/python/README.md](audio_ai_process/python/README.md) 的「束搜索」「唤醒词机制」两章和
+[KWS 调研报告](audio_ai_process/python/doc/sherpa-onnx-KWS关键词唤醒调研报告.md)。
 
 ## 运行与集成
 
 ### 依赖与编译
 
 CMake ≥ 3.10、C++17、OpenCV（core / imgproc / imgcodecs / highgui）、pthread。
-海康 SDK 已放在 `hk_mic_client/hk_sdk/`，CMake 按架构自动选择 `linux_x86` /
+海康 SDK 已放在 `3rd/hk_sdk/`，CMake 按架构自动选择 `linux_x86` /
 `linux64_arm` / `win64_x86`，并为可执行文件设置 RPATH。
 
-FreeType 是 `lib_audio_ai_process` 的可选依赖（供 `text_renderer` 渲染中文）：
+FreeType 是 `libaudio_ai_process` 的可选依赖（供 `text_renderer` 渲染中文）：
 找到时定义 `HK_HAVE_FREETYPE`，带窗口的 ASR 入口在底部用系统字体渲染中文；
 找不到时该模块编译空实现、入口自动回退 `cv::putText`（只支持 ASCII），不影响识别。
 KWS 离线入口不建窗口，不涉及文本渲染。
 
 ASR 相关目标额外依赖 ONNX Runtime，CMake 按架构选择项目内托管版本：
-x86_64 用 `onnxruntime/install/onnxruntime-1.23.2`，aarch64 用
-`onnxruntime/install/onnxruntime-1.18.0`（需在 Jetson 上源码编译）。
+x86_64 用 `3rd/onnxruntime/install/onnxruntime-1.23.2`，aarch64 用
+`3rd/onnxruntime/install/onnxruntime-1.18.0`（需在 Jetson 上源码编译）。
 ORT 缺失时只给 WARNING，音频采集 / 语谱图 / fbank 对拍仍可构建，
 依赖推理的 `asr_decode.cpp` / `kws_decode.cpp` 与四个 ORT 入口自动跳过。
-CUDA EP 的 cuDNN 9 环境配置见 `onnxruntime/README.md`。
+CUDA EP 的 cuDNN 9 环境配置见 `3rd/onnxruntime/README.md`。
+
+先构建并安装采集库，再构建 ASR 库（ASR 库依赖前者的安装产物）：
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
-cmake --install build      # 输出到 install/<库名>/{include,lib}
+# 1) 采集 + 特征工程库
+cmake -S hk_mic_client -B hk_mic_client/build
+cmake --build hk_mic_client/build -j
+cmake --install hk_mic_client/build      # -> 3rd/zl_3rd/hk_mic_client/
+
+# 2) 模型处理库
+cmake -S audio_ai_process -B audio_ai_process/build
+cmake --build audio_ai_process/build -j
+cmake --install audio_ai_process/build   # -> 3rd/zl_3rd/audio_ai_process/
 ```
 
 ### 安装与集成
 
 ```
-install/
-├── hk_sdk_audio_client/
-│   ├── include/   hk_sdk_audio_client.h、audio_resampler.h、HCNetSDK 头文件
-│   └── lib/       lib_hk_sdk_audio_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
-└── audio_ai_process/
-    ├── include/*.h
-    └── lib/lib_audio_ai_process.so
+3rd/
+├── hk_sdk/                        厂商 HCNetSDK 头 + 三平台预编译库
+├── onnxruntime/                   ORT 安装（install/ 不入库）
+└── zl_3rd/                        两个库的安装输出
+    ├── hk_mic_client/
+    │   ├── include/   hk_sdk_audio_client.h、audio_preprocess.h、spectrogram_image.h 等
+    │   └── lib/       libhk_mic_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
+    └── audio_ai_process/
+        ├── include/   asr_decode.h、kws_decode.h 等
+        └── lib/       libaudio_ai_process.so
 ```
 
-两个库互不 include 对方头文件；`test_mic_asr.out` / `test_spectrogram_cv_mic.out`
-只作为组合层同时链接两者。安装后库自身 `INSTALL_RPATH=$ORIGIN`，运行时能在同目录
-找到 HCNetSDK 运行库。ORT、OpenCV、FreeType 不随安装复制，属于外部运行期依赖：
+依赖方向是单向的：`audio_ai_process` → `hk_mic_client`，反向不成立。
+采集库不依赖 ORT / FreeType；ASR 库不直接调用 HCNetSDK，只通过采集库的公共头
+使用特征类型。安装后采集库 `INSTALL_RPATH=$ORIGIN`，运行时能在同目录找到
+HCNetSDK 运行库。ORT、OpenCV、FreeType 不随安装复制，属于外部运行期依赖：
 使用安装库的程序需要自行提供对应运行库（或设置 `LD_LIBRARY_PATH`）。
 
-使用方编译时加 `-Iinstall/<库名>/include`，链接
-`-Linstall/hk_sdk_audio_client/lib -l_hk_sdk_audio_client` 或
-`-Linstall/audio_ai_process/lib -l_audio_ai_process`；只需要采集能力时
+使用方编译时加 `-I3rd/zl_3rd/<库名>/include`，链接
+`-L3rd/zl_3rd/hk_mic_client/lib -lhk_mic_client` 或
+`-L3rd/zl_3rd/audio_ai_process/lib -laudio_ai_process`；只需要采集能力时
 不必链接 OpenCV 或 ONNX Runtime。
 
 ### 常用命令
 
 ```bash
 # 录 10 秒设备音频 -> results/hk_audio_<时间戳>.wav
-./build/save_audio_wav.out
+./hk_mic_client/build/save_audio_wav.out
 
 # 设备实时语谱图：q / Esc 退出，s 存图
-DISPLAY=:0 ./build/test_spectrogram_cv_mic.out
+DISPLAY=:0 ./hk_mic_client/build/test_spectrogram_cv_mic.out
 
 # 自检模式：跑 10 秒，存 results/spectrogram_mic.png 后退出
-DISPLAY=:0 ./build/test_spectrogram_cv_mic.out 10
+DISPLAY=:0 ./hk_mic_client/build/test_spectrogram_cv_mic.out 10
 
 # wav 语谱图：默认按 1x 节奏播放；不传路径时读 results/hk_audio_20261102_085654.wav（本机录音，不入库）
-DISPLAY=:0 ./build/test_spectrogram_cv_wav.out results/<录音>.wav
+DISPLAY=:0 ./hk_mic_client/build/test_spectrogram_cv_wav.out results/<录音>.wav
 
 # 批量检查：尽快喂完，存 results/spectrogram_wav.png 后退出
-DISPLAY=:0 ./build/test_spectrogram_cv_wav.out results/<录音>.wav --fast
+DISPLAY=:0 ./hk_mic_client/build/test_spectrogram_cv_wav.out results/<录音>.wav --fast
 
 # ASR 三模型加载自检（默认非 int8、CPU）
-./build/load_onnx_model.out
+./audio_ai_process/build/load_onnx_model.out
 
 # 切换 int8 模型目录（encoder / joiner 自动识别 .int8.onnx）
-./build/load_onnx_model.out weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05
+./audio_ai_process/build/load_onnx_model.out weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05
 
-# 验证 CUDA EP（需先按 onnxruntime/README.md 设置 cuDNN 9 的 LD_LIBRARY_PATH）
-LD_LIBRARY_PATH=<cuDNN 9 目录> ./build/load_onnx_model.out --cuda
+# 验证 CUDA EP（需先按 3rd/onnxruntime/README.md 设置 cuDNN 9 的 LD_LIBRARY_PATH）
+LD_LIBRARY_PATH=<cuDNN 9 目录> ./audio_ai_process/build/load_onnx_model.out --cuda
 
 # wav 语音识别：单个文件，窗口底部实时显示中文结果
-DISPLAY=:0 ./build/test_wav_asr.out weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs/1.wav
+DISPLAY=:0 ./audio_ai_process/build/test_wav_asr.out weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs/1.wav
 
 # 批量识别：默认目录（权重包 test_wavs/）或目录/多文件，只打印文本
-./build/test_wav_asr.out --no-window
-./build/test_wav_asr.out --no-window weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs
+./audio_ai_process/build/test_wav_asr.out --no-window
+./audio_ai_process/build/test_wav_asr.out --no-window weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs
 
 # 导出 token 供 Python 参考实现逐 token 对拍
-./build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
+./audio_ai_process/build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
 
 # CUDA EP（失败自动回退 CPU）
-./build/test_wav_asr.out --no-window --cuda weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs/1.wav
+./audio_ai_process/build/test_wav_asr.out --no-window --cuda weight/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/test_wavs/1.wav
 
 # 实时麦克风语音识别：窗口底部实时显示中文，q / Esc 退出，空格暂停/恢复语音转发
-DISPLAY=:0 ./build/test_mic_asr.out
+DISPLAY=:0 ./audio_ai_process/build/test_mic_asr.out
 
 # 只打印文本；跑 10 秒自动收尾退出（无人值守自检）
-./build/test_mic_asr.out --no-window --seconds 10
+./audio_ai_process/build/test_mic_asr.out --no-window --seconds 10
 
 # 双模式：默认 KWS 监听，说出唤醒词后自动切到识别；q / Esc 退出
-DISPLAY=:0 ./build/test_mic_kws_asr.out
+DISPLAY=:0 ./audio_ai_process/build/test_mic_kws_asr.out
 
 # 双模式自检：只打印事件与文本，跑 20 秒自动收尾
-./build/test_mic_kws_asr.out --no-window --seconds 20
+./audio_ai_process/build/test_mic_kws_asr.out --no-window --seconds 20
 
 # 双模式：初始进入 ASR（调试纯识别行为）/ 换唤醒词文件 / CUDA EP
-./build/test_mic_kws_asr.out --initial-asr --no-window --seconds 10
-./build/test_mic_kws_asr.out --keywords keywords/kws_keywords.txt
-./build/test_mic_kws_asr.out --cuda --no-window
+./audio_ai_process/build/test_mic_kws_asr.out --initial-asr --no-window --seconds 10
+./audio_ai_process/build/test_mic_kws_asr.out --keywords audio_ai_process/keywords/kws_keywords.txt
+./audio_ai_process/build/test_mic_kws_asr.out --cuda --no-window
 
 # 双模式长跑 + 录音：音频存 results/kws_asr_<时间戳>.wav，便于回放复现
-DISPLAY=:0 ./build/test_mic_kws_asr.out --record --seconds 120
+DISPLAY=:0 ./audio_ai_process/build/test_mic_kws_asr.out --record --seconds 120
 
 # KWS：默认跑权重包自带 9 条 wav，检查命中集合与流式不变性
-./build/test_wav_kws.out
+./audio_ai_process/build/test_wav_kws.out
 
 # KWS：指定文件 / 目录，导出命中（文件名 <TAB> 关键词 <TAB> 时间 <TAB> 概率）
-./build/test_wav_kws.out weight/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/test_wavs \
+./audio_ai_process/build/test_wav_kws.out weight/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/test_wavs \
     --dump-hits /tmp/kws_hits.tsv
 
 # KWS：覆盖 boosting score / 触发阈值，并打印被阈值挡住的候选
-./build/test_wav_kws.out --score 2.0 --threshold 0.3 --debug
+./audio_ai_process/build/test_wav_kws.out --score 2.0 --threshold 0.3 --debug
 
 # KWS 关键词前缀树单测：不需要权重 / ORT，通过时返回 0
-./build/test_context_graph.out
+./audio_ai_process/build/test_context_graph.out
 ```
 
 WSLg 下如果窗口打不开，先确认 `DISPLAY=:0`；环境里可能残留无效的远程 `DISPLAY`。
@@ -448,7 +465,7 @@ WSLg 下如果窗口打不开，先确认 `DISPLAY=:0`；环境里可能残留�
 KWS 关键词前缀树：
 
 ```bash
-./build/test_context_graph.out
+./audio_ai_process/build/test_context_graph.out
 ```
 
 搬上游 `context-graph-test.cc` 的 4 组期望值（strict / 非 strict × 默认分 /
@@ -458,7 +475,7 @@ KWS 关键词前缀树：
 离线 wav 关键词唤醒：
 
 ```bash
-./build/test_wav_kws.out
+./audio_ai_process/build/test_wav_kws.out
 ```
 
 跑权重包自带的 9 条 wav，命中集合必须与期望完全一致：
@@ -483,7 +500,7 @@ python3 -I tools/compare_fbank.py --wav results/<录音>.wav
 python3 -I tools/compare_fbank.py --chunks 160,17,333,1000,4096,0
 ```
 
-脚本用同一分块节奏分别跑 `python_ref/src/audio_preprocess.py` 和 C++ 的
+脚本用同一分块节奏分别跑 `audio_ai_process/python/src/audio_preprocess.py` 和 C++ 的
 `fbank_dump.out`，输出 `mean|Δ|`、`max|Δ|` 与超差位置。判定阈值默认
 `mean|Δ| ≤ 1e-5`、`max|Δ| ≤ 1e-3`；当前实测为 0。
 
@@ -491,7 +508,7 @@ ASR 逐 token 对拍：
 
 ```bash
 # 1) C++ 侧导出 token
-./build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
+./audio_ai_process/build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
 
 # 2) Python 参考实现按同一块长（160 样本）解码并逐个 token 比较
 #    用带 numpy + onnxruntime 的 Python 环境（本机为 conda 环境 pytorch-gpu）
@@ -500,7 +517,7 @@ python -I tools/compare_asr.py --cpp /tmp/cpp_tokens.txt \
 ```
 
 `test_wav_asr.out` 每行写「文件名 <TAB> id,id,...」；脚本用 stdlib `wave` 读同一条
-wav，依次跑 `python_ref/src/audio_preprocess.py` 与 `asr_decode.py`（尾部同样补
+wav，依次跑 `audio_ai_process/python/src/audio_preprocess.py` 与 `asr_decode.py`（尾部同样补
 100 帧 0），逐 token 比较并打印 Python 侧文本。当前权重包自带的四个 wav
 全部一致；出现差异时会指出第几个 token、两侧 id。对拍脚本依赖 numpy，
 `compare_asr.py` 另需带 onnxruntime 的 Python 环境。
@@ -719,7 +736,7 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | `HkSdkAudioClient` | `stop()` 会关闭当前 wav；`StartVoiceCom` 同步调用约阻塞 1.2 秒 | 连续录音不能跨暂停；在 UI 线程调用 `start()` 会卡顿，应放后台 |
 | `HkSdkAudioClient` | 取流缓冲上限 40960 样本（约 2.56 s） | 调用 `get_last_audio()` 间隔过长会丢弃最旧样本 |
 | `HkSdkAudioClient` | 静音补零依赖回调到达时刻（SDK 无设备时间戳），阈值 200 ms、单次上限 10 s；更长的断线只补前 10 s | 小于阈值的抖动不补；超过 10 s 的断线仍会让 wav 短于墙钟，超出部分丢弃后时间轴重新对齐 |
-| `tools/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
+| `hk_mic_client/include/wav_reader.h` | RIFF 解析只支持 PCM16 / float32，只取第一声道 | 其他编码或需要混音的 wav 不能直接使用 |
 | `SpectrogramImage` | 信息条使用 `cv::putText`，只支持 ASCII | 非 ASCII 标签会被替换成 `?` |
 | `test_wav_asr.cpp` | 模型按 16 kHz 训练，非 16 kHz 的 wav 只提示不重采样 | 采样率不对时识别结果不可用 |
 | `test_mic_asr.cpp` | 输出采样率由 `output_sample_rate=16000` 保证，配置被误改时会直接报错退出 | 不要把它改回 0，否则 PCM 编码下无法识别 |
@@ -742,8 +759,8 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | 两个 ASR 入口 | Jetson 实测 CUDA EP 反而更慢：每块只编码 61 帧，joiner/decoder 逐帧调用，116 个状态张量每次进出一遍 | 实时场景默认用 CPU；开 `--cuda` 前先用 `tools/bench_perf.sh --cuda` 实测 |
 | 两个 ASR 入口 | 已改为 `init()` → 模型加载 → `start()`：开流时主循环已就绪，启动阶段不再丢音频 | Jetson 实测丢块 0；若再出现启动积压，先确认 `start()` 是否被提前调用 |
 | 共享库 | 两个库以 SHARED 构建，Linux 下无需导出宏；ORT / OpenCV 不随安装复制 | Windows 构建需补 `__declspec(dllexport)`；部署机需自备 ORT 与 OpenCV 运行库 |
-| `weight/`、`onnxruntime/install/` | 体积大且按模型/平台分发，不入库 | 克隆后需自行放置权重与 ORT 预编译库，否则推理目标无法构建 |
-| `hk_mic_client/hk_sdk/` | 厂商预编译库，体积较大且按平台分目录 | 换平台需确认对应目录与运行期依赖完整 |
+| `weight/`、`3rd/onnxruntime/install/` | 体积大且按模型/平台分发，不入库 | 克隆后需自行放置权重与 ORT 预编译库，否则推理目标无法构建 |
+| `3rd/hk_sdk/` | 厂商预编译库，体积较大且按平台分目录 | 换平台需确认对应目录与运行期依赖完整 |
 
 ## 后续计划（未实施）
 
@@ -756,8 +773,8 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | 中 | PCM 长会话没有自动分段重开 | 已确认 21.5 秒是单次 `StartVoiceCom` 会话上限（重启设备、持久配置后一致）；实测 25 秒 `stop()` → `start()` 后包数与取流恢复，但客户端未自动做 | 在 `HkSdkAudioClient` 内对 PCM 下行每约 20 秒自动重开语音转发；注意与录制收尾、暂停状态和 `StartVoiceCom` 约 1.2 秒阻塞协调 |
 | 中 | 不做自动重连 | 断流后需上层 `stop()` → `start()`，登录会话未失效时不必 `init()` | 加 watchdog：`packets` 一段时间不增长即重连；必须抑制「设备静音不发包」的误判，阈值取设备最长静音间隔 |
 | 中 | 双模式缺少性能基准 | `bench_perf.sh` 只解析 ASR 入口的统计行，`test_mic_kws_asr.out` 暂未纳入 | 补脚本分支：解析双模式入口的唤醒 / 切回 / 回填 / 两类编码调用，比较 KWS 长时监听与 ASR 段的 CPU 占用 |
-| 低 | KWS 没有 oracle 对拍 | 实时双模式已落地，但 `--dump-hits` 导出的关键词 / 首 token 时间 / 平均概率还没和 sherpa-onnx wheel 逐条比较 | 移植 `python_ref/test_kws_oracle_mini.py` 的做法，对拍 TSV 的关键词与时间戳 |
-| 低 | 唤醒词文件只在双模式入口可换 | 仓库级 `keywords/kws_keywords.txt` 已建，`test_mic_kws_asr.out` 默认读它并支持 `--keywords`；离线 `test_wav_kws.out` 仍读权重包自带的 `test_wavs/keywords.txt` | 给离线入口也加 `--keywords`，默认保持权重包文件作回归基准 |
+| 低 | KWS 没有 oracle 对拍 | 实时双模式已落地，但 `--dump-hits` 导出的关键词 / 首 token 时间 / 平均概率还没和 sherpa-onnx wheel 逐条比较 | 移植 `audio_ai_process/python/test_kws_oracle_mini.py` 的做法，对拍 TSV 的关键词与时间戳 |
+| 低 | 唤醒词文件只在双模式入口可换 | 仓库内 `audio_ai_process/keywords/kws_keywords.txt` 已建，`test_mic_kws_asr.out` 默认读它并支持 `--keywords`；离线 `test_wav_kws.out` 仍读权重包自带的 `test_wavs/keywords.txt` | 给离线入口也加 `--keywords`，默认保持权重包文件作回归基准 |
 | 低 | 启动失败报错时机 | `init()` 的登录/编码错误能立即报；`StartVoiceCom` 失败要等模型加载完才报 | 若现场更在意早报错，可在 `init()` 后追加一次「起流 → 立即停流」探测，代价是约 1.2 秒 |
 | 低 | 没有单元测试框架 | 全靠对拍脚本与自检入口，依赖人工执行 | 把 `compare_fbank.py`、`compare_asr.py` 与三个自检入口接入 CI |
 | 低 | Windows 未实机验证 | 目录与链接路径已配置，共享库缺导出宏 | 补 `__declspec(dllexport)` 后在 Windows 上走一遍构建与冒烟 |
@@ -767,6 +784,6 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | 文档 | 内容 |
 | --- | --- |
 | [`hk_mic_client/hk_audio_README.md`](hk_mic_client/hk_audio_README.md) | G.722.1 帧长、回调包、解码单元、PCM 对比、上行保活、init/start/stop/deinit 生命周期与失败分级 |
-| [`python_ref/README.md`](python_ref/README.md) | Python 参考实现：前端七项 kaldi 口径、模型结构、贪心搜索、KWS 束搜索与唤醒词设置、流式等价性与实测数据 |
-| [`onnxruntime/README.md`](onnxruntime/README.md) | 两个平台的 ONNX Runtime 安装、CUDA EP 与 cuDNN 9 配置 |
+| [`audio_ai_process/python/README.md`](audio_ai_process/python/README.md) | Python 参考实现：前端七项 kaldi 口径、模型结构、贪心搜索、KWS 束搜索与唤醒词设置、流式等价性与实测数据 |
+| [`3rd/onnxruntime/README.md`](3rd/onnxruntime/README.md) | 两个平台的 ONNX Runtime 安装、CUDA EP 与 cuDNN 9 配置 |
 | [`weight/`](weight/) 各模型目录的 `README.md` | 权重来源、模型结构说明与官方 `test_onnx.py` |

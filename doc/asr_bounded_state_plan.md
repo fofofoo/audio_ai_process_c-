@@ -2,7 +2,7 @@
 
 - 状态：阶段一、二已实施并验证（2026-11-05）；阶段三（双模式入口）待做
 - 范围：`{include,src}/asr_decode.*`、`test_wav_asr.cpp`、`test_mic_asr.cpp`，以及后续的 BlockWorker / AsrSession / 双模式入口
-- 不改：`python_ref/`、`KwsDecoder`、`tools/compare_asr.py` 的对拍口径
+- 不改：`audio_ai_process/python/`、`KwsDecoder`、`tools/compare_asr.py` 的对拍口径
 
 ---
 
@@ -354,7 +354,7 @@ session.finish()
 - `kill -9` 后最多丢当前未满 64 token 的尾巴，已结算段都在文件里；
 - 正常退出后尾段被结算，文件内容与最终文本一致；
 - `test_wav_asr` 不受影响；
-- `./build/test_context_graph.out`、`./build/test_wav_kws.out` 仍通过。
+- `./audio_ai_process/build/test_context_graph.out`、`./audio_ai_process/build/test_wav_kws.out` 仍通过。
 
 **回滚**：阶段二只影响 `test_mic_asr` 与新文件，删除新文件并还原入口即可。
 
@@ -373,7 +373,7 @@ session.finish()
 
 ### 阶段三：双模式入口（原 B3）
 
-- 新增 `keywords/kws_keywords.txt`；
+- 新增 `audio_ai_process/keywords/kws_keywords.txt`；
 - 新增 `test_mic_kws_asr.cpp` 与 `KwsAsrSession`；
 - `KwsAsrSession` 内部持有 `KwsDecoder` 和一个 `AsrSession` 成员；
 - 复用 `BlockWorker`，不新增 Worker 类；
@@ -409,7 +409,7 @@ session.finish()
 | 层次 | 命令 | 期望 |
 |---|---|---|
 | 编译 | `cmake --build build -j` | 通过 |
-| 模型契约 | `./build/load_onnx_model.out` | 通过 |
+| 模型契约 | `./audio_ai_process/build/load_onnx_model.out` | 通过 |
 | 前端 | `python3 -I tools/compare_fbank.py` | 逐位一致（不受影响） |
 | token 对拍 | `test_wav_asr --dump-tokens` + `compare_asr.py` | 四个 wav 全一致 |
 | 文本回归 | 改动前后 stdout「识别结果」diff | 逐字节一致 |

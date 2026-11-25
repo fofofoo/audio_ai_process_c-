@@ -57,7 +57,7 @@
 注意：
 
 - B0 / B1 用的音频里**不能含唤醒词**（否则会切进 ASR，测的就不是待机）。
-  执行前先看 `keywords/kws_keywords.txt`，确认所选视频没有相近发音；
+  执行前先看 `audio_ai_process/keywords/kws_keywords.txt`，确认所选视频没有相近发音；
   或临时用 `--keywords` 指向一个只含生僻词的临时文件。
 - C0 / C1 必须让音频**持续有人声**，且**中间不能有 10 秒以上静音**：ASR 在静音时
   每帧都是 blank、不刷新 decoder，CPU 偏低；更糟的是空闲满 10 s 会**自动切回 KWS**，
@@ -108,7 +108,7 @@ cpu_sample() {
 
 ```bash
 # 1) 启动入口，日志单独存
-./build/test_mic_kws_asr.out --no-window --seconds 40 > /tmp/cpu_b0_run1.log 2>&1 &
+./audio_ai_process/build/test_mic_kws_asr.out --no-window --seconds 40 > /tmp/cpu_b0_run1.log 2>&1 &
 
 # 2) 等它打印「识别结果（Ctrl+C」再开始采样（此时已开流）
 until grep -q "识别结果（Ctrl+C" /tmp/cpu_b0_run1.log; do sleep 0.5; done
@@ -137,7 +137,7 @@ grep -E "^时长|^ASR：|^KWS：|^唤醒|^取流丢弃" /tmp/cpu_b0_run1.log
 ### 4.5 纯前端基线 A1
 
 ```bash
-./build/test_spectrogram_cv_mic.out 40 > /tmp/cpu_a1_run1.log 2>&1 &
+./hk_mic_client/build/test_spectrogram_cv_mic.out 40 > /tmp/cpu_a1_run1.log 2>&1 &
 sleep 3                                     # 它是轮询型入口，没有「识别结果」横幅
 PID=$(pgrep -f "test_spectrogram_cv_mic.out 40" | head -1)
 sleep 7                                     # 省掉预热：总共等约 10 s 再采样

@@ -4,7 +4,7 @@
 
 流程：
     同一条 wav
-      ├─ Python：stdlib wave 解码 -> python_ref/src/audio_preprocess.py
+      ├─ Python：stdlib wave 解码 -> audio_ai_process/python/src/audio_preprocess.py
       └─ C++   ：裸 float32 -> build/fbank_dump.out -> AudioPreprocess
     两边按相同块长喂入，逐帧逐 Mel 比较 mean|Δ| / max|Δ|。
 
@@ -32,7 +32,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-REF_PATH = os.path.join(ROOT, "python_ref", "src", "audio_preprocess.py")
+REF_PATH = os.path.join(ROOT, "audio_ai_process", "python", "src", "audio_preprocess.py")
 
 
 def load_reference_class():
@@ -149,7 +149,7 @@ def main():
                                       "hk_audio_20261102_085654.wav"),
         help="待比较的 PCM16 wav")
     parser.add_argument(
-        "--cpp", default=os.path.join(ROOT, "build", "fbank_dump.out"),
+        "--cpp", default=os.path.join(ROOT, "hk_mic_client", "build", "fbank_dump.out"),
         help="C++ 特征 dump 工具")
     parser.add_argument(
         "--chunks", default="160,1000,4096,0",

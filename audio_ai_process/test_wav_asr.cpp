@@ -60,7 +60,7 @@
 #include "spectrogram_image.h"
 #include "text_renderer.h"
 #include "text_utils.h"
-#include "tools/wav_reader.h"
+#include "wav_reader.h"
 
 #include <onnxruntime_cxx_api.h>
 

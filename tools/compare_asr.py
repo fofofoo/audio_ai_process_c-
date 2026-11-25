@@ -5,8 +5,8 @@
 流程：
     同一条 wav
       ├─ C++   ：test_wav_asr.out --no-window --dump-tokens → name<TAB>id,id,...
-      └─ Python：stdlib wave 解码 → python_ref/src/audio_preprocess.py
-                 → python_ref/src/asr_decode.py（同一个 160 样本块长）
+      └─ Python：stdlib wave 解码 → audio_ai_process/python/src/audio_preprocess.py
+                 → audio_ai_process/python/src/asr_decode.py（同一个 160 样本块长）
     逐 token 比较两侧的 id 序列，同时打印 Python 侧文本供肉眼核对。
 
 为什么要用参考实现而不是只比文本：
@@ -19,7 +19,7 @@
     ... tools/compare_asr.py --cpp /tmp/cpp_tokens.txt --wav-dir <test_wavs>
 
 前置：先跑 C++ 侧导出
-    ./build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
+    ./audio_ai_process/build/test_wav_asr.out --no-window --dump-tokens /tmp/cpp_tokens.txt
 
 判定：
     每个 wav 的 token 序列完全相同 → 返回 0；
@@ -36,8 +36,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-REF_PRE_PATH = os.path.join(ROOT, "python_ref", "src", "audio_preprocess.py")
-REF_ASR_PATH = os.path.join(ROOT, "python_ref", "src", "asr_decode.py")
+REF_PRE_PATH = os.path.join(ROOT, "audio_ai_process", "python", "src", "audio_preprocess.py")
+REF_ASR_PATH = os.path.join(ROOT, "audio_ai_process", "python", "src", "asr_decode.py")
 DEFAULT_MODEL_DIR = os.path.join(
     ROOT, "weight",
     "sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-"
@@ -86,7 +86,7 @@ def load_cpp_tokens(path):
     """
     if not os.path.isfile(path):
         raise SystemExit("找不到 C++ token 导出文件：%s\n"
-                         "先运行 ./build/test_wav_asr.out --no-window "
+                         "先运行 ./audio_ai_process/build/test_wav_asr.out --no-window "
                          "--dump-tokens %s" % (path, path))
     result = {}
     with open(path, encoding="utf-8") as f:

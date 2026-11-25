@@ -63,7 +63,7 @@
 #include "audio_preprocess.h"
 #include "kws_decode.h"
 #include "text_utils.h"
-#include "tools/wav_reader.h"
+#include "wav_reader.h"
 
 #include <onnxruntime_cxx_api.h>
 

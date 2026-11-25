@@ -1,9 +1,13 @@
 # ===== 构建产物 =====
-/build/
+# 两个库各自独立构建，构建目录都在自己的子目录下
+/hk_mic_client/build/
+/audio_ai_process/build/
+# 旧根工程 build 改名保留的临时目录（确认无用后可删除）
+/audio_ai_process/build.legacy/
 
 # ===== 安装产物 =====
-# cmake --install 输出，按需在本机生成
-/install/
+# cmake --install 输出到 3rd/zl_3rd，按需在本机生成
+/3rd/zl_3rd/
 
 # ===== 运行产物 =====
 # results/ 只保留目录占位，录音与截图不入库
@@ -18,11 +22,11 @@
 
 # ===== 离线资源，不入库 =====
 # 模型权重与预编译 ORT 库体积大、按平台/模型分发；
-# onnxruntime/README.md 保留入库，说明安装与接入方式。
+# 3rd/onnxruntime/README.md 保留入库，说明安装与接入方式。
 /weight/
-/onnxruntime/install/
+/3rd/onnxruntime/install/
 
-# ===== Python 缓存（python_ref 自带 .gitignore，这里兜底） =====
+# ===== Python 缓存（audio_ai_process/python 自带 .gitignore，这里兜底） =====
 __pycache__/
 *.py[cod]
 

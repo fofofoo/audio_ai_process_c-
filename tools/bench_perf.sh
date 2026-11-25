@@ -50,8 +50,8 @@ set -u
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR" || exit 1
 
-WAV_ASR="./build/test_wav_asr.out"
-MIC_ASR="./build/test_mic_asr.out"
+WAV_ASR="./audio_ai_process/build/test_wav_asr.out"
+MIC_ASR="./audio_ai_process/build/test_mic_asr.out"
 SAMPLE_RATE=16000   # 两个入口都要求 16 kHz，丢块 / 喂入样本按它换算秒数
 # 取流缓冲上限：max_stream_samples = 40960 样本 @ 16 kHz ≈ 2.56 s。
 # 启动积压超过它，超出的部分在进入主循环之前就已经被丢了。
