@@ -55,11 +55,11 @@
  * 按键（窗口模式）：q / Esc 停止后续文件，最终仍需按键关闭窗口。
  */
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/spectrogram_image.h"
-#include "audio_ai_process/text_renderer.h"
-#include "audio_ai_process/text_utils.h"
+#include "asr_decode.h"
+#include "audio_preprocess.h"
+#include "spectrogram_image.h"
+#include "text_renderer.h"
+#include "text_utils.h"
 #include "tools/wav_reader.h"
 
 #include <onnxruntime_cxx_api.h>

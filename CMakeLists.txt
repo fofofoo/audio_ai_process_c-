@@ -173,21 +173,26 @@ endforeach()
 #  语谱图与文本渲染。ORT 缺失时跳过 asr_decode.cpp / kws_decode.cpp 与四个
 #  ORT 入口，音频采集、语谱图与 fbank 对拍仍可构建。
 # =====================================================================
-set(AAP_DIR "${CMAKE_SOURCE_DIR}/audio_ai_process")
+# 库目录按「接口 / 实现」拆开：
+#   include/  公共头文件平铺，include 根就是 include/，外部写 #include "xxx.h"
+#             （与安装后一致，和 hk_mic_client 的头文件风格相同）
+#   src/      全部 ASR 库 .cpp，不对使用方暴露
+set(AAP_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include")
+set(AAP_SRC_DIR     "${CMAKE_SOURCE_DIR}/src")
 
 set(audio_ai_process_SOURCES
-    ${AAP_DIR}/audio_preprocess.cpp
-    ${AAP_DIR}/kws_context_graph.cpp
-    ${AAP_DIR}/spectrogram_image.cpp
-    ${AAP_DIR}/text_utils.cpp
-    ${AAP_DIR}/text_renderer.cpp
+    ${AAP_SRC_DIR}/audio_preprocess.cpp
+    ${AAP_SRC_DIR}/kws_context_graph.cpp
+    ${AAP_SRC_DIR}/spectrogram_image.cpp
+    ${AAP_SRC_DIR}/text_utils.cpp
+    ${AAP_SRC_DIR}/text_renderer.cpp
 )
 if(ORT_FOUND)
     list(APPEND audio_ai_process_SOURCES
-        ${AAP_DIR}/asr_decode.cpp
-        ${AAP_DIR}/asr_session.cpp
-        ${AAP_DIR}/kws_asr_session.cpp
-        ${AAP_DIR}/kws_decode.cpp
+        ${AAP_SRC_DIR}/asr_decode.cpp
+        ${AAP_SRC_DIR}/asr_session.cpp
+        ${AAP_SRC_DIR}/kws_asr_session.cpp
+        ${AAP_SRC_DIR}/kws_decode.cpp
     )
 endif()
 
@@ -207,10 +212,12 @@ foreach(TARGET ${LIB_DEMOS})
         INSTALL_RPATH "$ORIGIN"
     )
 
-    # 公共头文件使用 audio_ai_process/xxx.h 与 opencv2/... 写法，
-    # 因此把工作区根目录与 OpenCV 头文件路径传给使用方。
+    # 公共头文件平铺在 include/，使用方直接写 #include "xxx.h"（与 opencv2/... 同级）；
+    # 因此把 include/ 与 OpenCV 头文件路径传给使用方。
+    # 注意这里不再传工作区根目录：入口自己的仓库相对 include（如
+    # tools/wav_reader.h）在入口 target 里单独给出，库的搜索路径不夹带仓库根。
     target_include_directories(${TARGET} PUBLIC
-        ${CMAKE_SOURCE_DIR}
+        ${AAP_INCLUDE_DIR}
         ${OpenCV_INCLUDE_DIRS}
     )
 
@@ -305,6 +312,10 @@ foreach(TARGET ${EXEC_DEMOS})
         HK_PROJECT_DIR="${CMAKE_SOURCE_DIR}"
     )
 
+    # 仓库根搜索路径：入口 include "tools/wav_reader.h" 这类仓库相对路径。
+    # ASR 库的 PUBLIC 路径已收窄到 include/，不再顺带传仓库根。
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+
     # ${TARGET} 链接到 OpenCV 的库
     # audio_ai_process 已用 PUBLIC 传递，这里再显式写出：
     # 每个入口依赖了什么一眼可见，也便于日后单独替换某个入口的链接。
@@ -363,19 +374,19 @@ set(HK_AUDIO_HEADERS
 )
 
 set(AAP_HEADERS
-    ${AAP_DIR}/audio_preprocess.h
-    ${AAP_DIR}/block_worker.h
-    ${AAP_DIR}/kws_context_graph.h
-    ${AAP_DIR}/spectrogram_image.h
-    ${AAP_DIR}/text_utils.h
-    ${AAP_DIR}/text_renderer.h
+    ${AAP_INCLUDE_DIR}/audio_preprocess.h
+    ${AAP_INCLUDE_DIR}/block_worker.h
+    ${AAP_INCLUDE_DIR}/kws_context_graph.h
+    ${AAP_INCLUDE_DIR}/spectrogram_image.h
+    ${AAP_INCLUDE_DIR}/text_utils.h
+    ${AAP_INCLUDE_DIR}/text_renderer.h
 )
 if(ORT_FOUND)
     list(APPEND AAP_HEADERS
-        ${AAP_DIR}/asr_decode.h
-        ${AAP_DIR}/asr_session.h
-        ${AAP_DIR}/kws_asr_session.h
-        ${AAP_DIR}/kws_decode.h
+        ${AAP_INCLUDE_DIR}/asr_decode.h
+        ${AAP_INCLUDE_DIR}/asr_session.h
+        ${AAP_INCLUDE_DIR}/kws_asr_session.h
+        ${AAP_INCLUDE_DIR}/kws_decode.h
     )
 endif()
 
@@ -427,10 +438,10 @@ install(DIRECTORY "${HIK_LIB_ROOT}/"
     PATTERN "*.dll"
 )
 
-# ASR 库：头文件保留 audio_ai_process/ 前缀，使用方 include 路径与源码一致。
+# ASR 库：头文件平铺到 include/，与源码 #include "xxx.h" 写法一致。
 # ORT / OpenCV 不复制，属于外部运行期依赖（见 README）。
 install_module(audio_ai_process
     "${INSTALL_ROOT}/audio_ai_process"
     "${AAP_HEADERS}"
-    "audio_ai_process"
+    ""
 )

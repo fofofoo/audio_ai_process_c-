@@ -10,7 +10,7 @@
  * 走 AsrDecoder::text_of() / recent_text()，保证与离线入口逐字节一致。
  */
 
-#include "audio_ai_process/asr_session.h"
+#include "asr_session.h"
 
 #include <cstdio>
 #include <filesystem>

@@ -103,16 +103,16 @@ SHARED 库，入口只做装配。
 | 采集源码 | `hk_mic_client/hk_sdk_audio_client.{h,cpp}` | 设备连接与音频流水线 |
 | 采集源码 | `hk_mic_client/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），PCM 32 kHz → 16 kHz；零外部依赖 |
 | 采集源码 | `hk_mic_client/hk_sdk/` | 厂商 HCNetSDK 头文件与预编译库（按平台分目录） |
-| ASR 源码 | `audio_ai_process/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
-| ASR 源码 | `audio_ai_process/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
-| KWS 源码 | `audio_ai_process/kws_decode.{h,cpp}` | 流式关键词唤醒：三模型推理、trie 约束的束搜索、尾随 blank 触发判定、静音软重置 |
-| KWS 源码 | `audio_ai_process/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
-| 框架 | `audio_ai_process/block_worker.h` | header-only 异步管家：有界队列 + 单消费者线程，满时丢最旧、尾块阻塞不丢、异常捕获与 join |
-| 双模式源码 | `audio_ai_process/asr_session.{h,cpp}` | ASR 外部长期缓存：全量 token、64 token 分段、转写落盘、显示快照 |
-| 双模式源码 | `audio_ai_process/kws_asr_session.{h,cpp}` | 双模式模式机：KWS ↔ ASR 切换、100 帧回填环、10 秒空闲计时、结束语判定、事件与统计 |
-| ASR 源码 | `audio_ai_process/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
-| ASR 源码 | `audio_ai_process/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
-| ASR 源码 | `audio_ai_process/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
+| ASR 源码 | `{include,src}/audio_preprocess.{h,cpp}` | 流式 LogFBank 前端：PCM 块 → `(n_frames, n_mels)` 特征 |
+| ASR 源码 | `{include,src}/asr_decode.{h,cpp}` | 流式 ASR 解码：三模型推理、贪心搜索、文本还原、跨块状态 |
+| KWS 源码 | `{include,src}/kws_decode.{h,cpp}` | 流式关键词唤醒：三模型推理、trie 约束的束搜索、尾随 blank 触发判定、静音软重置 |
+| KWS 源码 | `{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树（trie + fail/output 弧）：逐 token 步进、关键词加分与命中判定；纯标准库，不依赖 ORT |
+| 框架 | `include/block_worker.h` | header-only 异步管家：有界队列 + 单消费者线程，满时丢最旧、尾块阻塞不丢、异常捕获与 join |
+| 双模式源码 | `{include,src}/asr_session.{h,cpp}` | ASR 外部长期缓存：全量 token、64 token 分段、转写落盘、显示快照 |
+| 双模式源码 | `{include,src}/kws_asr_session.{h,cpp}` | 双模式模式机：KWS ↔ ASR 切换、100 帧回填环、10 秒空闲计时、结束语判定、事件与统计 |
+| ASR 源码 | `{include,src}/spectrogram_image.{h,cpp}` | 特征 → BGR 滚动语谱图画布 |
+| ASR 源码 | `{include,src}/text_renderer.{h,cpp}` | UTF-8 文本 → BGR 画布（FreeType 渲染中文，可选依赖） |
+| ASR 源码 | `{include,src}/text_utils.{h,cpp}` | UTF-8 编解码、字符分类、系统路径等小工具 |
 | 入口 | `save_audio_wav.cpp` | 录 10 秒设备音频到 `results/` |
 | 入口 | `test_spectrogram_cv_mic.cpp` | 设备实时语谱图入口 |
 | 入口 | `test_spectrogram_cv_wav.cpp` | wav 文件语谱图入口 |
@@ -260,8 +260,8 @@ C++ 侧三个部件：
 
 | 部件 | 路径 | 职责 |
 | --- | --- | --- |
-| `KwsContextGraph` | `audio_ai_process/kws_context_graph.{h,cpp}` | 关键词前缀树：加分、逐 token 步进、命中判定；纯标准库 |
-| `KwsDecoder` | `audio_ai_process/kws_decode.{h,cpp}` | 分块编码、trie 约束的束搜索、触发判定、静音软重置 |
+| `KwsContextGraph` | `{include,src}/kws_context_graph.{h,cpp}` | 关键词前缀树：加分、逐 token 步进、命中判定；纯标准库 |
+| `KwsDecoder` | `{include,src}/kws_decode.{h,cpp}` | 分块编码、trie 约束的束搜索、触发判定、静音软重置 |
 | `test_wav_kws.out` | `test_wav_kws.cpp` | 离线验收入口：wav → 特征 → 命中事件，不开窗口 |
 
 Python 参考实现在 `python_ref/src/kws_decode.py`；C++ 按它的逐帧语义移植，并按
@@ -349,7 +349,7 @@ install/
 │   ├── include/   hk_sdk_audio_client.h、audio_resampler.h、HCNetSDK 头文件
 │   └── lib/       lib_hk_sdk_audio_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
 └── audio_ai_process/
-    ├── include/audio_ai_process/*.h
+    ├── include/*.h
     └── lib/lib_audio_ai_process.so
 ```
 

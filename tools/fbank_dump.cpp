@@ -17,7 +17,7 @@
  *   n_mels    Mel 通道数
  */
 
-#include "audio_ai_process/audio_preprocess.h"
+#include "audio_preprocess.h"
 
 #include <algorithm>
 #include <cstdint>

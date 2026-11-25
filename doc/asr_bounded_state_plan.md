@@ -1,7 +1,7 @@
 # 实时 ASR 有界状态与转写落盘改造计划
 
 - 状态：阶段一、二已实施并验证（2026-11-05）；阶段三（双模式入口）待做
-- 范围：`audio_ai_process/asr_decode.*`、`test_wav_asr.cpp`、`test_mic_asr.cpp`，以及后续的 BlockWorker / AsrSession / 双模式入口
+- 范围：`{include,src}/asr_decode.*`、`test_wav_asr.cpp`、`test_mic_asr.cpp`，以及后续的 BlockWorker / AsrSession / 双模式入口
 - 不改：`python_ref/`、`KwsDecoder`、`tools/compare_asr.py` 的对拍口径
 
 ---
@@ -242,7 +242,7 @@ AsrSession 不调用 `run_encoder` / `run_joiner` / `run_decoder`，所有模型
 
 ## 五、BlockWorker 异步改造
 
-新增 `audio_ai_process/block_worker.h`（header-only 模板），语义沿用 `doc/audio_ai_block_worker.md`：
+新增 `include/block_worker.h`（header-only 模板），语义沿用 `doc/audio_ai_block_worker.md`：
 
 ```cpp
 template <typename Block>
@@ -303,12 +303,12 @@ session.finish()
 
 **改动文件**
 
-1. `audio_ai_process/asr_decode.h`
+1. `include/asr_decode.h`
    - 增加 `recent_text()`、`text_of()`；
    - 增加 `recent_tokens_`、`recent_text_`；
    - 删除 `hyp_`、`text_`、`token_ids()`、`text()`；
    - `accept_features()` 返回值改为 `std::vector<int64_t>`。
-2. `audio_ai_process/asr_decode.cpp`
+2. `src/asr_decode.cpp`
    - 重写 `accept_features()`：追加特征 → 出块 → 贪心 → 新 token 追加并裁剪 → 维护窗口文本 → 返回新增 id；
    - `run_decoder()` 输入改为「最近 `context_size` 个，不足补 blank」；
    - 新增 `text_of()`，复用现有 `detokenize()`；
@@ -339,8 +339,8 @@ session.finish()
 
 **改动文件**
 
-1. 新增 `audio_ai_process/block_worker.h`；
-2. 新增 `audio_ai_process/asr_session.h/.cpp`；
+1. 新增 `include/block_worker.h`；
+2. 新增 `include/asr_session.h` 与 `src/asr_session.cpp`；
 3. `test_mic_asr.cpp`：删除本地 `AsrWorker`，改为 `AsrSession` + `BlockWorker`；
 4. `CMakeLists.txt`：`asr_session.cpp` 加入 `lib_audio_ai_process`，新头文件随库安装；
 5. `.gitignore`：加入 `log/`；`log/` 目录放 `.gitkeep`；

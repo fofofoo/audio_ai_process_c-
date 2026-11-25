@@ -60,9 +60,9 @@
  *       覆盖 boosting score / 触发阈值，并打印被阈值挡住的候选
  */
 
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/kws_decode.h"
-#include "audio_ai_process/text_utils.h"
+#include "audio_preprocess.h"
+#include "kws_decode.h"
+#include "text_utils.h"
 #include "tools/wav_reader.h"
 
 #include <onnxruntime_cxx_api.h>

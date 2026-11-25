@@ -54,7 +54,7 @@
 #include <utility>
 #include <vector>
 
-#include "audio_ai_process/kws_context_graph.h"
+#include "kws_context_graph.h"
 
 namespace {
 

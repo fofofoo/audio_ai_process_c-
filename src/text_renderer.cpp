@@ -12,9 +12,9 @@
  *                → 8-bit 灰度位图 → 按 alpha 混合到 BGR 画布
  */
 
-#include "audio_ai_process/text_renderer.h"
+#include "text_renderer.h"
 
-#include "audio_ai_process/text_utils.h"
+#include "text_utils.h"
 
 #include <fstream>
 

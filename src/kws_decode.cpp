@@ -69,7 +69,7 @@
  *     kws.reset();   // 换文件 / 重新开始监听
  */
 
-#include "audio_ai_process/kws_decode.h"
+#include "kws_decode.h"
 
 #include <algorithm>
 #include <cmath>

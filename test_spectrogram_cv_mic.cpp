@@ -25,8 +25,8 @@
  *   ./build/test_spectrogram_cv_mic.out 10       # 自检模式，跑 10 秒后存图退出
  */
 
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/spectrogram_image.h"
+#include "audio_preprocess.h"
+#include "spectrogram_image.h"
 #include "hk_sdk_audio_client.h"
 
 #include <chrono>

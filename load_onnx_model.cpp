@@ -28,7 +28,7 @@
  * 注意：CUDA EP 需要 cuDNN 9 在 LD_LIBRARY_PATH 里，具体见 onnxruntime/README.md。
  */
 
-#include "audio_ai_process/text_utils.h"
+#include "text_utils.h"
 
 #include <onnxruntime_cxx_api.h>
 

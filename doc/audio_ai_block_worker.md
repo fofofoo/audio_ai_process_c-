@@ -8,7 +8,7 @@
 框架、Worker 和业务类各自承担什么；最后用一次完整的唤醒过程和几条关键约定收尾。
 代码细节不是重点，理解这套分工和扩展方式才是。
 
-> **代码位置**：`audio_ai_process/block_worker.h`（header-only 模板，随
+> **代码位置**：`include/block_worker.h`（header-only 模板，随
 > `lib_audio_ai_process` 安装）；单模式 Session 在 `asr_session.h/.cpp`，
 > 双模式 Session 在 `kws_asr_session.h/.cpp`。
 >
@@ -570,7 +570,7 @@ BlockWorker<TtsRequest> worker(
 
 ## 12. 落地方式
 
-`BlockWorker` 放在 `audio_ai_process/block_worker.h`，是一个 header-only 模板，
+`BlockWorker` 放在 `include/block_worker.h`，是一个 header-only 模板，
 随 `lib_audio_ai_process` 安装，不新增 `.cpp`，也不引入新的外部依赖。
 
 单模式的 `test_mic_asr.cpp` 用它替换原来的 `AsrWorker`：Worker 负责线程和音频特征

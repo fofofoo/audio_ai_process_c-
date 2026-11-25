@@ -42,7 +42,7 @@
 #include <string>
 #include <vector>
 
-#include "audio_ai_process/audio_preprocess.h"
+#include "audio_preprocess.h"
 
 namespace audio_ai {
 

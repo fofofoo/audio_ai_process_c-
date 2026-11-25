@@ -59,9 +59,9 @@
 #include <string>
 #include <vector>
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/asr_session.h"
-#include "audio_ai_process/kws_decode.h"
+#include "asr_decode.h"
+#include "asr_session.h"
+#include "kws_decode.h"
 
 namespace audio_ai {
 

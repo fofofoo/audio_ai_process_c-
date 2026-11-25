@@ -8,7 +8,7 @@
  * 本文件只依赖标准库与 POSIX（dirent / sys/stat），不引入 ROS / OpenCV / ORT。
  */
 
-#include "audio_ai_process/text_utils.h"
+#include "text_utils.h"
 
 #include <dirent.h>
 #include <sys/stat.h>

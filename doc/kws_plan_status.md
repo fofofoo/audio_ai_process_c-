@@ -42,7 +42,7 @@ KWS 监听 --命中唤醒词--> ASR 识别
 
 **已落地文件**
 
-- `audio_ai_process/kws_context_graph.h/.cpp`：Aho-Corasick 风格的关键词前缀树。
+- `include/kws_context_graph.h` 与 `src/kws_context_graph.cpp`：Aho-Corasick 风格的关键词前缀树。
   构造期按 `KeywordSpec` 建 trie、填 fail/output 弧；运行期 `forward_one_step()`
   逐 token 步进，`is_matched()` 判断是否走完整条关键词。纯标准库，不依赖 ORT / ROS。
 - `tools/test_context_graph.cpp`：搬上游 `context-graph-test.cc` 的 4 组期望值，
@@ -68,7 +68,7 @@ KWS 监听 --命中唤醒词--> ASR 识别
 
 **已落地文件**
 
-- `audio_ai_process/kws_decode.h/.cpp`：流式关键词唤醒。持有三个 `Ort::Session`
+- `include/kws_decode.h` 与 `src/kws_decode.cpp`：流式关键词唤醒。持有三个 `Ort::Session`
   与 38 个状态张量，按值持有 `KwsContextGraph`；完成分块编码、束搜索（每帧批量跑
   decoder / joiner）、尾随 blank 触发判定与静音软重置。
 - `test_wav_kws.cpp`：离线 wav 入口，对应 `python_ref/test_wav_kws_mini.py`。
@@ -247,11 +247,11 @@ C++ 侧读取的是生成后的音素行格式：
 
 **新增 / 改动文件**
 
-- `audio_ai_process/kws_asr_session.h/.cpp`：模式机、100 帧回填环、空闲计时、
+- `include/kws_asr_session.h` 与 `src/kws_asr_session.cpp`：模式机、100 帧回填环、空闲计时、
   结束语判定、事件序号与统计；只做业务编排，不碰 ORT / 线程 / 队列。
 - `test_mic_kws_asr.cpp`：设备取流 → 前端 → `BlockWorker` → `KwsAsrSession`，
   窗口两行状态（模式行 + 文本行），5 个命令行开关照设计落地。
-- `audio_ai_process/asr_session.h/.cpp`：补 `settle_segment()` / `token_count()` /
+- `include/asr_session.h` 与 `src/asr_session.cpp`：补 `settle_segment()` / `token_count()` /
   `current_text()` / `clear_history()`，供模式切换使用。
 - `keywords/kws_keywords.txt`：从 `python_ref/keywords/kws_keywords.txt` 复制。
 - `CMakeLists.txt`：库源、安装头文件、入口声明与链接分组同步。
@@ -332,7 +332,7 @@ B3 原计划紧接着 B2 做，但曾临时插入 ASR 缓存改造，原因是 *
 
 **实施结果（2026-11-05，阶段一、二均已完成）**：
 
-- `audio_ai_process/block_worker.h`（header-only 模板）、`audio_ai_process/asr_session.h/.cpp`
+- `include/block_worker.h`（header-only 模板）、`include/asr_session.h` 与 `src/asr_session.cpp`
   新增；`test_mic_asr.cpp` 的本地 `AsrWorker` 已删除，改用
   `BlockWorker<LogFbankFeatures>` + `AsrSession`；`test_wav_asr.cpp` 改为外部累积
   `all_ids`，收尾用 `text_of(all_ids)`。

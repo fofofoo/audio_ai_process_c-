@@ -25,9 +25,9 @@
  *   ./build/test_spectrogram_cv_wav.out results/xxx.wav --fast   # 尽快喂完，存图退出
  */
 
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/spectrogram_image.h"
-#include "audio_ai_process/text_utils.h"
+#include "audio_preprocess.h"
+#include "spectrogram_image.h"
+#include "text_utils.h"
 
 #include "tools/wav_reader.h"
 

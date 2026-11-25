@@ -82,15 +82,15 @@
  *       长跑同时把音频录到 results/kws_asr_<时间戳>.wav，便于事后回放复现
  */
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/asr_session.h"
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/block_worker.h"
-#include "audio_ai_process/kws_asr_session.h"
-#include "audio_ai_process/kws_decode.h"
-#include "audio_ai_process/spectrogram_image.h"
-#include "audio_ai_process/text_renderer.h"
-#include "audio_ai_process/text_utils.h"
+#include "asr_decode.h"
+#include "asr_session.h"
+#include "audio_preprocess.h"
+#include "block_worker.h"
+#include "kws_asr_session.h"
+#include "kws_decode.h"
+#include "spectrogram_image.h"
+#include "text_renderer.h"
+#include "text_utils.h"
 #include "hk_sdk_audio_client.h"
 
 #include <onnxruntime_cxx_api.h>

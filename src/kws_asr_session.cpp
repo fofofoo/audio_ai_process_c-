@@ -21,7 +21,7 @@
  * 线程与背压由 BlockWorker 负责，入口只负责装配。
  */
 
-#include "audio_ai_process/kws_asr_session.h"
+#include "kws_asr_session.h"
 
 #include <algorithm>
 #include <chrono>

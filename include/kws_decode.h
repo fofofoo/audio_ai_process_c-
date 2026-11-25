@@ -43,8 +43,8 @@
 #include <utility>
 #include <vector>
 
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/kws_context_graph.h"
+#include "audio_preprocess.h"
+#include "kws_context_graph.h"
 
 namespace audio_ai {
 

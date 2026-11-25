@@ -88,13 +88,13 @@
  *       CUDA EP，失败自动回退 CPU
  */
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/asr_session.h"
-#include "audio_ai_process/audio_preprocess.h"
-#include "audio_ai_process/block_worker.h"
-#include "audio_ai_process/spectrogram_image.h"
-#include "audio_ai_process/text_renderer.h"
-#include "audio_ai_process/text_utils.h"
+#include "asr_decode.h"
+#include "asr_session.h"
+#include "audio_preprocess.h"
+#include "block_worker.h"
+#include "spectrogram_image.h"
+#include "text_renderer.h"
+#include "text_utils.h"
 #include "hk_sdk_audio_client.h"
 
 #include <onnxruntime_cxx_api.h>

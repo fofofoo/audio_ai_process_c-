@@ -76,8 +76,8 @@
  *   4. blank 帧沿用旧 decoder_out，省掉绝大多数 decoder 前向。
  */
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/text_utils.h"
+#include "asr_decode.h"
+#include "text_utils.h"
 
 #include <algorithm>
 #include <cstdio>

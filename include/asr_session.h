@@ -40,8 +40,8 @@
 #include <string>
 #include <vector>
 
-#include "audio_ai_process/asr_decode.h"
-#include "audio_ai_process/block_worker.h"
+#include "asr_decode.h"
+#include "block_worker.h"
 
 namespace audio_ai {
 
