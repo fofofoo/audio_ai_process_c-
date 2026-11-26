@@ -1,5 +1,5 @@
 ##################################################################################
-#  audio_ai_processor —— 语音处理 ROS 节点
+#  kws_asr_processor —— 语音处理 ROS 节点
 #
 #  职责：
 #    海康设备实时取流 → LogFBank 前端 → 双模式 KWS/ASR 解码，
@@ -20,14 +20,14 @@
 #    cmake -S audio_ai_process -B audio_ai_process/build && cmake --build audio_ai_process/build -j
 #    cmake --install audio_ai_process/build
 #
-#  本包位于 <仓库根>/catkin_ws/src/audio_ai_processor，CMake 默认向上三级
+#  本包位于 <仓库根>/catkin_ws/src/kws_asr_processor，CMake 默认向上三级
 #  定位仓库根（仓库整体搬目录不用改）；特殊布局下用
 #    catkin_make -DAUDIO_AI_ROOT=/path/to/audio_ai_process
 #  覆盖（RPATH 与 ORT 路径都跟着它走）。
 ##################################################################################
 
 cmake_minimum_required(VERSION 3.0.2)
-project(audio_ai_processor)
+project(kws_asr_processor)
 
 # 与工作区其它节点保持一致：C++17 + Release
 set(CMAKE_CXX_STANDARD 17)
@@ -47,7 +47,7 @@ find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------
 # audio_ai_process 仓库根：库安装产物与权重都在这里
-#   本包位于 <仓库根>/catkin_ws/src/audio_ai_processor，上三级就是仓库根，
+#   本包位于 <仓库根>/catkin_ws/src/kws_asr_processor，上三级就是仓库根，
 #   整个仓库搬目录时不用改；特殊布局下用 catkin_make -DAUDIO_AI_ROOT=... 覆盖
 # ---------------------------------------------------------------------
 if(NOT DEFINED AUDIO_AI_ROOT)
@@ -114,10 +114,10 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
 )
 
-# 节点本体：main 只做参数与发布编排，流水线在 audio_ai_processor_node
+# 节点本体：main 只做参数与发布编排，流水线在 kws_asr_processor_node
 add_executable(${PROJECT_NAME}_node
   src/main.cpp
-  src/audio_ai_processor_node.cpp
+  src/kws_asr_processor_node.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}_node PRIVATE

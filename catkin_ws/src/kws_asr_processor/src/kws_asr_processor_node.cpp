@@ -1,5 +1,5 @@
 /**
- * @file audio_ai_processor_node.cpp
+ * @file kws_asr_processor_node.cpp
  * @brief 语音处理节点类实现：设备取流 → 前端 → 双模式解码 → 收尾统计。
  *
  * ============================================================
@@ -21,7 +21,7 @@
  *     ROS 自己接管 SIGINT，本类不再装信号处理函数。
  *   - 不再写 results/ 录音、不再有 --record / --seconds 等调试开关；
  *     转写文件路径由 main 从 launch 参数传入。
- *   - 事件与文本不在类里直接发布，而是通过 AudioAiProcessorStep 返回给
+ *   - 事件与文本不在类里直接发布，而是通过 KwsAsrProcessorStep 返回给
  *     main，保持「节点类不碰 publisher」的分层。
  *   - 窗口按键改为「返回 quit_requested」，由 main 调 ros::shutdown()。
  *
@@ -39,10 +39,10 @@
  * ============================================================
  * 用法
  * ============================================================
- *   roslaunch audio_ai_processor audio_ai_processor.launch
+ *   roslaunch kws_asr_processor kws_asr_processor.launch
  */
 
-#include "audio_ai_processor/audio_ai_processor_node.h"
+#include "kws_asr_processor/kws_asr_processor_node.h"
 
 #include <algorithm>
 #include <chrono>
@@ -73,7 +73,7 @@ constexpr int kCalibrateFrames = 50;  // 前 0.5 秒标定色阶后锁死
 constexpr int kHeaderH = 52;
 const cv::Size kPlotSize(1200, 300);  // 语谱图显示尺寸（宽，高）
 const char kLabel[] = "hk mic";       // 信息条标签（只能是 ASCII）
-const char kWindow[] = "audio_ai_processor kws+asr";  // 窗口标题（只能是 ASCII）
+const char kWindow[] = "kws_asr_processor kws+asr";  // 窗口标题（只能是 ASCII）
 
 // ==================== 二、KWS 解码参数 ====================
 // 与 test_wav_kws.cpp / test_mic_kws_asr.cpp 一致；关键词行里的
@@ -117,11 +117,11 @@ constexpr size_t kMaxStatusChars = 50;
 // ==================== 构造 / 析构 ====================
 
 // 只保存配置；设备与模型都要等 init()。
-AudioAiProcessorNode::AudioAiProcessorNode(const AudioAiProcessorConfig& config)
+KwsAsrProcessorNode::KwsAsrProcessorNode(const KwsAsrProcessorConfig& config)
     : config_(config) {}
 
 // 兜底收尾：main 正常退出时已经调过 shutdown()，这里靠 running_ 去重。
-AudioAiProcessorNode::~AudioAiProcessorNode() {
+KwsAsrProcessorNode::~KwsAsrProcessorNode() {
     shutdown();
 }
 
@@ -129,7 +129,7 @@ AudioAiProcessorNode::~AudioAiProcessorNode() {
 
 // 连接设备并加载全部模型与前端，成功后由 start() 开流。
 // 失败时返回 false 并保证设备已 deinit，调用方直接退出即可。
-bool AudioAiProcessorNode::init() {
+bool KwsAsrProcessorNode::init() {
     // —— 1. 连接设备（对应入口第二节）——
     // 1.1 填配置：pcm_sample_rate 只在设备走 PCM 时兜底；G.722.1 的采样率
     //     由编码本身固定为 16 kHz，客户端会自行纠正。
@@ -154,7 +154,7 @@ bool AudioAiProcessorNode::init() {
     //     开流放到 start()，模型加载期间设备不推流，不会产生启动丢块。
     client_ = std::make_unique<hk_isapi::HkSdkAudioClient>(capture_config);
     if (!client_->init()) {
-        ROS_ERROR("[audio_ai_processor] 设备初始化失败：%s",
+        ROS_ERROR("[kws_asr_processor] 设备初始化失败：%s",
                   client_->last_error().c_str());
         client_.reset();
         return false;
@@ -164,9 +164,8 @@ bool AudioAiProcessorNode::init() {
     //     不满足说明 output_sample_rate 与设备率无法匹配，直接拒绝启动。
     sample_rate_ = client_->sample_rate();
     if (sample_rate_ != kSampleRate) {
-        ROS_ERROR("[audio_ai_processor] 输出采样率是 %d Hz，而模型固定 16 kHz；"
-                  "设备实际采样率 = %d Hz",
-                  sample_rate_, client_->device_sample_rate());
+        ROS_ERROR("[kws_asr_processor] 输出采样率是 %d Hz，而模型固定 16 kHz；"
+                  "设备实际采样率 = %d Hz", sample_rate_, client_->device_sample_rate());
         client_->deinit();
         client_.reset();
         return false;
@@ -183,16 +182,14 @@ bool AudioAiProcessorNode::init() {
 
 // 加载 ONNX 模型、前端与可视化，装配三个会话与后台 Worker。
 // 调用前 client_ 必须已经 init() 成功；失败时已创建的对象由 unique_ptr 释放。
-bool AudioAiProcessorNode::loadModels() {
+bool KwsAsrProcessorNode::loadModels() {
     // 2.1 session 选项：多个 chunk 之间本来就串行，intra / inter 各 1 线程；
     //     日志降到 WARNING，避免加载时刷屏。
-    env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING,
-                                      "audio_ai_processor");
+    env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "kws_asr_processor");
     session_options_ = std::make_unique<Ort::SessionOptions>();
     session_options_->SetIntraOpNumThreads(1);
     session_options_->SetInterOpNumThreads(1);
-    session_options_->SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_ALL);
+    session_options_->SetGraphOptimizationLevel( GraphOptimizationLevel::ORT_ENABLE_ALL);
 
     // 2.2 可选 CUDA EP：注册失败只告警并回退 CPU，不中断启动。
     //     必须用 AppendExecutionProvider_CUDA；通用 AppendExecutionProvider
@@ -204,10 +201,10 @@ bool AudioAiProcessorNode::loadModels() {
             cuda_options.device_id = 0;
             session_options_->AppendExecutionProvider_CUDA(cuda_options);
             cuda_status_ = "CUDA";
-            ROS_INFO("[audio_ai_processor] CUDA EP 已注册（device_id=0）");
+            ROS_INFO("[kws_asr_processor] CUDA EP 已注册（device_id=0）");
         } catch (const std::exception& e) {
             cuda_status_ = "CPU（CUDA 注册失败，已回退）";
-            ROS_WARN("[audio_ai_processor] CUDA EP 注册失败，回退 CPU：%s",
+            ROS_WARN("[kws_asr_processor] CUDA EP 注册失败，回退 CPU：%s",
                      e.what());
         }
     }
@@ -222,8 +219,7 @@ bool AudioAiProcessorNode::loadModels() {
     asr_joiner_ = std::make_unique<Ort::Session>(
         *env_, config_.asr_joiner_path.c_str(), *session_options_);
     asr_decoder_ = std::make_unique<AsrDecoder>(
-        *asr_encoder_, *asr_decoder_session_, *asr_joiner_,
-        config_.asr_tokens_path);
+        *asr_encoder_, *asr_decoder_session_, *asr_joiner_, config_.asr_tokens_path);
     asr_info_ = asr_decoder_->info();
 
     // 2.4 KWS：三个 session + KwsDecoder（加载词表、唤醒词并建 trie）。
@@ -243,7 +239,7 @@ bool AudioAiProcessorNode::loadModels() {
     // 2.5 两组模型共用同一份特征，n_mels 必须一致；不一致说明权重包配错，
     //     继续跑只会在 encoder 输入维度上抛异常，提前报清楚。
     if (kws_info_.n_mels != asr_info_.n_mels) {
-        ROS_ERROR("[audio_ai_processor] KWS 的 n_mels=%d 与 ASR 的 n_mels=%d "
+        ROS_ERROR("[kws_asr_processor] KWS 的 n_mels=%d 与 ASR 的 n_mels=%d "
                   "不一致，请检查两组权重",
                   kws_info_.n_mels, asr_info_.n_mels);
         return false;
@@ -275,7 +271,7 @@ bool AudioAiProcessorNode::loadModels() {
         const bool font_ok =
             !font.path.empty() &&
             text_renderer_->init(font.path, font.face_index);
-        ROS_INFO("[audio_ai_processor] 文字字体: %s",
+        ROS_INFO("[kws_asr_processor] 文字字体: %s",
                  font_ok ? font.path.c_str() : "未找到，回退 ASCII");
     }
 
@@ -288,12 +284,10 @@ bool AudioAiProcessorNode::loadModels() {
     AsrSessionConfig asr_session_cfg;
     asr_session_cfg.segment_tokens = 64;
     asr_session_cfg.transcript_path = config_.transcript_path;
-    asr_session_ =
-        std::make_unique<AsrSession>(*asr_decoder_, asr_session_cfg);
+    asr_session_ = std::make_unique<AsrSession>(*asr_decoder_, asr_session_cfg);
 
     KwsAsrSessionConfig kws_asr_cfg;
-    kws_asr_cfg.initial_mode =
-        config_.initial_asr ? KwsAsrMode::Asr : KwsAsrMode::Kws;
+    kws_asr_cfg.initial_mode =  config_.initial_asr ? KwsAsrMode::Asr : KwsAsrMode::Kws;
     kws_asr_cfg.idle_timeout_s = config_.idle_timeout_s;
     kws_asr_cfg.backfill_frames = config_.backfill_frames;
     session_ = std::make_unique<KwsAsrSession>(*asr_decoder_, *kws_decoder_,
@@ -315,16 +309,16 @@ bool AudioAiProcessorNode::loadModels() {
 }
 
 // 开语音转发并打印运行配置。失败时释放设备会话，调用方应退出。
-bool AudioAiProcessorNode::start() {
+bool KwsAsrProcessorNode::start() {
     if (!client_ || !worker_) {
-        ROS_ERROR("[audio_ai_processor] start() 调用前必须先 init()");
+        ROS_ERROR("[kws_asr_processor] start() 调用前必须先 init()");
         return false;
     }
 
     // 3.1 开流：StartVoiceCom 同步阻塞约 1.2 秒，失败时 init() 建立的
     //     会话还在，必须 deinit() 后再释放。
     if (!client_->start()) {
-        ROS_ERROR("[audio_ai_processor] 语音转发启动失败：%s",
+        ROS_ERROR("[kws_asr_processor] 语音转发启动失败：%s",
                   client_->last_error().c_str());
         client_->deinit();
         client_.reset();
@@ -337,7 +331,7 @@ bool AudioAiProcessorNode::start() {
     // 3.2 打印配置（设备 / 模型 / 唤醒词 / 切换规则）。
     printConfig();
 
-    ROS_INFO("[audio_ai_processor] 已开始监听（Ctrl+C 退出）");
+    ROS_INFO("[kws_asr_processor] 已开始监听（Ctrl+C 退出）");
     return true;
 }
 
@@ -345,8 +339,8 @@ bool AudioAiProcessorNode::start() {
 
 // 取一块音频 → 算特征 → 投给后台 Session → 读快照 →（可选）画窗与按键。
 // 主线程从头到尾不调用模型；模式切换与解码都在 Worker 线程里完成。
-AudioAiProcessorStep AudioAiProcessorNode::processOnce() {
-    AudioAiProcessorStep out;
+KwsAsrProcessorStep KwsAsrProcessorNode::processOnce() {
+    KwsAsrProcessorStep out;
     if (!running_) {
         return out;
     }
@@ -427,7 +421,7 @@ AudioAiProcessorStep AudioAiProcessorNode::processOnce() {
 
 // 停流 → 取完残余样本 → deinit → 尾块 + join → 结算 → 统计。
 // 可重复调用：第二次起直接返回。
-void AudioAiProcessorNode::shutdown() {
+void KwsAsrProcessorNode::shutdown() {
     if (!running_ || !client_ || !worker_) {
         return;
     }
@@ -509,28 +503,28 @@ void AudioAiProcessorNode::shutdown() {
 
 // 空格切换「暂停 / 恢复语音转发」：底层就是 client.stop() / client.start()，
 // 只停/起对讲线路，不重登录、不重建编码器；恢复后设备约 1.2 秒才送首包。
-void AudioAiProcessorNode::togglePause() {
+void KwsAsrProcessorNode::togglePause() {
     if (!paused_) {
         if (client_->stop()) {
             paused_ = true;
-            ROS_INFO("[audio_ai_processor] 已暂停语音转发，按空格恢复");
+            ROS_INFO("[kws_asr_processor] 已暂停语音转发，按空格恢复");
         } else {
-            ROS_WARN("[audio_ai_processor] 暂停失败：%s",
+            ROS_WARN("[kws_asr_processor] 暂停失败：%s",
                      client_->last_error().c_str());
         }
     } else {
-        ROS_INFO("[audio_ai_processor] 正在恢复语音转发（首包约 1.2 秒后到达）...");
+        ROS_INFO("[kws_asr_processor] 正在恢复语音转发（首包约 1.2 秒后到达）...");
         if (client_->start()) {
             paused_ = false;
         } else {
-            ROS_WARN("[audio_ai_processor] 恢复失败：%s",
+            ROS_WARN("[kws_asr_processor] 恢复失败：%s",
                      client_->last_error().c_str());
         }
     }
 }
 
 // 每轮重画底部白条与两行状态，再 imshow。
-void AudioAiProcessorNode::drawFrame() {
+void KwsAsrProcessorNode::drawFrame() {
     if (canvas_.empty()) {
         return;
     }
@@ -553,7 +547,7 @@ void AudioAiProcessorNode::drawFrame() {
 }
 
 // 底部状态文字：优先 FreeType 渲染 UTF-8 中文，失败回退 ASCII putText。
-void AudioAiProcessorNode::drawStatusLine(cv::Mat& frame,
+void KwsAsrProcessorNode::drawStatusLine(cv::Mat& frame,
                                           const std::string& text,
                                           int baseline, int font_height) {
     const cv::Point org(kStatusMargin, frame.rows - baseline);
@@ -572,9 +566,9 @@ void AudioAiProcessorNode::drawStatusLine(cv::Mat& frame,
 // ==================== 五、配置与统计打印 ====================
 
 // 打印设备、模型、唤醒词与切换规则，格式与入口第四节一致。
-void AudioAiProcessorNode::printConfig() {
+void KwsAsrProcessorNode::printConfig() {
     std::cout << std::string(74, '=') << "\n"
-              << "audio_ai_processor —— KWS 唤醒 -> ASR 识别"
+              << "kws_asr_processor —— KWS 唤醒 -> ASR 识别"
               << (config_.show_window ? " + 语谱图" : "") << "\n"
               << std::string(74, '=') << "\n"
               << "设备  : " << config_.device_ip << ":" << config_.sdk_port
@@ -624,7 +618,7 @@ void AudioAiProcessorNode::printConfig() {
 }
 
 // 收尾统计：口径与入口 6.5 一致。调用时 Worker 已 join，读解码统计无并发。
-void AudioAiProcessorNode::printStats(const std::string& final_text,
+void KwsAsrProcessorNode::printStats(const std::string& final_text,
                                       double wall_seconds) {
     const hk_isapi::AudioCaptureStats stats = client_->get_stats();
     const std::vector<int64_t>& ids = asr_session_->all_token_ids();

@@ -7,8 +7,8 @@
         /audio_ai/kws_event  std_msgs/String  唤醒 / 结束语 / 超时切回事件
 
       现场覆盖示例：
-        roslaunch audio_ai_processor audio_ai_processor.launch ip:=10.168.2.66
-        roslaunch audio_ai_processor audio_ai_processor.launch use_cuda:=true
+        roslaunch kws_asr_processor kws_asr_processor.launch ip:=10.168.2.66
+        roslaunch kws_asr_processor kws_asr_processor.launch use_cuda:=true
     -->
 
     <!-- ========== 设备连接 ========== -->
@@ -61,6 +61,6 @@
     <param name="use_cuda" value="$(arg use_cuda)"/>
     <param name="show_window" value="$(arg show_window)"/>
 
-    <node name="audio_ai_processor_node" pkg="audio_ai_processor"
-          type="audio_ai_processor_node" output="screen"/>
+    <node name="kws_asr_processor_node" pkg="kws_asr_processor"
+          type="kws_asr_processor_node" output="screen"/>
 </launch>

@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @file audio_ai_processor_node.h
+ * @file kws_asr_processor_node.h
  * @brief 语音处理节点类：海康设备取流 + KWS/ASR 双模式解码的流水线封装。
  *
  * ============================================================
@@ -45,7 +45,7 @@
  * ============================================================
  * 调用顺序（对照 main）
  * ============================================================
- *   1) main 读 launch 参数，组装 AudioAiProcessorConfig
+ *   1) main 读 launch 参数，组装 KwsAsrProcessorConfig
  *   2) main 构造节点 → init()：连接设备、加载模型、装配前端与 Session
  *   3) main 调 start()：开语音转发、打印配置
  *   4) main 主循环：processOnce() → 发布事件 / 文本 → ros::Rate 节拍
@@ -54,7 +54,7 @@
  * ============================================================
  * 用法
  * ============================================================
- *   roslaunch audio_ai_processor audio_ai_processor.launch
+ *   roslaunch kws_asr_processor kws_asr_processor.launch
  */
 #include <chrono>
 #include <cstdint>
@@ -81,7 +81,7 @@
  * 模型路径全部是「main 拼好的完整路径」（目录来自 launch，文件名写死 main），
  * 节点类不关心权重包的文件命名，只负责加载。
  */
-struct AudioAiProcessorConfig {
+struct KwsAsrProcessorConfig {
     // —— 设备连接（launch 参数）——
     std::string device_ip = "10.168.2.65";  ///< 音频设备 IP
     int sdk_port = 8000;                    ///< HCNetSDK 私有协议端口
@@ -118,7 +118,7 @@ struct AudioAiProcessorConfig {
  *
  * 事件与文本都只在「变化时」置位，main 不需要自己保存上一次的值。
  */
-struct AudioAiProcessorStep {
+struct KwsAsrProcessorStep {
     bool has_event = false;       ///< 本轮出现新事件（唤醒 / 结束语 / 超时）
     std::string event;            ///< 事件文本（UTF-8，可直接发布）
     bool has_text = false;        ///< 本轮 ASR 会话文本有变化
@@ -129,22 +129,22 @@ struct AudioAiProcessorStep {
 /**
  * @brief 语音处理节点：设备取流、双模式解码与统计的流水线封装。
  */
-class AudioAiProcessorNode {
+class KwsAsrProcessorNode {
 public:
     /**
      * @brief 保存配置；不连接设备、不加载模型。
      * @param config 运行配置，main 已按 launch 参数拼好全部路径
      */
-    explicit AudioAiProcessorNode(const AudioAiProcessorConfig& config);
+    explicit KwsAsrProcessorNode(const KwsAsrProcessorConfig& config);
 
     /**
      * @brief 兜底收尾：main 未调用 shutdown() 时补一次（内部靠 running_ 去重）。
      */
-    ~AudioAiProcessorNode();
+    ~KwsAsrProcessorNode();
 
     // 持有设备句柄、Ort::Session 与后台线程，禁止拷贝
-    AudioAiProcessorNode(const AudioAiProcessorNode&) = delete;
-    AudioAiProcessorNode& operator=(const AudioAiProcessorNode&) = delete;
+    KwsAsrProcessorNode(const KwsAsrProcessorNode&) = delete;
+    KwsAsrProcessorNode& operator=(const KwsAsrProcessorNode&) = delete;
 
     /**
      * @brief 连接设备并加载全部模型与前端，不开流。
@@ -167,7 +167,7 @@ public:
      * @brief 主循环一轮：取音频 → 前端 → 投递 → 读快照 → （可选）画窗与按键。
      * @return 本轮新增事件 / 文本变化 / 窗口退出请求
      */
-    AudioAiProcessorStep processOnce();
+    KwsAsrProcessorStep processOnce();
 
     /**
      * @brief 收尾：停流、取完残余样本、补尾块、join、结算并打印统计。
@@ -208,7 +208,7 @@ private:
     void printStats(const std::string& final_text, double wall_seconds);
 
     /// 运行配置（main 传入，只读）
-    AudioAiProcessorConfig config_;
+    KwsAsrProcessorConfig config_;
 
     // —— 依赖顺序：以下成员声明顺序即创建顺序，析构时逆序销毁 ——
     // 设备会话（采集库）：init() 创建并 init()，start() 开流

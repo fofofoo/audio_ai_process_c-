@@ -1,4 +1,4 @@
-# audio_ai_processor
+# kws_asr_processor
 
 海康设备实时语音处理节点：KWS 关键词唤醒 + ASR 连续识别，结果发布到 ROS 话题。
 算法实现来自 `audio_ai_process` 仓库的两个库，本包只做 ROS 封装（参数、话题、主循环）。
@@ -74,9 +74,9 @@ catkin_make -DAUDIO_AI_ROOT=/path/to/audio_ai_process
 ```bash
 cd /home/liyun/code/AI/audio_ai_process/catkin_ws
 source devel/setup.bash
-roslaunch audio_ai_processor audio_ai_processor.launch
-roslaunch audio_ai_processor audio_ai_processor.launch use_cuda:=true
-roslaunch audio_ai_processor audio_ai_processor.launch ip:=10.168.2.66
+roslaunch kws_asr_processor kws_asr_processor.launch
+roslaunch kws_asr_processor kws_asr_processor.launch use_cuda:=true
+roslaunch kws_asr_processor kws_asr_processor.launch ip:=10.168.2.66
 ```
 
 观察话题：

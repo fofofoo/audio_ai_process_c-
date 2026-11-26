@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>audio_ai_processor</name>
+  <name>kws_asr_processor</name>
   <version>0.1.0</version>
   <description>
     语音处理节点：海康设备实时取流，KWS 关键词唤醒 + ASR 连续识别，
