@@ -11,7 +11,8 @@
  *        └ 切到 ASR，发布「唤醒」事件
  *
  *   on_block（ASR） → AsrSession::on_block → 新 token 刷新计时
- *        └ 结束语 / 空闲超时 → back_to_kws()
+ *        显示与结束语判定用 recent_text() 尾部窗口（最近 128 token）
+ *        └ 结束语 / 空闲超时 → back_to_kws()（此时才算一次全量文本）
  *             ├ settle_segment()（尾段落盘）
  *             ├ clear_history()（本会话 token 清空，文件与段数保留）
  *             ├ 两个解码器 reset()
@@ -97,7 +98,8 @@ KwsAsrSession::KwsAsrSession(AsrDecoder& asr_decoder, KwsDecoder& kws_decoder,
 }
 
 // 一块特征的总调度：两种模式互斥，收尾块在 KWS 模式下直接跳过。
-void KwsAsrSession::on_block(const AudioFeatureInput& item) {
+void KwsAsrSession::on_block(const AudioFeatureInput& item) 
+{
     // 1) 回填环始终跟随真实音频；收尾块是特征域的 0（log 能量 1），
     //    不是真静音，不能污染下一次唤醒的回填内容。
     if (!item.is_tail) {
@@ -126,22 +128,27 @@ void KwsAsrSession::on_block(const AudioFeatureInput& item) {
     if (asr_session_.token_count() > before) {
         last_activity_ = now();
     }
-    const std::string text = asr_session_.current_text();
+    // 判定与显示都用解码器尾部窗口（最近 128 token）：结束语是句尾后缀，
+    // 窗口足够覆盖；这样每块不再对全量 token 做 detokenize。
+    const std::string tail_text = asr_decoder_.recent_text();
     update_snapshot();
 
     // 4) 切回条件：结束语优先，其次空闲超时（与 Python 6.7 顺序一致）。
-    if (is_end_phrase(text)) {
+    if (is_end_phrase(tail_text)) {
+        // 切回时才算一次全量：事件文本与 last_text 要带走整轮完整结果。
+        const std::string full_text = asr_session_.current_text();
         std::ostringstream event;
-        event << "[结束语] " << strip_trailing_punct(text);
-        back_to_kws(event.str(), text);
+        event << "[结束语] " << strip_trailing_punct(full_text);
+        back_to_kws(event.str(), full_text);
         return;
     }
     const double idle_s =
         std::chrono::duration<double>(now() - last_activity_).count();
     if (idle_s > cfg_.idle_timeout_s) {
+        const std::string full_text = asr_session_.current_text();
         std::ostringstream event;
         event << "[超时 " << static_cast<int>(idle_s) << "s] 切回关键词模式";
-        back_to_kws(event.str(), text);
+        back_to_kws(event.str(), full_text);
     }
 }
 
@@ -298,13 +305,14 @@ KwsAsrSnapshot KwsAsrSession::snapshot() const {
     return snap_;
 }
 
-// 刷新快照：detokenize 在锁外做，锁内只赋值；last_event 由 publish_event()
+// 刷新快照：文本拷贝在锁外做，锁内只赋值；last_event 由 publish_event()
 // 单独维护。主线程读快照因此不会等解码器算文本。
 void KwsAsrSession::update_snapshot() {
-    // KWS 模式没有当前 ASR 会话，文本置空；ASR 模式下按全量 token 重算。
+    // KWS 模式没有当前 ASR 会话，文本置空；ASR 模式取解码器尾部窗口
+    // （最近 128 token），避免每块对全量 token 重新 detokenize。
     std::string text;
     if (mode_ == KwsAsrMode::Asr) {
-        text = asr_session_.current_text();
+        text = asr_decoder_.recent_text();
     }
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     snap_.mode = mode_;

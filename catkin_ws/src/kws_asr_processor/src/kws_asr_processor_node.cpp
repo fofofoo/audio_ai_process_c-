@@ -380,8 +380,8 @@ KwsAsrProcessorStep KwsAsrProcessorNode::processOnce() {
 
     // 4.6 读快照：事件（唤醒 / 结束语 / 超时）只返回一次；
     //     文本只在变化时返回，main 收到后才发布话题。
-    //     异步解码下文字会比语谱图滞后若干块，这是把推理挪出主线程的
-    //     必然代价。
+    //     ASR 模式的文本是解码器最近 128 token 的窗口；异步解码下文字会比
+    //     语谱图滞后若干块，这是把推理挪出主线程的必然代价。
     snapshot_ = session_->snapshot();
     if (snapshot_.event_seq != shown_event_seq_) {
         shown_event_seq_ = snapshot_.event_seq;

@@ -984,8 +984,8 @@ G.722.1 协议帧 20 ms
 
 ## 四、作为独立库使用（安装）
 
-采集库现在构建为 `libhk_mic_client.so`（工程目录 `hk_mic_client/`），负责采集与
-特征工程，不依赖 ASR 库 `libaudio_ai_process.so`；反过来 ASR 库依赖本库。
+采集库现在构建为 `lib_hk_mic_client.so`（工程目录 `hk_mic_client/`），负责采集与
+特征工程，不依赖 ASR 库 `lib_audio_ai_process.so`；反过来 ASR 库依赖本库。
 安装命令（在仓库根执行）：
 
 ```bash
@@ -999,7 +999,7 @@ cmake --install hk_mic_client/build
 ```
 3rd/zl_3rd/hk_mic_client/
 ├── include/   hk_sdk_audio_client.h、audio_preprocess.h、spectrogram_image.h 等
-└── lib/       libhk_mic_client.so、HCNetSDK 运行库（含 HCNetSDKCom/）
+└── lib/       lib_hk_mic_client.so、HCNetSDK 运行库（含 HCNetSDKCom/）
 ```
 
 使用方编译时加 `-I3rd/zl_3rd/hk_mic_client/include`，链接

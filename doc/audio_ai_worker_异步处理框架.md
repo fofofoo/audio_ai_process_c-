@@ -4,9 +4,10 @@
 主线程、哪些工作在后台、两边怎么交换数据，以及为什么这样分。读完应该能回答三个
 问题：主线程在干什么、后台线程在干什么、结果怎么回到界面。
 
-文档先给一张全景图，再按「每一步在做什么」把流程走一遍；然后解释为什么需要这层
-框架、Worker 和业务类各自承担什么；最后用一次完整的唤醒过程和几条关键约定收尾。
-代码细节不是重点，理解这套分工和扩展方式才是。
+文档先给一张全景图，再按「每一步在做什么」把流程走一遍，随后把快照在各层之间的
+拷贝关系理清；然后解释为什么需要这层框架、Worker 和业务类各自承担什么；最后用
+一次完整的唤醒过程和几条关键约定收尾。代码细节不是重点，理解这套分工和扩展方式
+才是。
 
 > **代码位置**：`include/block_worker.h`（header-only 模板，随
 > `lib_audio_ai_process` 安装）；单模式 Session 在 `asr_session.h/.cpp`，
@@ -175,11 +176,140 @@ Worker 不知道它的存在。
 最后通过快照回到主线程显示。主线程从头到尾没有调用过模型，后台线程从头到尾没有
 碰过设备和窗口。两边靠一个音频特征输入队列和一个快照连接，职责非常清楚。
 
+### 文件级链路：从采集到解码器
+
+上面的 ①~③ 是概念链路；落到具体文件，调用关系如下。`hk_sdk_audio_client.h`、
+`wav_reader.h`、`audio_preprocess.h`、`spectrogram_image.h` 属于 `lib_hk_mic_client`；
+`block_worker.h` 及其之后的 Session、Decoder 属于 `lib_audio_ai_process`。
+
+```
+设备 / wav 文件
+   │
+   ▼
+hk_sdk_audio_client.h   麦克风采集：登录 / 起流 / G.722.1 解码 / 取流缓冲
+   │
+   ▼
+audio_preprocess.h      前端：PCM → LogfbankFeatures (n, 80)
+   │
+   ├───────────────────────────┐          AI音频处理，语音转文字数据流
+   ▼                           ▼
+spectrogram_image.h      block_worker.h   数据入口：管理音频特征输入队列：定上限、丢最旧、尾块阻塞、空块过滤、线程生命管理
+ 可视化:特征 → 画布             │
+                               ▼
+                            Session       业务分发、数据出口：KWS / ASR 输入分发,汇总输出，写入快照，供主线程提取
+                 kws_asr_session.h/asr_session.h
+                               │
+                               ▼
+                             Decoder      业务核心：接受短期音频特征(480ms),调用各类模型协作，输出文字
+                 asr_decode.h / kws_decode.h
+
+```
+
+采集库只产出 `LogfbankFeatures`，不依赖 ASR 库；并发管家、Session、解码器与快照都在
+`audio_ai_process` 一侧。设备与 wav 两条数据源在前端汇合，前端输出再分给可视化与管家。
+
 ---
 
-## 2. 为什么需要这层框架
+## 2. 快照层级与线程边界
 
-### 2.1 如果全放在主线程
+第 1 节的 ⑧ 说的是概念上的「Session 把结果写进快照」。落到代码里，从入口装配、
+Worker 回调到话题发布其实是一条**逐层拷贝**的链：每层解决不同的问题，文本的范围
+也不同。看清这条链和每层的调用方，才能回答「主线程看到的到底是哪一份文本」。
+
+```
+入口 main（主线程，装配）
+  AsrDecoder / KwsDecoder → AsrSession → KwsAsrSession → BlockWorker
+  每轮 push(特征块)；收尾 push_final(尾块) → finish_and_join()
+        │（有界队列：满时丢最旧，0 帧不入队）
+        ▼
+Worker 线程（唯一，串行）：KwsAsrSession.on_block(item)
+  ├ 1.1 执行 KWS 模式 → kws_decoder_.accept_features()；命中 → enter_asr()
+  └ 1.2 执行 ASR 模式 → AsrSession::on_block → asr_decoder_.accept_features()
+  │                      ├ all_ids_（全量）→ 切回时 current_text() → last_text / finish()
+  │                      ├ segment_ids_（每满 64 → 写一行 txt）
+  │                      └ recent_text_（最近 128）→ snap_.text
+  └ 2.0 刷新 KwsAsrSession.snapshot 快照（ASR 模式每块刷新；KWS 仅命中唤醒 / 切回时刷新）：
+        ├ mode      ← Kws / Asr
+        ├ text      ← ASR：recent_text_（最近 128）；KWS：空串
+        ├ last_text ← 切回时 text_of(all_ids_) 全量（back_to_kws / finish 时更新）
+        ├ 计数      ← wake_count / back_count
+        ├ 事件      ← event_seq / last_event（唤醒 / 结束语 / 超时）
+        └ snapshot() → 整份拷贝（短锁）→ 主线程
+
+主线程（稳态每轮）
+  单模式：latest_text()（128 尾部窗口）
+  双模式：snapshot()（整份拷贝，text 为最近 128 窗口）
+  ROS 节点：snapshot() → 与上次比较去重 → 发话题
+主线程（join 后）：finish() / all_token_ids() / stats()
+```
+
+| 层 / 接口 | 文本来源 | 范围 | 调用方（线程） | 同步 |
+| --- | --- | --- | --- | --- |
+| `AsrDecoder::recent_text_` | 最近 128 token | 有界 | `AsrSession::on_block` / `KwsAsrSession::update_snapshot()`（Worker） | 无锁，Worker 独占 |
+| `AsrSession::snapshot_` | `recent_text()` 的拷贝 | 有界 | 写：`AsrSession::on_block`（Worker）；读：单模式入口 `latest_text()`（主线程） | `snapshot_mutex_` |
+| `AsrSession::all_ids_` | 全量 token | 随会话增长 | 写：`AsrSession::on_block`（Worker）；读：切回时的 `current_text()`（`KwsAsrSession`，Worker）、`finish()` / `all_token_ids()`（入口 main，join 后） | 无锁，靠线程模型 |
+| `KwsAsrSession::snap_` | `recent_text()`（最近 128）；`last_text` 为切回时全量 | 有界 | 写：`update_snapshot()`（Worker）；读：`snapshot()`（双模式入口 / ROS 节点主线程） | `KwsAsrSession::snapshot_mutex_` |
+| 入口层副本 | 整份快照拷贝 | 同左 | 入口 main | 无（主线程私有） |
+
+调用方约束（比图更硬的一条线）：
+
+| 接口 | 谁可以调 | 时机 |
+| --- | --- | --- |
+| `on_block()` | 只有 Worker（由 `BlockWorker` 的 handler 调） | 每块，串行；主线程不得直接调用 |
+| `settle_segment()` / `clear_history()` | Worker 内的 `back_to_kws()`；或入口 main 在 join 之后 | 不能与 `on_block()` 并发 |
+| `latest_text()` / `snapshot()` | 主线程随时 | 稳态每轮，短锁内只做拷贝 |
+| `finish()` / `all_token_ids()` / `n_segments()` / `stats()` | 入口 main | 必须在 `worker.finish_and_join()` 之后 |
+
+快照的流转最终都汇到同一份 token 源：显示、输出、落盘没有各自的「识别 / 重构」逻辑，
+文本都取自同一条 token 流，区别只在取的范围（全量 / 当前段 / 尾部窗口）。
+
+```
+all_ids_（全量，唯一事实来源）
+  ├─ 切回时 current_text() ─► snap_.last_text / 事件（一轮一次）
+  └─ finish() ─────────────► 最终完整文本
+
+segment_ids_（all_ids_ 的当前段切片，≤64）
+  └─ close_segment() ─► text_of(segment_ids_) ─► log/asr_last_text.txt（一行一段）
+
+recent_tokens_（最近 128 个，all_ids_ 的尾部窗口）
+  ├─ recent_text_ ─► snap_.text ─► snapshot() ─► 窗口 / stdout / 话题（双模式）
+  └─ recent_text_ ─► AsrSession::snapshot_ ─► latest_text()（单模式显示）
+```
+
+三份 token 不是三套识别结果，而是同一条 token 流的三种视图，分工由「要不要完整、
+能存多久」决定。`all_ids_` 是 `AsrSession` 里的完整副本：解码器每返回一批新 token，
+`on_block()` 就把它追加进来，本会话内只增不减，直到切回 KWS 时 `clear_history()`
+清空；它不参与实时显示，而是承担三件事——每块用 `size()` 判断有没有新 token
+（空闲计时与统计）、切回时用 `text_of(all_ids_)` 算出一轮的完整文本（`last_text`
+与结束语事件）、收尾时由 `finish()` / `all_token_ids()` 交出最终结果。
+
+`segment_ids_` 是 `all_ids_` 的当前段切片：同一批 token 同时进两份数组，`all_ids_`
+留全量，`segment_ids_` 攒到 64 个就交给 `close_segment()` 转文本、写一行 txt 并
+清空。它的唯一作用是让落盘按固定长度切段；段与段按顺序拼接仍然还原成 `all_ids_`
+的完整序列，不重复、不丢 token，只是可能在句子中间断开——所以落盘行只是全量文本
+的分段副本，不要拿它拼出另一套「最终文本」。
+
+`recent_tokens_` 是解码器内部维护的尾部窗口：只保留最近 128 个 token 及对应文本
+（`recent_text_`），更早的会被挤出。它服务「看」而不是「存」——双模式每块把窗口
+文本拷进 `snap_.text` 供窗口和话题显示，单模式由 `AsrSession::snapshot_` 拷贝给
+`latest_text()`；窗口长度固定，显示开销不随会话增长。三者的联系可以概括为：同一批
+token 同时进入窗口、全量与当前段；显示只读窗口，落盘只用当前段，最终文本与一轮
+结束文本只从全量算；窗口和段都会滚动或清空，全量才是随时可回溯的事实来源。
+
+另外注意：`recent_text_` 本身不是线程安全快照，只是解码器内部缓存，靠 Worker
+单线程访问保证不并发；真正跨线程的是 `AsrSession::snapshot_` 与
+`KwsAsrSession::snap_` 两把短锁保护的字段。
+
+代价与边界：双模式每块只拷贝 `recent_text()` 的尾部窗口（有界，开销恒定），
+不再对全量 token 做 detokenize；全量 `text_of(all_ids_)` 只在切回时算一次
+（给 `last_text` 与结束语事件）。显示文本因此只保留最近 128 token，完整一轮
+文本以 `last_text` / `finish()` 为准。
+
+---
+
+## 3. 为什么需要这层框架
+
+### 3.1 如果全放在主线程
 
 最直接的做法是把推理也写在主循环里：取一块音频，算特征，跑 encoder / decoder /
 joiner，更新文字，再画图。单看代码很顺，但在 Jetson 上实测，主循环吞吐只有 0.99，
@@ -189,7 +319,7 @@ joiner，更新文字，再画图。单看代码很顺，但在 Jetson 上实测
 音频丢块和视频丢帧不一样。视频丢一帧只是画面卡一下；音频丢块是识别结果里少字，
 而且补不回来。所以主线程必须保持轻量，推理不能和取流抢同一个循环。
 
-### 2.2 如果每种能力各写一套线程
+### 3.2 如果每种能力各写一套线程
 
 把推理挪到后台之后，最初的做法是写一个 ASR 专用 worker：它持有 `AsrDecoder`，
 维护自己的音频特征输入队列、锁、条件变量、文本快照和收尾逻辑。这个 worker 能工作，
@@ -200,7 +330,7 @@ joiner，更新文字，再画图。单看代码很顺，但在 Jetson 上实测
 和具体能力无关，却要被复制多次；复制一次就多一次写错的机会，比如忘了尾块阻塞、
 忘了异常捕获、忘了析构 join。
 
-### 2.3 框架给出的答案
+### 3.3 框架给出的答案
 
 真正跨能力不变的东西只有两样：**线程和音频特征输入队列**。真正变化的东西也只有两样：
 **拿到一块之后做什么**、**结果怎么保存**。
@@ -211,7 +341,7 @@ joiner，更新文字，再画图。单看代码很顺，但在 Jetson 上实测
 
 ---
 
-## 3. 三方的约定
+## 4. 三方的约定
 
 可以把这套框架想成三方在各自表态。这些「表态」不是运行期协商，而是装配时由代码
 固定下来的约定，但用它来理解职责很直观。
@@ -240,7 +370,7 @@ Worker 说：你不用管我什么时候算、算多久。你放进音频特征�
 
 ---
 
-## 4. 四个角色
+## 5. 四个角色
 
 主线程是唯一碰设备和界面的线程。它负责取流、前端、语谱图、按键，以及读快照显示。
 它不直接调用解码器，也不等待处理结果。这样做的原因很实际：Jetson 上把推理放回
@@ -263,9 +393,9 @@ Session 是每种能力的统一入口，包括 `AsrSession`、`KwsAsrSession` �
 
 ---
 
-## 5. 两条独立的数据通路
+## 6. 两条独立的数据通路
 
-### 5.1 输入通路：主线程推，Worker 拉
+### 6.1 输入通路：主线程推，Worker 拉
 
 ```
 主线程：push(音频特征输入块) ──► 音频特征输入队列 ──► Worker 取一块 ──► Session.on_block ──► 解码器
@@ -275,7 +405,7 @@ Session 是每种能力的统一入口，包括 `AsrSession`、`KwsAsrSession` �
 生产时，Worker 睡在空队列上。两边都不需要知道对方的速度，也不需要互相通知「我
 准备好了」或者「你慢一点」。音频特征输入队列本身就是缓冲和调节器。
 
-### 5.2 输出通路：Session 写，主线程读
+### 6.2 输出通路：Session 写，主线程读
 
 ```
 Session：算出结果 ──► 快照.set(结果) ──锁──► 主线程 快照.get() → 显示
@@ -284,7 +414,7 @@ Session：算出结果 ──► 快照.set(结果) ──锁──► 主线程
 Worker 完全不参与这条路。快照只保留最新值，主线程每轮主动读；读不到新值就沿用
 上一帧。这样主线程的刷新节奏由它自己决定，不会被后台每处理完一块就打断一次。
 
-### 5.3 为什么必须分开
+### 6.3 为什么必须分开
 
 如果让 Worker 同时管输出，它就必须知道输出是文本、模式还是音频，通用性立刻消失，
 又回到「一种能力一个专用 Worker」的老路。分开之后，Worker 只认「块」，输出格式由
@@ -292,7 +422,7 @@ Session 自己决定，将来接 TTS 也不用改 Worker。
 
 ---
 
-## 6. 双模式：唤醒 + 识别
+## 7. 双模式：唤醒 + 识别
 
 ```
 ┌────────────────┐   命中唤醒词     ┌────────────────┐
@@ -308,7 +438,7 @@ Session 自己决定，将来接 TTS 也不用改 Worker。
 完整 ASR，计算量大、误识别多；如果只跑 KWS，又没法听懂命令。所以做成两个阶段，
 按需切换。
 
-### 6.1 一次唤醒的完整过程
+### 7.1 一次唤醒的完整过程
 
 假设用户先说「小智同学」，再说「打开客厅的灯」，最后说「再见」。整个过程大致如下。
 
@@ -330,7 +460,7 @@ Session 自己决定，将来接 TTS 也不用改 Worker。
 超过 10 秒，也走同样的切回流程。切回之后，KWS 重新从当前音频开始监听，ASR 的文本
 清空，窗口回到「KWS | listening」。
 
-### 6.2 两个边界
+### 7.2 两个边界
 
 第一个边界是回填。回填帧数是 100，大约 1 秒。填得太多，ASR 会把唤醒词前面的无关
 内容也听进去；填得太少，命令词开头可能被切掉。100 帧是当前调好的折中值，入口里
@@ -343,7 +473,7 @@ Session 自己决定，将来接 TTS 也不用改 Worker。
 
 ---
 
-## 7. Worker 做什么、不做什么
+## 8. Worker 做什么、不做什么
 
 Worker 做的是一组看起来琐碎、但漏一条就会出问题的并发工作。
 
@@ -369,7 +499,7 @@ Worker 做的是一组看起来琐碎、但漏一条就会出问题的并发工�
 
 ---
 
-## 8. 六条关键约定
+## 9. 六条关键约定
 
 **一、一个 Worker 一个线程。** Session 不会并发执行，同一个解码器也不会被两个线程
 同时碰到。需要并行处理两种能力时，不要共享解码器；要么在 Session 内部按顺序分发，
@@ -399,11 +529,11 @@ Worker 做的是一组看起来琐碎、但漏一条就会出问题的并发工�
 
 ---
 
-## 9. 统一输入：每个能力一个 Session
+## 10. 统一输入：每个能力一个 Session
 
 这一节解释为什么 ASR 也要从「lambda 特例」改成 Session 类。
 
-### 9.1 之前的两种写法不一致
+### 10.1 之前的两种写法不一致
 
 在此之前，单模式 ASR 的接法是：
 
@@ -427,7 +557,7 @@ BlockWorker<LogFbankFeatures> worker(
 能工作，但入口的装配方式不一致：以后每加一种能力，都要重新决定「逻辑放 lambda 还是
 放类」「快照放外面还是放里面」。能力越多，风格越散。
 
-### 9.2 统一成 Session 类
+### 10.2 统一成 Session 类
 
 现在把每种能力都统一成 Session 类，约定两个接口：
 
@@ -480,7 +610,7 @@ BlockWorker<LogFbankFeatures> worker(
 
 双模式只是把 `AsrSession` 换成 `KwsAsrSession`，Worker、队列、投递、收尾都不变。
 
-### 9.3 这样做的收益
+### 10.3 这样做的收益
 
 第一，**扩展路径统一**。以后接 TTS，只需要写一个 `TtsSession`，实现 `on_block` 和
 自己的快照读取接口，入口的装配代码形状不变。不需要再判断「这个能力要不要包类」。
@@ -496,7 +626,7 @@ BlockWorker<LogFbankFeatures> worker(
 第四，**测试和复用更容易**。Session 不依赖线程和队列，可以单独构造、单独喂块、
 单独检查快照；Worker 也不依赖具体能力，可以单独测背压和收尾。
 
-### 9.4 不强行统一的部分
+### 10.4 不强行统一的部分
 
 Session 的输入类型不要求全部相同。ASR 和 KWS 吃 `AudioFeatureInput`，TTS 可能吃
 `TtsInput`；它们共享的是 `on_block` 这个入口形状和 Worker 的并发策略，不是同一个
@@ -505,7 +635,7 @@ Session 的输入类型不要求全部相同。ASR 和 KWS 吃 `AudioFeatureInpu
 
 ---
 
-## 10. 接一种新能力要做什么
+## 11. 接一种新能力要做什么
 
 现在流程固定为三步：定义输入块（如果需要新类型）、写一个 Session 类、用同一个
 Worker 装配。
@@ -541,7 +671,7 @@ BlockWorker<TtsRequest> worker(
 
 ---
 
-## 11. 常见误解
+## 12. 常见误解
 
 **「Worker 就是开个线程。」** 开线程只是它做的第一件事。真正容易写错的是音频特征
 输入队列的上限、丢最旧、尾块阻塞、空块过滤、异常退出、排空和 join；这些才是它存在的
@@ -568,7 +698,7 @@ BlockWorker<TtsRequest> worker(
 
 ---
 
-## 12. 落地方式
+## 13. 落地方式
 
 `BlockWorker` 放在 `include/block_worker.h`，是一个 header-only 模板，
 随 `lib_audio_ai_process` 安装，不新增 `.cpp`，也不引入新的外部依赖。

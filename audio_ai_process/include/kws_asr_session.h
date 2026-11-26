@@ -21,7 +21,7 @@
  *        └ ASR 模式：AsrSession::on_block → 结束语 / 空闲超时 → back_to_kws()
  *        │
  *        ▼
- *   快照（模式 / 文本 / 计数 / 最近事件）——主线程随时读
+ *   快照（模式 / 最近窗口文本 / 计数 / 最近事件）——主线程随时读
  *
  * 职责边界：
  *   - 只做模式机、回填环、空闲计时、事件与统计；
@@ -37,6 +37,8 @@
  *     被 chunk 边界吃掉；回填含唤醒词本身，ASR 文本开头可能出现唤醒词，属正常；
  *   - 回填环按「帧」维护（不是按块），块长变化不影响回填长度；
  *   - 结束语判定用 UTF-8 后缀匹配，先剥掉尾部空白与中英文标点；
+ *   - 判定与快照文本都用 recent_text() 尾部窗口（最近 128 token），
+ *     全量 text_of(all_ids_) 只在切回时算一次，供 last_text 与事件使用；
  *   - 空闲计时用 steady_clock 墙钟，只在 worker 线程读写；没有新音频时
  *     Worker 不执行 on_block，计时自然停住，与 Python 版行为一致；
  *   - 切回 KWS 时先结算 ASR 转写段、再清空本会话 token 历史、最后两个解码器
@@ -94,8 +96,8 @@ struct KwsAsrSessionConfig {
 /// 主线程读的显示快照：只保留最新值，不排队、不累积。
 struct KwsAsrSnapshot {
     KwsAsrMode mode = KwsAsrMode::Kws;  ///< 当前模式
-    std::string text;                   ///< 当前 ASR 会话文本（KWS 模式为空）
-    std::string last_text;              ///< 最近一次结束的 ASR 会话文本
+    std::string text;                   ///< 最近 128 token 窗口文本（KWS 模式为空）
+    std::string last_text;              ///< 最近一次结束会话的全量文本（切回时结算）
     int wake_count = 0;                 ///< 累计唤醒次数
     int back_count = 0;                 ///< 累计切回 KWS 次数
     int64_t event_seq = 0;              ///< 事件序号，主线程据此判断有没有新事件

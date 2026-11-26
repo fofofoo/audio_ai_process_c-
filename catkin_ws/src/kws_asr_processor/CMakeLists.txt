@@ -8,8 +8,8 @@
 #  依赖：
 #    - ROS：roscpp、std_msgs
 #    - 项目内库（audio_ai_process 仓库的安装产物，默认 3rd/zl_3rd）：
-#        libhk_mic_client.so       采集 + 前端 + 语谱图
-#        libaudio_ai_process.so    模型解码 + 双模式 Session
+#        lib_hk_mic_client.so      采集 + 前端 + 语谱图
+#        lib_audio_ai_process.so   模型解码 + 双模式 Session
 #    - ONNX Runtime：按架构从 3rd/onnxruntime/install 选择（与库编译时一致）
 #    - 系统库：OpenCV、Threads
 #
@@ -57,9 +57,9 @@ endif()
 set(ZL3RD_DIR "${AUDIO_AI_ROOT}/3rd/zl_3rd")
 
 set(HK_INCLUDE_DIR  "${ZL3RD_DIR}/hk_mic_client/include")
-set(HK_LIBRARY      "${ZL3RD_DIR}/hk_mic_client/lib/libhk_mic_client.so")
+set(HK_LIBRARY      "${ZL3RD_DIR}/hk_mic_client/lib/lib_hk_mic_client.so")
 set(ASR_INCLUDE_DIR "${ZL3RD_DIR}/audio_ai_process/include")
-set(ASR_LIBRARY     "${ZL3RD_DIR}/audio_ai_process/lib/libaudio_ai_process.so")
+set(ASR_LIBRARY     "${ZL3RD_DIR}/audio_ai_process/lib/lib_audio_ai_process.so")
 
 if(NOT EXISTS "${HK_LIBRARY}")
   message(FATAL_ERROR
@@ -131,7 +131,7 @@ target_link_libraries(${PROJECT_NAME}_node PRIVATE
 
 # 运行期动态库：
 #   - 两个项目库 + 其依赖的 ORT 不在系统库路径里，必须写进 RPATH；
-#   - HCNetSDK 的运行库与 libhk_mic_client.so 同目录（库自身 RPATH=$ORIGIN）。
+#   - HCNetSDK 的运行库与 lib_hk_mic_client.so 同目录（库自身 RPATH=$ORIGIN）。
 set_target_properties(${PROJECT_NAME}_node PROPERTIES
   BUILD_RPATH
     "${ZL3RD_DIR}/hk_mic_client/lib;${ZL3RD_DIR}/audio_ai_process/lib;${ORT_LIB_DIR}"

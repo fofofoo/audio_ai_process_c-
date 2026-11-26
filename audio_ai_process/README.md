@@ -99,8 +99,8 @@ ASR 结果与 `audio_ai_process/python/` 中的 Python 参考实现逐点、逐 
 
 | 类别 | 路径 | 一句话职责 |
 | --- | --- | --- |
-| 库 | `libhk_mic_client.so` | 采集 + 特征工程：登录、语音转发、G.722.1 解码、降采样、wav 录制、LogFBank、语谱图；不依赖 ASR 库 / ORT / FreeType |
-| 库 | `libaudio_ai_process.so` | 模型处理：`AsrDecoder` / `KwsDecoder`（ORT）、关键词前缀树、双模式 session、中文渲染；依赖 `hk_mic_client` 与 ORT |
+| 库 | `lib_hk_mic_client.so` | 采集 + 特征工程：登录、语音转发、G.722.1 解码、降采样、wav 录制、LogFBank、语谱图；不依赖 ASR 库 / ORT / FreeType |
+| 库 | `lib_audio_ai_process.so` | 模型处理：`AsrDecoder` / `KwsDecoder`（ORT）、关键词前缀树、双模式 session、中文渲染；依赖 `hk_mic_client` 与 ORT |
 | 采集源码 | `hk_mic_client/{include,src}/hk_sdk_audio_client.{h,cpp}` | 设备连接与音频流水线 |
 | 采集源码 | `hk_mic_client/{include,src}/audio_resampler.{h,cpp}` | 整数倍降采样（Kaiser 窗 FIR + 抽取），PCM 32 kHz → 16 kHz；零外部依赖 |
 | 采集源码 | `3rd/hk_sdk/` | 厂商 HCNetSDK 头文件与预编译库（按平台分目录） |
@@ -138,10 +138,10 @@ ASR 结果与 `audio_ai_process/python/` 中的 Python 参考实现逐点、逐 
 ### 依赖链（谁编译在先）
 
 ```
-HCNetSDK ──> libhk_mic_client.so ──> 采集 / 可视化入口
+HCNetSDK ──> lib_hk_mic_client.so ──> 采集 / 可视化入口
                   │                  （save_audio_wav、test_spectrogram_cv_*、fbank_dump）
                   │
-                  └──> libaudio_ai_process.so ──> ASR / KWS 入口
+                  └──> lib_audio_ai_process.so ──> ASR / KWS 入口
                            ↑                    （test_wav_*、test_mic_*、load_onnx_model）
                            └── ONNX Runtime / OpenCV / FreeType
 ```
@@ -176,6 +176,96 @@ ASR 与 KWS 是两条并列的解码分支，共用同一个前端：前者输�
 
 麦克风入口与 wav 入口只在「数据源」不同，后半段完全共用。核心类只靠特征相连：
 前端不知道设备，可视化不知道波形，解码器不知道数据源。
+
+## 异步处理框架（BlockWorker）
+
+两个实时入口（`test_mic_asr` / `test_mic_kws_asr`）把整条链路拆成两半：主线程只做
+取流、前端、渲染与读快照，模型推理交给后台唯一线程串行执行。这不是可选的优化，
+而是实时性的前提——推理、渲染、取流同线程时 Jetson 上吞吐约 0.99，恰在实时线上，
+取流缓冲（2.56 s）一溢出就开始丢音频；推理挪到后台后，两个入口的取流与解码丢块
+实测均为 0。wav 类入口没有实时约束，仍是主循环同步解码。完整设计说明见
+[`doc/audio_ai_worker_异步处理框架.md`](../doc/audio_ai_worker_异步处理框架.md)。
+
+```
+主线程                                        │  后台线程（唯一）
+──────────────────────────────────────────────┼─────────────────────────────────────
+设备 / wav → 采集 → AudioPreprocess           │
+                     │                        │
+                     ├─ SpectrogramImage      │
+                     │  （渲染、按键）        │
+                     │                        │
+                     └─ worker.push(特征块) ──┼──► 有界队列 ──► session.on_block()
+                                              │  （上限 50 块，      ├ AsrSession
+                                              │   满时丢最旧，       └ KwsAsrSession
+                                              │   0 帧块由 Skip 过滤）        │
+                                              │                              ▼
+        主线程读快照 ◄────────────────────────┼──── 快照（文本 / 模式 / 事件）
+```
+
+### 四个角色
+
+| 角色 | 实现 | 职责 | 边界 |
+| --- | --- | --- | --- |
+| 主线程 | 两个实时入口 `main` | 取流、前端、语谱图、按键、读快照 | 不调用解码器，不等后台算完 |
+| 并发管家 | `BlockWorker<Block>` | 有界队列、单线程串行、丢最旧、尾块保护、空块过滤、异常捕获、排空与 join | 不知道块里是什么，不定义输出 |
+| 能力入口 | `AsrSession` / `KwsAsrSession` | 拿到一块输入做什么，维护跨块状态与结果快照 | 不创建线程，不碰输入队列 |
+| 算法 | `AsrDecoder` / `KwsDecoder` | 特征进、文本或命中出 | 非线程安全，由 Worker 保证单线程调用 |
+
+### 两条数据通路
+
+```
+输入：主线程 push(块) ──► 输入队列 ──► Worker 取一块 ──► Session.on_block
+输出：Session 算完 ──► 快照.set(结果) ──短锁──► 主线程 快照.get() → 显示
+```
+
+输入侧是「主线程推、Worker 拉」：`push()` 非阻塞，队列满时丢最旧，主线程立刻回去
+取流；尾块走 `push_final()`，队列满时阻塞等空位。输出侧是「Session 写、主线程读」：
+Worker 完全不参与，快照只保留最新值，主线程下一轮主动读取，读不到新值就沿用上一帧。
+两条通路各有一把短锁，互不嵌套，所以主线程投递不会被推理拖住。
+
+### 六条关键约定
+
+1. **一个 Worker 一个线程。** Handler 严格串行，这是两个解码器内部不加锁的全部依据；
+   需要并行处理两种能力时不要共享解码器，各自持有实例或串行分发。
+2. **普通块满时丢最旧。** 丢的是过时输入而不是音频，目的是让结果贴近当前声音；
+   丢弃数进 `dropped()`，持续增长说明后台跟不上，应先查模型与执行器，而不是加大队列。
+3. **尾块绝不丢。** 收尾块承载最后几个字，走 `push_final()` 阻塞等空位；必须在
+   `finish_and_join()` 之前投递，顺序颠倒会把它当成「已经结束」直接丢掉。
+4. **空块不入队。** 判据由投递方给（两个实时入口都是 `n_frames <= 0 || data.empty()`）；
+   未凑满一帧的样本还在前端缓存里，跳过不丢音频，也避免无效块挤占容量。
+5. **持锁不解码。** Worker 解锁后才调用 Handler；Session 只在给快照赋值时短暂拿锁。
+   一旦有人拿着队列锁做推理，主线程的每次投递都会等整个推理结束，实时性就没了。
+6. **先 join 后销毁。** Worker 必须声明在被它引用的 Session / 解码器之后，C++ 逆序
+   析构保证先停线程、再销毁对象；`finish_and_join()` 幂等，析构时兜底。
+
+### 双模式如何挂在框架上
+
+`KwsAsrSession` 复用同一个 Worker：KWS 模式只喂 `KwsDecoder`，ASR 模式只经
+`AsrSession` 喂 `AsrDecoder`，两个解码器始终在同一个后台线程里被串行调用，不存在
+跨线程迁移。唤醒时先 `reset()` ASR 解码器、清会话历史，再回填最近 100 帧特征并切
+模式；切回时先结算本段，再重置两个解码器。尾块（`is_tail`）在 KWS 模式直接跳过并
+计数——特征域补 0 是 log 能量 1，不是真静音，喂给 KWS 会污染软重置判据；ASR 模式
+才正常消费。Worker 只负责把 `is_tail` 标记传下去，不解释它的含义。
+
+### 接一种新能力
+
+1. **定义输入块**：音频类能力直接复用 `LogfbankFeatures`（队列里每项是
+   `BlockWorker<LogfbankFeatures>::Item`，即特征块 + `is_tail`）；非音频能力
+   定义自己的输入类型，`BlockWorker<T>` 是模板。
+2. **写 Session 类**：实现 `on_block(const Item&)`，结果写进自己的线程安全快照，
+   读结果接口供主线程随时调用。
+3. **用同一个 Worker 装配**：队列上限、空块判据、尾块投递与 `finish_and_join()`
+   全部照旧，只把 Handler 换成新 Session：
+
+```cpp
+BlockWorker<LogfbankFeatures> worker(
+    [&session](const AudioFeatureInput& item) { session.on_block(item); },
+    [](const LogfbankFeatures& f) { return f.n_frames <= 0 || f.data.empty(); },
+    50);
+```
+
+Worker 只认「块」，不知道块里是特征还是 TTS 请求，也不定义输出格式；所以新增能力
+时线程、队列、背压与收尾都不用重写，变的只有 Session。
 
 ## 输入输出契约
 
@@ -227,7 +317,7 @@ ASR 与 KWS 是两条并列的解码分支，共用同一个前端：前者输�
 | | `keywords()` / `info()` | 关键词原文列表 / 模型契约与束宽 |
 | | `reset()` / `n_hits()` / `n_chunks()` | 清空束搜索与 encoder 状态 / 累计命中与编码次数 |
 | `audio_ai::KwsAsrSession` | `on_block(input)` / `finish()` | 后台线程处理一块特征（内部按模式分发给 KWS / ASR）/ 收尾并返回最近一次 ASR 文本 |
-| | `snapshot()` / `stats()` | 读模式、文本、事件与计数（短锁）/ 收尾统计（`finish()` 后读） |
+| | `snapshot()` / `stats()` | 读模式、最近 128 token 窗口文本、事件与计数（短锁；`last_text` 为一轮全量）/ 收尾统计（`finish()` 后读） |
 | `audio_ai::Utf8TextRenderer` | `init(path, face_index)` / `draw(...)` | 加载字体 / 把 UTF-8 文本画到 BGR 画布；不可用时回退 `cv::putText` |
 | | `draw_tail(..., max_width)` | 从尾部按像素宽度截断后绘制（累积文本滑动显示，中英混排同样准确） |
 
@@ -328,7 +418,7 @@ CMake ≥ 3.10、C++17、OpenCV（core / imgproc / imgcodecs / highgui）、pthr
 海康 SDK 已放在 `3rd/hk_sdk/`，CMake 按架构自动选择 `linux_x86` /
 `linux64_arm` / `win64_x86`，并为可执行文件设置 RPATH。
 
-FreeType 是 `libaudio_ai_process` 的可选依赖（供 `text_renderer` 渲染中文）：
+FreeType 是 `lib_audio_ai_process` 的可选依赖（供 `text_renderer` 渲染中文）：
 找到时定义 `HK_HAVE_FREETYPE`，带窗口的 ASR 入口在底部用系统字体渲染中文；
 找不到时该模块编译空实现、入口自动回退 `cv::putText`（只支持 ASCII），不影响识别。
 KWS 离线入口不建窗口，不涉及文本渲染。
@@ -363,10 +453,10 @@ cmake --install audio_ai_process/build   # -> 3rd/zl_3rd/audio_ai_process/
 └── zl_3rd/                        两个库的安装输出
     ├── hk_mic_client/
     │   ├── include/   hk_sdk_audio_client.h、audio_preprocess.h、spectrogram_image.h 等
-    │   └── lib/       libhk_mic_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
+    │   └── lib/       lib_hk_mic_client.so + HCNetSDK 运行库（含 HCNetSDKCom/）
     └── audio_ai_process/
         ├── include/   asr_decode.h、kws_decode.h 等
-        └── lib/       libaudio_ai_process.so
+        └── lib/       lib_audio_ai_process.so
 ```
 
 依赖方向是单向的：`audio_ai_process` → `hk_mic_client`，反向不成立。
@@ -796,4 +886,5 @@ Session 换成 `KwsAsrSession`：Worker 线程串行喂两个解码器，模式�
 | [`hk_mic_client/README.md`](../hk_mic_client/README.md) | G.722.1 帧长、回调包、解码单元、PCM 对比、上行保活、init/start/stop/deinit 生命周期与失败分级；LogFBank 前端的分帧语义、流式机制、7 步流水线与 `tail_pad_frames` |
 | [`audio_ai_process/python/README.md`](python/README.md) | Python 参考实现：前端七项 kaldi 口径、模型结构、贪心搜索、KWS 束搜索与唤醒词设置、流式等价性与实测数据 |
 | [`3rd/onnxruntime/README.md`](../3rd/onnxruntime/README.md) | 两个平台的 ONNX Runtime 安装、CUDA EP 与 cuDNN 9 配置 |
+| [`doc/audio_ai_worker_异步处理框架.md`](../doc/audio_ai_worker_异步处理框架.md) | BlockWorker 异步框架的完整设计：音频路径全景、四个角色、两条数据通路、六条关键约定、双模式挂载与扩展方式 |
 | [`weight/`](../weight/) 各模型目录的 `README.md` | 权重来源、模型结构说明与官方 `test_onnx.py` |

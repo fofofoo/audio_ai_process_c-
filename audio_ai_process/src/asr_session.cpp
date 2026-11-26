@@ -68,7 +68,8 @@ AsrSession::AsrSession(AsrDecoder& decoder, AsrSessionConfig cfg)
 
 // 处理一块特征：解码器只返回增量，本类负责累积、分段与刷新快照。
 // 没有新 token 时直接返回：段长、快照都不会变，没必要重复写。
-void AsrSession::on_block(const AudioFeatureInput& item) {
+void AsrSession::on_block(const AudioFeatureInput& item) 
+{
     const std::vector<int64_t> ids = decoder_.accept_features(item.block);
     if (ids.empty()) {
         return;

@@ -2,7 +2,7 @@
 #  audio_ai_process —— 流式 ASR / KWS 模型处理库
 #
 #  职责：
-#    libaudio_ai_process.so  三模型 ORT 推理、贪心 / 束搜索解码、关键词前缀树、
+#    lib_audio_ai_process.so  三模型 ORT 推理、贪心 / 束搜索解码、关键词前缀树、
 #                            双模式 session 编排、中文文本渲染
 #
 #  依赖方向：
@@ -69,9 +69,9 @@ message(STATUS "ONNX Runtime root : ${ORT_ROOT}")
 # hk_mic_client：使用其安装产物（头 + .so），不直接引用对方源码目录
 # ---------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    set(HK_LIBRARY "${ZL3RD_DIR}/hk_mic_client/lib/hk_mic_client.lib")
+    set(HK_LIBRARY "${ZL3RD_DIR}/hk_mic_client/lib/_hk_mic_client.lib")
 else()
-    set(HK_LIBRARY "${ZL3RD_DIR}/hk_mic_client/lib/libhk_mic_client.so")
+    set(HK_LIBRARY "${ZL3RD_DIR}/hk_mic_client/lib/lib_hk_mic_client.so")
 endif()
 set(HK_INCLUDE_DIR "${ZL3RD_DIR}/hk_mic_client/include")
 
@@ -113,8 +113,9 @@ add_library(audio_ai_process SHARED
     src/text_renderer.cpp
 )
 
-# 输出 build/lib/libaudio_ai_process.so
+# 输出 build/lib/lib_audio_ai_process.so（target 名保持 audio_ai_process，链接方不用改）
 set_target_properties(audio_ai_process PROPERTIES
+    OUTPUT_NAME "_audio_ai_process"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     INSTALL_RPATH "$ORIGIN"

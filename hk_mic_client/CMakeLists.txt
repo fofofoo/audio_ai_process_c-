@@ -2,7 +2,7 @@
 #  hk_mic_client —— 海康拾音器音频采集 + 特征工程库
 #
 #  职责：
-#    libhk_mic_client.so  登录、语音转发、G.722.1 解码、可选降采样、wav 录制、
+#    lib_hk_mic_client.so  登录、语音转发、G.722.1 解码、可选降采样、wav 录制、
 #                         取流缓冲与统计；LogFBank 前端、滚动语谱图、通用文本/路径工具
 #
 #  依赖方向：
@@ -91,8 +91,10 @@ add_library(hk_mic_client SHARED
     src/text_utils.cpp
 )
 
-# 输出 build/lib/libhk_mic_client.so；安装后靠 $ORIGIN 找同目录的 HCNetSDK 运行库
+# 输出 build/lib/lib_hk_mic_client.so（target 名保持 hk_mic_client，链接方不用改）；
+# 安装后靠 $ORIGIN 找同目录的 HCNetSDK 运行库
 set_target_properties(hk_mic_client PROPERTIES
+    OUTPUT_NAME "_hk_mic_client"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     INSTALL_RPATH "$ORIGIN"
